@@ -1,5 +1,7 @@
+pub mod index;
 pub mod parse;
 pub mod scan;
 pub mod types;
 
-pub use types::{SymbolId, SymbolKind, SymbolNode, SymbolTree, finalize_children};
+pub use index::index_repo;
+pub use types::{finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
