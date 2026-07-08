@@ -11,7 +11,10 @@ use crate::types::{finalize_children, SymbolId, SymbolNode, SymbolTree};
 pub fn index_repo(repo_root: &Path) -> anyhow::Result<SymbolTree> {
     let files = scan_files(repo_root)?;
     let rs_children = parse_all_rust(repo_root, &files)?;
-    Ok(build_tree(repo_root, &files, &rs_children))
+    let mut tree = build_tree(repo_root, &files, &rs_children);
+    let counts = crate::churn::churn_counts(repo_root)?;
+    crate::churn::annotate(&mut tree, &counts);
+    Ok(tree)
 }
 
 /// Parse every .rs file in parallel (spec §5.2: rayon, whole repo at startup).

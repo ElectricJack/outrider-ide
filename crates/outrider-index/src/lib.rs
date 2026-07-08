@@ -1,3 +1,4 @@
+pub mod churn;
 pub mod index;
 pub mod parse;
 pub mod scan;
