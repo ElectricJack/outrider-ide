@@ -1,54 +1,39 @@
 mod camera;
 mod theme;
+mod treemap;
 mod world;
 
-use gpui::{
-    div, prelude::*, px, rgb, size, App, Bounds, Context, Window, WindowBounds, WindowOptions,
-};
+use std::path::PathBuf;
+
+use gpui::{px, size, App, AppContext as _, Bounds, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
-struct HelloWorld;
-
-impl Render for HelloWorld {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .size_full()
-            .justify_center()
-            .items_center()
-            .bg(rgb(0x1e2430))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(240.))
-                            .h(px(120.))
-                            .rounded_md()
-                            .bg(rgb(0x2e7d32)),
-                    )
-                    .child(
-                        div()
-                            .text_xl()
-                            .text_color(rgb(0xffffff))
-                            .child("outrider — milestone 0"),
-                    ),
-            )
-    }
-}
+use crate::treemap::TreemapView;
 
 fn main() {
-    application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
+    let repo = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().expect("no working directory"));
+    eprintln!("indexing {}…", repo.display());
+    let tree = match outrider_index::index_repo(&repo) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+    };
+    let layout = outrider_layout::layout(&tree);
+    eprintln!("{} symbols laid out", layout.nodes.len());
+
+    application().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| HelloWorld),
+            |_, cx| cx.new(|cx| TreemapView::new(tree, layout, cx)),
         )
         .expect("failed to open window");
         cx.activate(true);
