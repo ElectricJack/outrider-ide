@@ -90,11 +90,8 @@ fn layout_hash_identical_across_processes() {
             .unwrap()
             .lines()
             .find_map(|l| {
-                if let Some(start) = l.find("LAYOUT_HASH=") {
-                    Some(l[start + "LAYOUT_HASH=".len()..].to_string())
-                } else {
-                    None
-                }
+                l.find("LAYOUT_HASH=")
+                    .map(|start| l[start + "LAYOUT_HASH=".len()..].to_string())
             })
             .expect("child printed no LAYOUT_HASH line")
     };
