@@ -1,4 +1,5 @@
 mod world;
+mod camera;
 
 use gpui::{
     div, prelude::*, px, rgb, size, App, Bounds, Context, Window, WindowBounds, WindowOptions,
