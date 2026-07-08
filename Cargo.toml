@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/outrider-index",
+    "crates/outrider-layout",
+    "crates/outrider",
+]
