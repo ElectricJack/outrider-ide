@@ -311,3 +311,11 @@ Create `docs/superpowers/plans/2026-07-08-phase-0-verdict.md`:
 git add crates/outrider/src/main.rs docs/superpowers/plans/2026-07-08-phase-0-verdict.md
 git commit -m "feat: gpui hello-world window; record milestone 0 platform verdict"
 ```
+
+---
+
+## Post-implementation notes (2026-07-08)
+
+- At the pinned rev (029bf2f2), `gpui::Application::new()` no longer exists; the entry point is `gpui_platform::application()`. Task 3's dependency block therefore gained a second dep: `gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "<same SHA>", features = ["wayland"] }`. Any future rev bump must move **both** deps in lockstep.
+- The `wayland` feature on `gpui_platform` is required on Linux; without it the build has no platform backend.
+- Verdict details (llvmpipe-only Vulkan, borderless window under WSLg) are in `2026-07-08-phase-0-verdict.md`.

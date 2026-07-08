@@ -88,7 +88,7 @@ fn git_stdout(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
     if !out.status.success() {
         bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    Ok(String::from_utf8(out.stdout).context("git output not utf-8")?)
+    String::from_utf8(out.stdout).context("git output not utf-8")
 }
 
 /// Annotate the tree: file counts -> percentile among files; folder counts

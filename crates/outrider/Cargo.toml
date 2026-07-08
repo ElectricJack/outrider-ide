@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# gpui and gpui_platform must stay pinned at the same rev; gpui_platform provides the entry point (application()) and the linux backend features
 gpui = { git = "https://github.com/zed-industries/zed", rev = "029bf2f284b4e59f20175d78443e630468f3a3e5" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "029bf2f284b4e59f20175d78443e630468f3a3e5", features = ["wayland"] }
