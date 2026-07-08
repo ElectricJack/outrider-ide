@@ -29,6 +29,7 @@ impl Camera {
     }
 
     /// Multiply zoom by `factor`, keeping the world point under (sx, sy) fixed.
+    #[allow(clippy::too_many_arguments)]
     pub fn zoom_about(
         &mut self,
         sx: f64,

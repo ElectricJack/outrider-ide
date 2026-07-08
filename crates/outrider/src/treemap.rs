@@ -109,77 +109,124 @@ impl TreemapView {
 }
 
 impl Render for TreemapView {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focus_handle.is_focused(window) {
+            self.focus_handle.focus(window, cx);
+        }
+
         let vp = window.viewport_size();
         let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
         let items = self.paint_items(vw, vh);
 
-        div().size_full().bg(rgb(theme::BG)).child(
-            canvas(
-                |_bounds, _window, _cx: &mut App| {},
-                move |bounds, _prepaint, window, _cx: &mut App| {
-                    let origin = bounds.origin;
-                    for item in &items {
-                        let b = Bounds::new(
-                            point(origin.x + px(item.x), origin.y + px(item.y)),
-                            size(px(item.w), px(item.h)),
-                        );
-                        window.paint_quad(quad(
-                            b,
-                            px(0.),
-                            rgb(item.fill),
-                            px(1.),
-                            rgb(item.border),
-                            BorderStyle::default(),
-                        ));
-                        if item.rung == Rung::Dot || item.h < 14.0 {
-                            continue;
-                        }
-                        let font_px = 12.0_f32;
-                        let line_height = px(font_px * 1.3);
-                        let run = |len: usize, color: u32| TextRun {
-                            len,
-                            font: gpui::font(theme::FONT_FAMILY),
-                            color: rgb(color).into(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        if let Some(name) = truncate_to_width(&item.name, item.w, font_px) {
-                            let line = window.text_system().shape_line(
-                                name.clone().into(),
-                                px(font_px),
-                                &[run(name.len(), theme::TEXT_PRIMARY)],
-                                None,
+        let max_zoom = vh * 8f64.powi(15);
+        let min_zoom = self.home_zoom * 0.5;
+
+        div()
+            .size_full()
+            .bg(rgb(theme::BG))
+            .track_focus(&self.focus_handle)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseDownEvent, _w, _cx| {
+                    this.drag_last = Some(e.position);
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _e: &gpui::MouseUpEvent, _w, _cx| {
+                    this.drag_last = None;
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _w, cx| {
+                if e.pressed_button != Some(gpui::MouseButton::Left) {
+                    return;
+                }
+                let Some(last) = this.drag_last else { return };
+                let (dx, dy) = (f64::from(e.position.x - last.x), f64::from(e.position.y - last.y));
+                if let Some(cam) = this.camera.as_mut() {
+                    cam.pan(dx, dy);
+                }
+                this.drag_last = Some(e.position);
+                cx.notify();
+            }))
+            .on_scroll_wheel(cx.listener(move |this, e: &gpui::ScrollWheelEvent, w, cx| {
+                let dy = match e.delta {
+                    gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
+                    gpui::ScrollDelta::Lines(l) => l.y as f64 * 40.0,
+                };
+                let vp = w.viewport_size();
+                let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
+                if let Some(cam) = this.camera.as_mut() {
+                    // scroll up (positive dy) zooms in; flip the sign here if
+                    // manual testing shows it inverted on this platform
+                    let factor = (dy * 0.002).exp();
+                    cam.zoom_about(
+                        f64::from(e.position.x),
+                        f64::from(e.position.y),
+                        vw,
+                        vh,
+                        factor,
+                        min_zoom,
+                        max_zoom,
+                    );
+                }
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
+                if e.keystroke.key == "home" {
+                    let vp = w.viewport_size();
+                    let c = this.home_camera(f64::from(vp.width), f64::from(vp.height));
+                    this.home_zoom = c.zoom;
+                    this.camera = Some(c);
+                    cx.notify();
+                }
+            }))
+            .child(
+                canvas(
+                    |_bounds, _window, _cx: &mut App| {},
+                    move |bounds, _prepaint, window, _cx: &mut App| {
+                        let origin = bounds.origin;
+                        for item in &items {
+                            let b = Bounds::new(
+                                point(origin.x + px(item.x), origin.y + px(item.y)),
+                                size(px(item.w), px(item.h)),
                             );
-                            let ty = if item.rung == Rung::Label {
-                                // vertically centered in the box
-                                item.y + (item.h - font_px * 1.3) / 2.0
-                            } else {
-                                item.y + 4.0
+                            window.paint_quad(quad(
+                                b,
+                                px(0.),
+                                rgb(item.fill),
+                                px(1.),
+                                rgb(item.border),
+                                BorderStyle::default(),
+                            ));
+                            if item.rung == Rung::Dot || item.h < 14.0 {
+                                continue;
+                            }
+                            let font_px = 12.0_f32;
+                            let line_height = px(font_px * 1.3);
+                            let run = |len: usize, color: u32| TextRun {
+                                len,
+                                font: gpui::font(theme::FONT_FAMILY),
+                                color: rgb(color).into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
                             };
-                            let _ = line.paint(
-                                point(origin.x + px(item.x + 6.0), origin.y + px(ty)),
-                                line_height,
-                                TextAlign::Left,
-                                None,
-                                window,
-                                _cx,
-                            );
-                        }
-                        if item.rung == Rung::Card {
-                            if let Some(meta) = truncate_to_width(&item.meta, item.w, font_px) {
+                            if let Some(name) = truncate_to_width(&item.name, item.w, font_px) {
                                 let line = window.text_system().shape_line(
-                                    meta.clone().into(),
+                                    name.clone().into(),
                                     px(font_px),
-                                    &[run(meta.len(), theme::TEXT_SECONDARY)],
+                                    &[run(name.len(), theme::TEXT_PRIMARY)],
                                     None,
                                 );
+                                let ty = if item.rung == Rung::Label {
+                                    // vertically centered in the box
+                                    item.y + (item.h - font_px * 1.3) / 2.0
+                                } else {
+                                    item.y + 4.0
+                                };
                                 let _ = line.paint(
-                                    point(
-                                        origin.x + px(item.x + 6.0),
-                                        origin.y + px(item.y + 4.0 + font_px * 1.4),
-                                    ),
+                                    point(origin.x + px(item.x + 6.0), origin.y + px(ty)),
                                     line_height,
                                     TextAlign::Left,
                                     None,
@@ -187,12 +234,32 @@ impl Render for TreemapView {
                                     _cx,
                                 );
                             }
+                            if item.rung == Rung::Card {
+                                if let Some(meta) = truncate_to_width(&item.meta, item.w, font_px) {
+                                    let line = window.text_system().shape_line(
+                                        meta.clone().into(),
+                                        px(font_px),
+                                        &[run(meta.len(), theme::TEXT_SECONDARY)],
+                                        None,
+                                    );
+                                    let _ = line.paint(
+                                        point(
+                                            origin.x + px(item.x + 6.0),
+                                            origin.y + px(item.y + 4.0 + font_px * 1.4),
+                                        ),
+                                        line_height,
+                                        TextAlign::Left,
+                                        None,
+                                        window,
+                                        _cx,
+                                    );
+                                }
+                            }
                         }
-                    }
-                },
+                    },
+                )
+                .size_full(),
             )
-            .size_full(),
-        )
     }
 }
 
