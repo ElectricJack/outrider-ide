@@ -140,7 +140,9 @@ fn collect_counts(node: &SymbolNode, files: &mut Vec<u64>, folders: &mut Vec<u64
     }
 }
 
-/// Map each distinct count to its percentile (ties share one entry).
+/// Map each distinct count to its percentile. Duplicate counts overwrite
+/// each other in the map, which is safe because `percentiles` assigns
+/// identical values to ties.
 fn zip_pct(counts: &[u64]) -> BTreeMap<u64, f32> {
     let pcts = percentiles(counts);
     counts.iter().copied().zip(pcts).collect()
