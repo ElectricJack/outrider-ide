@@ -6,12 +6,13 @@ use rayon::prelude::*;
 
 use crate::parse::{parse_rust_items, RawItem};
 use crate::scan::{build_tree, scan_files, ScannedFile};
-use crate::types::{finalize_children, SymbolId, SymbolNode, SymbolTree};
+use crate::types::{dedupe_ids, finalize_children, SymbolId, SymbolNode, SymbolTree};
 
 pub fn index_repo(repo_root: &Path) -> anyhow::Result<SymbolTree> {
     let files = scan_files(repo_root)?;
     let rs_children = parse_all_rust(repo_root, &files)?;
     let mut tree = build_tree(repo_root, &files, &rs_children);
+    dedupe_ids(&mut tree.root);
     let counts = crate::churn::churn_counts(repo_root)?;
     crate::churn::annotate(&mut tree, &counts);
     Ok(tree)

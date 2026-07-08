@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -59,6 +60,29 @@ pub fn finalize_children(children: &mut [SymbolNode]) {
     }
 }
 
+/// Enforce tree-wide `SymbolId` uniqueness (spec §4.1: the ID is the stable
+/// identity used by layout keys). `finalize_children` disambiguates only
+/// within one sibling group; same-named children of same-named containers
+/// (e.g. cfg-gated duplicate `mod` blocks) still collide across scopes.
+/// Deterministic pre-order walk: on a repeated `(kind, qualified_path)`,
+/// bump the ordinal to the next unseen value. Within-scope relative order
+/// is preserved because visit order is deterministic and bumps are monotonic.
+pub fn dedupe_ids(root: &mut SymbolNode) {
+    fn walk(node: &mut SymbolNode, seen: &mut BTreeMap<(SymbolKind, String), u16>) {
+        let next = seen
+            .entry((node.id.kind, node.id.qualified_path.clone()))
+            .or_insert(0);
+        if node.id.ordinal < *next {
+            node.id.ordinal = *next;
+        }
+        *next = node.id.ordinal + 1;
+        for child in &mut node.children {
+            walk(child, seen);
+        }
+    }
+    walk(root, &mut BTreeMap::new());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +123,51 @@ mod tests {
         let json = serde_json::to_string(&tree).unwrap();
         let back: SymbolTree = serde_json::from_str(&json).unwrap();
         assert_eq!(tree, back);
+    }
+
+    #[test]
+    fn dedupe_ids_disambiguates_cross_scope_duplicates() {
+        // Simulates two cfg-gated `mod imp` blocks, each containing `fn connect`.
+        let mk_mod = || {
+            SymbolNode {
+                id: SymbolId {
+                    kind: SymbolKind::Module,
+                    qualified_path: "net.rs::imp".into(),
+                    ordinal: 0,
+                },
+                name: "imp".into(),
+                byte_range: None,
+                measure: 2,
+                churn: 0.0,
+                churn_count: 0,
+                children: vec![SymbolNode {
+                    id: SymbolId {
+                        kind: SymbolKind::Fn,
+                        qualified_path: "net.rs::imp::connect".into(),
+                        ordinal: 0,
+                    },
+                    name: "connect".into(),
+                    byte_range: None,
+                    measure: 1,
+                    churn: 0.0,
+                    churn_count: 0,
+                    children: vec![],
+                }],
+            }
+        };
+        let mut file = mk("net.rs");
+        file.children = vec![mk_mod(), mk_mod()];
+        finalize_children(&mut file.children);
+        // finalize gives the mods ordinals 0,1 — but both `connect` fns still collide
+        assert_eq!(
+            file.children[0].children[0].id,
+            file.children[1].children[0].id
+        );
+
+        dedupe_ids(&mut file);
+        let a = &file.children[0].children[0].id;
+        let b = &file.children[1].children[0].id;
+        assert_ne!(a, b);
+        assert_eq!((a.ordinal, b.ordinal), (0, 1));
     }
 }

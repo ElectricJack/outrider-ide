@@ -51,3 +51,21 @@ fn index_repo_parses_rust_files_into_items() {
     let clamp = find(&tree.root, "src/util.rs::clamp").expect("clamp fn");
     assert_eq!(clamp.measure, 3);
 }
+
+#[test]
+fn symbol_ids_are_unique_tree_wide() {
+    let dir = common::copy_fixture("mini_repo");
+    let tree = index_repo(dir.path()).unwrap();
+    fn walk(n: &outrider_index::SymbolNode, out: &mut Vec<outrider_index::SymbolId>) {
+        out.push(n.id.clone());
+        for c in &n.children {
+            walk(c, out);
+        }
+    }
+    let mut ids = Vec::new();
+    walk(&tree.root, &mut ids);
+    let total = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "duplicate SymbolIds in indexed tree");
+}

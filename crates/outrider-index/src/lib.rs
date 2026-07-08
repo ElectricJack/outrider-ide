@@ -6,4 +6,4 @@ pub mod scan;
 pub mod types;
 
 pub use index::index_repo;
-pub use types::{finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
+pub use types::{dedupe_ids, finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
