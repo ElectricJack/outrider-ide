@@ -1,6 +1,9 @@
 use outrider_layout::RATIO;
 
 pub const CELL_ASPECT: f64 = 3.0;
+/// Width falloff per depth. Deliberately gentler than the 8x cell-height
+/// ratio so deeper columns stay readable; heights alone carry the grid.
+pub const COLUMN_SHRINK: f64 = 0.5;
 pub const MERGE_PX: f64 = 4.0;
 pub const LABEL_PX: f64 = 20.0;
 pub const CARD_PX: f64 = 80.0;
@@ -18,16 +21,20 @@ pub fn column_scale(depth: u8) -> f64 {
     (RATIO as f64).powi(-(depth as i32))
 }
 
-/// X_d = CELL_ASPECT * (1 - 8^-d) * 8/7 — where the depth-d column begins.
-pub fn column_x(depth: u8) -> f64 {
-    let r = RATIO as f64;
-    CELL_ASPECT * (1.0 - column_scale(depth)) * r / (r - 1.0)
+/// Width of the depth-d column: CELL_ASPECT * COLUMN_SHRINK^d.
+pub fn column_width(depth: u8) -> f64 {
+    CELL_ASPECT * COLUMN_SHRINK.powi(depth as i32)
 }
 
-/// Total world width: the columns converge to CELL_ASPECT * 8/7.
+/// X_d = CELL_ASPECT * (1 - COLUMN_SHRINK^d) / (1 - COLUMN_SHRINK) —
+/// where the depth-d column begins (sum of shallower column widths).
+pub fn column_x(depth: u8) -> f64 {
+    CELL_ASPECT * (1.0 - COLUMN_SHRINK.powi(depth as i32)) / (1.0 - COLUMN_SHRINK)
+}
+
+/// Total world width: the columns converge to CELL_ASPECT / (1 - COLUMN_SHRINK).
 pub fn world_width() -> f64 {
-    let r = RATIO as f64;
-    CELL_ASPECT * r / (r - 1.0)
+    CELL_ASPECT / (1.0 - COLUMN_SHRINK)
 }
 
 pub fn node_world_rect(depth: u8, abs_start: f64, len: u64) -> WorldRect {
@@ -35,7 +42,7 @@ pub fn node_world_rect(depth: u8, abs_start: f64, len: u64) -> WorldRect {
     WorldRect {
         x: column_x(depth),
         y: abs_start * s,
-        w: CELL_ASPECT * s,
+        w: column_width(depth),
         h: len as f64 * s,
     }
 }
@@ -184,13 +191,14 @@ mod tests {
     fn culling_home_view_prunes_submerge_nodes() {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
-        let cam = Camera::frame(world_width(), 1.0, 800.0, 600.0); // zoom ≈ 222.22
+        let cam = Camera::frame(world_width(), 1.0, 800.0, 600.0); // zoom ≈ 126.98
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        // g is ~3.47px tall at home zoom -> merged into b.rs
+        // g is ~1.98px tall at home zoom -> merged into b.rs
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f"]);
         let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
-        assert_eq!(rungs, vec![Rung::Card, Rung::Card, Rung::Label, Rung::Dot]);
+        // heights: root 127px, a.rs 63.5px, b.rs 15.9px, f 5.95px
+        assert_eq!(rungs, vec![Rung::Card, Rung::Label, Rung::Dot, Rung::Dot]);
     }
 
     #[test]
@@ -207,18 +215,18 @@ mod tests {
     fn culling_recurses_past_offscreen_left_parent() {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
-        // Zoomed onto b.rs's children: root column entirely off-screen left,
-        // a.rs off-screen top, but b.rs/f/g visible.
-        let cam = Camera { center_x: 3.4, center_y: 0.69, zoom: 2000.0 };
+        // Zoomed onto b.rs's children: root and b.rs columns end off-screen
+        // left (both skipped but recursed), a.rs off-screen top, f/g visible.
+        let cam = Camera { center_x: 4.9, center_y: 0.69, zoom: 2000.0 };
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        assert_eq!(names, vec!["b.rs", "f", "g"]);
-        // hand-computed rect for b.rs: x=(3.0-3.4)*2000+400, y=(0.625-0.69)*2000+300, w=0.375*2000, h=0.125*2000
-        let b = &items[0].px;
-        assert!((b.x - -400.0).abs() < 1e-6, "{}", b.x);
-        assert!((b.y - 170.0).abs() < 1e-6, "{}", b.y);
-        assert!((b.w - 750.0).abs() < 1e-6, "{}", b.w);
-        assert!((b.h - 250.0).abs() < 1e-6, "{}", b.h);
+        assert_eq!(names, vec!["f", "g"]);
+        // hand-computed rect for f: x=(4.5-4.9)*2000+400, y=(0.625-0.69)*2000+300, w=0.75*2000, h=(3/64)*2000
+        let f = &items[0].px;
+        assert!((f.x - -400.0).abs() < 1e-6, "{}", f.x);
+        assert!((f.y - 170.0).abs() < 1e-6, "{}", f.y);
+        assert!((f.w - 1500.0).abs() < 1e-6, "{}", f.w);
+        assert!((f.h - 93.75).abs() < 1e-6, "{}", f.h);
     }
 
     #[test]
@@ -226,10 +234,13 @@ mod tests {
         close(column_scale(0), 1.0);
         close(column_scale(1), 0.125);
         close(column_scale(2), 0.015625);
+        close(column_width(0), 3.0);
+        close(column_width(1), 1.5);
+        close(column_width(2), 0.75);
         close(column_x(0), 0.0);
         close(column_x(1), 3.0);
-        close(column_x(2), 3.375);
-        close(world_width(), 24.0 / 7.0);
+        close(column_x(2), 4.5);
+        close(world_width(), 6.0);
     }
 
     #[test]
@@ -242,9 +253,9 @@ mod tests {
         close(r.h, 1.0);
         // b.rs::g — depth 2, abs cell 44, len 1 (Phase 2 worked example)
         let g = node_world_rect(2, 44.0, 1);
-        close(g.x, 3.375);
+        close(g.x, 4.5);
         close(g.y, 0.6875);
-        close(g.w, 0.046875);
+        close(g.w, 0.75);
         close(g.h, 0.015625);
     }
 

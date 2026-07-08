@@ -63,11 +63,16 @@ One level-0 cell is 1.0 world unit tall.
 
 - `CELL_ASPECT = 3.0` — a column is 3× the height of its cell (an 80 px cell
   sits in a ~240 px column). Tunable constant in `world.rs`.
-- Column width at depth d: `w_d = CELL_ASPECT / 8^d`.
-- Column x-origin: `X_d = CELL_ASPECT · (1 − 8⁻ᵈ) · 8/7`. Total world width
-  converges to `CELL_ASPECT · 8/7`; "fully zoomed out" is a finite frame.
+- `COLUMN_SHRINK = 0.5` — width falloff per depth, deliberately gentler than
+  the 8× cell-height ratio so deeper columns stay readable (tuned at the
+  Phase 3 exit gate; the original 8× width falloff made ancestor columns
+  dominate the screen). Heights alone carry the grid.
+- Column width at depth d: `w_d = CELL_ASPECT · COLUMN_SHRINK^d`.
+- Column x-origin: `X_d = CELL_ASPECT · (1 − COLUMN_SHRINK^d) / (1 −
+  COLUMN_SHRINK)`. Total world width converges to `CELL_ASPECT / (1 −
+  COLUMN_SHRINK)`; "fully zoomed out" is a finite frame.
 - Node world rect (all f64):
-  - `x = X_depth`, `width = CELL_ASPECT / 8^depth`
+  - `x = X_depth`, `width = CELL_ASPECT · COLUMN_SHRINK^depth`
   - `y = abs_start / 8^depth`, `height = len / 8^depth`
   - `abs_start` composed alongside the tree walk by the layout recurrence
     `abs = parent_abs · 8 + start` (same rule as
