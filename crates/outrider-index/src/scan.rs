@@ -16,12 +16,17 @@ pub struct ScannedFile {
 /// Walk the repo honoring .gitignore / standard ignore files (spec §5.1).
 /// `require_git(false)` so ignore rules also apply in non-git dirs (fixtures).
 /// Hidden files (dotfiles, .git) are skipped by the walker's default.
+/// Generated lock files (Cargo.lock etc.) are skipped: they are not source,
+/// and their size dwarfs real files in the treemap.
 pub fn scan_files(repo_root: &Path) -> anyhow::Result<Vec<ScannedFile>> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(repo_root).require_git(false).build();
     for entry in walker {
         let entry = entry?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if entry.path().extension().is_some_and(|e| e == "lock") {
             continue;
         }
         let rel_path = entry

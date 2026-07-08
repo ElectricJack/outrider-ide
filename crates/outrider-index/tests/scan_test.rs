@@ -15,7 +15,8 @@ fn scan_respects_gitignore_and_builds_sorted_tree() {
         .map(|f| f.rel_path.to_string_lossy().into_owned())
         .collect();
     // generated/ and *.log excluded by .gitignore; .gitignore itself is a
-    // dotfile, skipped by the walker's hidden-files default.
+    // dotfile, skipped by the walker's hidden-files default; Cargo.lock
+    // excluded by the *.lock filter (generated, not source).
     assert_eq!(paths, vec!["README.md", "src/lib.rs", "src/util.rs"]);
 
     let tree = build_tree(dir.path(), &files, &BTreeMap::new());
