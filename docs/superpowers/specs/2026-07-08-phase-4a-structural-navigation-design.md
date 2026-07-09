@@ -89,10 +89,12 @@ pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64,
   viewport height (Card territory, siblings and parent visible around it —
   "frame focus plus its parent" in the column model, where ancestors are
   always on-screen as the columns to the left). *Amended after the 4b exit
-  gate:* arrow steps use `frame_band_step`, which floors the target zoom at
-  the current (or live tween target) zoom — stepping never zooms out, so
-  stepping between methods after End stays at Full instead of dropping the
-  box back below `FULL_PX`.
+  gate (second pass):* the step fraction is **sticky** — End sets it to
+  `END_FRACTION`, Home resets it to `FOCUS_FRACTION`, and every arrow step
+  re-frames the new focus at the sticky fraction. Re-framing per node keeps
+  the fidelity rung constant across different-sized siblings (a first-pass
+  zoom floor did not: box height is zoom × node height, so a smaller
+  sibling dropped below `FULL_PX`), and Left zooms out to frame the parent.
 - `END_FRACTION = 0.95` — **End** frames the focus to fill the viewport.
 - **Home** keeps its current framing (`Camera::frame`) but now animates.
 - Constants live in `camera.rs`, tunable at the exit gate.
@@ -142,10 +144,11 @@ animation frame, and clears it when done.
 ## 6. Input wiring (`treemap.rs`)
 
 - Key handlers: Right/Left/Up/Down mutate `Focus` then tween to
-  `frame_band_step(world_band(focus), vh, current_zoom, …)` (FOCUS_FRACTION
-  framing floored at the current zoom); End tweens to
-  `END_FRACTION` framing of the current focus (no focus change); Home
-  tweens to `Camera::frame(root_world_height(), vh)`.
+  `frame_band(world_band(focus), vh, step_fraction, …)`, where
+  `step_fraction` is the view's sticky fraction (FOCUS_FRACTION by
+  default); End sets the sticky fraction to `END_FRACTION` and tweens to
+  that framing of the current focus (no focus change); Home resets the
+  sticky fraction and tweens to `Camera::frame(root_world_height(), vh)`.
 - Click: hit-test → focus change only.
 - Zoom clamps stay as computed today (min = 0.5 × home zoom,
   max = vh · 8¹⁵); framing targets are clamped through the same values.

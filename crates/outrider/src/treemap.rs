@@ -48,6 +48,12 @@ pub struct TreemapView {
     drag_last: Option<gpui::Point<Pixels>>,
     press_origin: Option<gpui::Point<Pixels>>,
     focus: Focus,
+    /// Sticky framing fraction for arrow steps: FOCUS_FRACTION by default,
+    /// END_FRACTION after End, reset by Home. Re-framing every step at this
+    /// fraction keeps the fidelity rung constant across different-sized
+    /// nodes (a zoom floor cannot: box height = zoom × node height) and
+    /// lets Left zoom out to frame the parent.
+    step_fraction: f64,
     tween: Option<(CameraTween, std::time::Instant)>,
     focus_handle: FocusHandle,
     buffers: BufferManager,
@@ -197,6 +203,7 @@ impl TreemapView {
             drag_last: None,
             press_origin: None,
             focus: Focus::new(root_id),
+            step_fraction: camera::FOCUS_FRACTION,
             tween: None,
             focus_handle: cx.focus_handle(),
             buffers,
@@ -393,21 +400,18 @@ impl Render for TreemapView {
                         if !moved {
                             return;
                         }
-                        // Floor at the tween target when one is live: stepping
-                        // right after End must keep the End zoom, not the
-                        // mid-flight sample.
-                        let cur_zoom = this
-                            .tween
-                            .map(|(tw, _)| tw.to.zoom)
-                            .unwrap_or_else(|| this.camera.expect("checked above").zoom);
                         world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
-                            camera::frame_band_step(y, h, vh, cur_zoom, min_zoom, max_zoom)
+                            camera::frame_band(y, h, vh, this.step_fraction, min_zoom, max_zoom)
                         })
                     }
-                    "end" => world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
-                        camera::frame_band(y, h, vh, camera::END_FRACTION, min_zoom, max_zoom)
-                    }),
+                    "end" => {
+                        this.step_fraction = camera::END_FRACTION;
+                        world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
+                            camera::frame_band(y, h, vh, camera::END_FRACTION, min_zoom, max_zoom)
+                        })
+                    }
                     "home" => {
+                        this.step_fraction = camera::FOCUS_FRACTION;
                         let c = this.home_camera(vh);
                         this.home_zoom = c.zoom;
                         Some(c)
