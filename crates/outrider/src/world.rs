@@ -3,6 +3,10 @@ use outrider_layout::RATIO;
 pub const MERGE_PX: f64 = 4.0;
 pub const LABEL_PX: f64 = 20.0;
 pub const CARD_PX: f64 = 80.0;
+pub const DETAIL_PX: f64 = 250.0;
+pub const FULL_PX: f64 = 700.0;
+/// Full is useless in a sliver column; below this width it downgrades to Detail.
+pub const CODE_MIN_W: f64 = 300.0;
 
 /// The normalized column stack sums to this fraction of the viewport width
 /// at every zoom, eliminating the mid-octave total-width dip of the raw
@@ -103,7 +107,8 @@ pub fn column_table(zoom: f64, vw: f64, max_depth: usize) -> Vec<ColPx> {
 }
 
 /// Rung by pixel height, downgraded to Dot when the column is too narrow
-/// for text (gutter strips). Heights below MERGE_PX merge into the parent.
+/// for text (gutter strips) and from Full to Detail when too narrow for
+/// code. Heights below MERGE_PX merge into the parent.
 pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
     let by_height = if px_h < MERGE_PX {
         return None;
@@ -111,10 +116,15 @@ pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
         Rung::Dot
     } else if px_h < CARD_PX {
         Rung::Label
-    } else {
+    } else if px_h < DETAIL_PX {
         Rung::Card
+    } else if px_h < FULL_PX {
+        Rung::Detail
+    } else {
+        Rung::Full
     };
-    Some(if px_w < LABEL_MIN_W { Rung::Dot } else { by_height })
+    let rung = if px_w < LABEL_MIN_W { Rung::Dot } else { by_height };
+    Some(if rung == Rung::Full && px_w < CODE_MIN_W { Rung::Detail } else { rung })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +132,8 @@ pub enum Rung {
     Dot,
     Label,
     Card,
+    Detail,
+    Full,
 }
 
 use outrider_index::{SymbolId, SymbolNode, SymbolTree};
@@ -142,6 +154,9 @@ pub struct DrawItem<'a> {
     pub node: &'a SymbolNode,
     pub px: PxRect,
     pub rung: Rung,
+    /// UNclipped screen-y of the box top (`px.y` is clipped to the viewport).
+    #[allow(dead_code)]
+    pub top: f64,
 }
 
 /// Cull the tree against the viewport and the 4px merge rule.
@@ -204,7 +219,7 @@ fn walk<'a>(
     // The rung above is chosen from the UNclipped height.
     let y0 = px_y.max(-2.0);
     let y1 = (px_y + px_h).min(vh + 2.0);
-    out.push(DrawItem { node, px: PxRect { x: px_x, y: y0, w: px_w, h: y1 - y0 }, rung });
+    out.push(DrawItem { node, px: PxRect { x: px_x, y: y0, w: px_w, h: y1 - y0 }, rung, top: px_y });
     for child in &node.children {
         walk(child, layout, camera, cols, vw, vh, abs, out);
     }
@@ -362,9 +377,18 @@ mod tests {
         assert_eq!(rung_for(20.0, 400.0), Some(Rung::Label));
         assert_eq!(rung_for(79.9, 400.0), Some(Rung::Label));
         assert_eq!(rung_for(80.0, 400.0), Some(Rung::Card));
+        assert_eq!(rung_for(249.9, 400.0), Some(Rung::Card));
+        assert_eq!(rung_for(250.0, 400.0), Some(Rung::Detail));
+        assert_eq!(rung_for(699.9, 400.0), Some(Rung::Detail));
+        assert_eq!(rung_for(700.0, 400.0), Some(Rung::Full));
         // narrow columns are forced to Dot regardless of height (gutters)
         assert_eq!(rung_for(100_000.0, 59.9), Some(Rung::Dot));
-        assert_eq!(rung_for(100_000.0, 60.0), Some(Rung::Card));
+        // Full downgrades to Detail when too narrow for code (spec §4.2)
+        assert_eq!(rung_for(100_000.0, 60.0), Some(Rung::Detail));
+        assert_eq!(rung_for(100_000.0, 299.9), Some(Rung::Detail));
+        assert_eq!(rung_for(100_000.0, 300.0), Some(Rung::Full));
+        // the CODE_MIN_W downgrade applies only to Full
+        assert_eq!(rung_for(100.0, 60.0), Some(Rung::Card));
         // the merge rule wins over everything
         assert_eq!(rung_for(3.9, 24.0), None);
     }
@@ -390,10 +414,7 @@ mod tests {
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
         let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
         // heights: root 571.4, a.rs 285.7, b.rs 71.4, f 26.8, g 8.9
-        // tree max level 2 → 3 columns normalized to 0.95·800 = 760:
-        // weights (0.35)^⅔, (5/14)^⅔, (5/112)^⅔ → widths 335.25, 339.80, 84.95
-        // (f is 84.9px wide, ≥ LABEL_MIN_W, so it keeps its height rung)
-        assert_eq!(rungs, vec![Rung::Card, Rung::Card, Rung::Label, Rung::Label, Rung::Dot]);
+        assert_eq!(rungs, vec![Rung::Detail, Rung::Detail, Rung::Label, Rung::Label, Rung::Dot]);
         // externally computed px rect for f (zoom = 4000/7):
         // x = w0+w1, y = 0.125·zoom + 300, w = w2, h = 3·zoom/64
         let f = &items[3].px;
@@ -432,8 +453,9 @@ mod tests {
         // a.rs and f are entirely above the viewport (y-pruned)
         assert_eq!(names, vec!["", "b.rs", "g"]);
         let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
-        // root is narrow (36.2 < LABEL_MIN_W) → Dot; b.rs still wide → Card
-        assert_eq!(rungs, vec![Rung::Dot, Rung::Card, Rung::Card]);
+        // root narrow (36.2 < LABEL_MIN_W) → Dot; b.rs Full-height but
+        // 144.76 < CODE_MIN_W → Detail; g 571.4px → Detail
+        assert_eq!(rungs, vec![Rung::Dot, Rung::Detail, Rung::Detail]);
         // root strip: x=0, w=36.19, y clipped to [-2, 602]
         let root = &items[0].px;
         assert!((root.x - 0.0).abs() < 1e-6 && (root.w - 36.1904762).abs() < 1e-6, "{:?}", root);
@@ -448,6 +470,9 @@ mod tests {
         for i in &items {
             assert!(i.px.y >= -2.0 - 1e-9 && i.px.y + i.px.h <= 602.0 + 1e-9);
         }
+        // DrawItem.top is the UNclipped screen top (px.y is clipped to -2)
+        assert!((items[0].top - (300.0 - 0.6875 * (256000.0 / 7.0))).abs() < 1e-6);
+        assert!((items[2].top - 300.0).abs() < 1e-6); // on-screen: top == px.y
     }
 
     #[test]
