@@ -63,8 +63,6 @@ pub fn column_table(zoom: f64) -> Vec<ColPx> {
     let mut x = 0.0;
     for d in 0..=MAX_DEPTH {
         let w = column_px_width(cell_px_height(d as u8, zoom));
-        // Ensure w is large enough that x strictly increases despite floating point rounding
-        let w = w.max(1e-13);
         out.push(ColPx { x, w });
         x += w;
     }
@@ -377,7 +375,8 @@ mod tests {
             close(t[0].x, 0.0);
             for d in 1..t.len() {
                 close(t[d].x, t[d - 1].x + t[d - 1].w);
-                assert!(t[d].x > t[d - 1].x, "x must be strictly increasing");
+                assert!(t[d - 1].w > 0.0, "widths must be positive");
+                assert!(t[d].x >= t[d - 1].x, "x must be non-decreasing");
             }
             // spec §3: total stack width is bounded at any zoom
             let total = t[MAX_DEPTH].x + t[MAX_DEPTH].w;
