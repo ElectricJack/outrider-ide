@@ -1,9 +1,6 @@
 use outrider_layout::RATIO;
 
 pub const CELL_ASPECT: f64 = 3.0;
-/// Width falloff per depth. Deliberately gentler than the 8x cell-height
-/// ratio so deeper columns stay readable; heights alone carry the grid.
-pub const COLUMN_SHRINK: f64 = 0.5;
 pub const MERGE_PX: f64 = 4.0;
 pub const LABEL_PX: f64 = 20.0;
 pub const CARD_PX: f64 = 80.0;
@@ -15,21 +12,12 @@ pub const LABEL_MIN_W: f64 = 60.0;
 /// Depths beyond this are sub-merge at any legal zoom (max zoom = vh·8^15).
 pub const MAX_DEPTH: usize = 24;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WorldRect {
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
-}
-
 /// 8^-depth: the size scale of level-`depth` cells relative to level 0.
 pub fn column_scale(depth: u8) -> f64 {
     (RATIO as f64).powi(-(depth as i32))
 }
 
 /// Pixel height of one level-`depth` cell at `zoom` (px per world unit).
-#[allow(dead_code)]
 pub fn cell_px_height(depth: u8, zoom: f64) -> f64 {
     zoom * column_scale(depth)
 }
@@ -38,7 +26,6 @@ pub fn cell_px_height(depth: u8, zoom: f64) -> f64 {
 /// CELL_ASPECT·h until the peak (h = MAX/CELL_ASPECT, cells comfortably in
 /// Card rung), then decays as 1/h — 8× per zoom octave on both sides, so the
 /// profile is self-similar — floored at the gutter for zoomed-past ancestors.
-#[allow(dead_code)]
 pub fn column_px_width(h: f64) -> f64 {
     let peak_h = MAX_COLUMN_PX / CELL_ASPECT;
     if h <= peak_h {
@@ -49,7 +36,6 @@ pub fn column_px_width(h: f64) -> f64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 pub struct ColPx {
     pub x: f64,
     pub w: f64,
@@ -57,7 +43,6 @@ pub struct ColPx {
 
 /// Per-frame column table: x is the prefix sum of shallower widths — the
 /// stack is left-anchored at x = 0 and fully determined by zoom.
-#[allow(dead_code)]
 pub fn column_table(zoom: f64) -> Vec<ColPx> {
     let mut out = Vec::with_capacity(MAX_DEPTH + 1);
     let mut x = 0.0;
@@ -71,7 +56,6 @@ pub fn column_table(zoom: f64) -> Vec<ColPx> {
 
 /// Rung by pixel height, downgraded to Dot when the column is too narrow
 /// for text (gutter strips). Heights below MERGE_PX merge into the parent.
-#[allow(dead_code)]
 pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
     let by_height = if px_h < MERGE_PX {
         return None;
@@ -85,49 +69,11 @@ pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
     Some(if px_w < LABEL_MIN_W { Rung::Dot } else { by_height })
 }
 
-/// Width of the depth-d column: CELL_ASPECT * COLUMN_SHRINK^d.
-pub fn column_width(depth: u8) -> f64 {
-    CELL_ASPECT * COLUMN_SHRINK.powi(depth as i32)
-}
-
-/// X_d = CELL_ASPECT * (1 - COLUMN_SHRINK^d) / (1 - COLUMN_SHRINK) —
-/// where the depth-d column begins (sum of shallower column widths).
-pub fn column_x(depth: u8) -> f64 {
-    CELL_ASPECT * (1.0 - COLUMN_SHRINK.powi(depth as i32)) / (1.0 - COLUMN_SHRINK)
-}
-
-/// Total world width: the columns converge to CELL_ASPECT / (1 - COLUMN_SHRINK).
-pub fn world_width() -> f64 {
-    CELL_ASPECT / (1.0 - COLUMN_SHRINK)
-}
-
-pub fn node_world_rect(depth: u8, abs_start: f64, len: u64) -> WorldRect {
-    let s = column_scale(depth);
-    WorldRect {
-        x: column_x(depth),
-        y: abs_start * s,
-        w: column_width(depth),
-        h: len as f64 * s,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rung {
     Dot,
     Label,
     Card,
-}
-
-pub fn rung_for_px_height(h: f64) -> Option<Rung> {
-    if h < MERGE_PX {
-        None
-    } else if h < LABEL_PX {
-        Some(Rung::Dot)
-    } else if h < CARD_PX {
-        Some(Rung::Label)
-    } else {
-        Some(Rung::Card)
-    }
 }
 
 use outrider_index::{SymbolNode, SymbolTree};
@@ -159,15 +105,18 @@ pub fn visible_nodes<'a>(
     vw: f64,
     vh: f64,
 ) -> Vec<DrawItem<'a>> {
+    let cols = column_table(camera.zoom);
     let mut out = Vec::new();
-    walk(&tree.root, layout, camera, vw, vh, 0.0, &mut out);
+    walk(&tree.root, layout, camera, &cols, vw, vh, 0.0, &mut out);
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk<'a>(
     node: &'a SymbolNode,
     layout: &WorldLayout,
     camera: &Camera,
+    cols: &[ColPx],
     vw: f64,
     vh: f64,
     parent_abs: f64,
@@ -177,14 +126,14 @@ fn walk<'a>(
     let depth = nl.cells.level;
     let abs = parent_abs * outrider_layout::RATIO as f64 + nl.cells.start as f64;
     debug_assert!(abs < 2f64.powi(53), "cell address exceeds exact f64 range");
-    let rect = node_world_rect(depth, abs, nl.cells.len);
-    let (px_x, px_y) = camera.world_to_screen(rect.x, rect.y, vw, vh);
-    let px_w = rect.w * camera.zoom;
-    let px_h = rect.h * camera.zoom;
+    let s = column_scale(depth);
+    let px_y = camera.world_to_screen_y(abs * s, vh);
+    let px_h = nl.cells.len as f64 * s * camera.zoom;
+    let Some(&ColPx { x: px_x, w: px_w }) = cols.get(depth as usize) else { return };
 
     // Below the merge threshold: this node merges into its parent's tile,
     // and children (8x smaller) are below it too. Stop.
-    let Some(rung) = rung_for_px_height(px_h) else { return };
+    let Some(rung) = rung_for(px_h, px_w) else { return };
     // Children's y-ranges are contained in the parent's: off-screen y prunes the subtree.
     if px_y > vh || px_y + px_h < 0.0 {
         return;
@@ -193,13 +142,14 @@ fn walk<'a>(
     if px_x > vw {
         return;
     }
-    // The node's own column may be off-screen left while children are visible:
-    // skip drawing but keep recursing.
-    if px_x + px_w > 0.0 {
-        out.push(DrawItem { node, px: PxRect { x: px_x, y: px_y, w: px_w, h: px_h }, rung });
-    }
+    // Zoomed-past ancestors have enormous pixel heights; clip to the viewport
+    // (2px slack keeps their borders off-screen) before f32 ever sees them.
+    // The rung above is chosen from the UNclipped height.
+    let y0 = px_y.max(-2.0);
+    let y1 = (px_y + px_h).min(vh + 2.0);
+    out.push(DrawItem { node, px: PxRect { x: px_x, y: y0, w: px_w, h: y1 - y0 }, rung });
     for child in &node.children {
-        walk(child, layout, camera, vw, vh, abs, out);
+        walk(child, layout, camera, cols, vw, vh, abs, out);
     }
 }
 
@@ -252,86 +202,13 @@ mod tests {
     }
 
     #[test]
-    fn culling_home_view_prunes_submerge_nodes() {
-        let tree = worked_example();
-        let layout = outrider_layout::layout(&tree);
-        let cam = Camera::frame(world_width(), 1.0, 800.0, 600.0); // zoom ≈ 126.98
-        let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
-        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        // g is ~1.98px tall at home zoom -> merged into b.rs
-        assert_eq!(names, vec!["", "a.rs", "b.rs", "f"]);
-        let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
-        // heights: root 127px, a.rs 63.5px, b.rs 15.9px, f 5.95px
-        assert_eq!(rungs, vec![Rung::Card, Rung::Label, Rung::Dot, Rung::Dot]);
-    }
-
-    #[test]
     fn culling_offscreen_y_is_empty() {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
-        let mut cam = Camera::frame(world_width(), 1.0, 800.0, 600.0);
+        let mut cam = Camera::frame(1.0, 600.0);
         cam.center_y = 100.0; // world is y ∈ [0,1]
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         assert!(items.is_empty());
-    }
-
-    #[test]
-    fn culling_recurses_past_offscreen_left_parent() {
-        let tree = worked_example();
-        let layout = outrider_layout::layout(&tree);
-        // Zoomed onto b.rs's children: root and b.rs columns end off-screen
-        // left (both skipped but recursed), a.rs off-screen top, f/g visible.
-        let cam = Camera { center_x: 4.9, center_y: 0.69, zoom: 2000.0 };
-        let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
-        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        assert_eq!(names, vec!["f", "g"]);
-        // hand-computed rect for f: x=(4.5-4.9)*2000+400, y=(0.625-0.69)*2000+300, w=0.75*2000, h=(3/64)*2000
-        let f = &items[0].px;
-        assert!((f.x - -400.0).abs() < 1e-6, "{}", f.x);
-        assert!((f.y - 170.0).abs() < 1e-6, "{}", f.y);
-        assert!((f.w - 1500.0).abs() < 1e-6, "{}", f.w);
-        assert!((f.h - 93.75).abs() < 1e-6, "{}", f.h);
-    }
-
-    #[test]
-    fn column_geometry() {
-        close(column_scale(0), 1.0);
-        close(column_scale(1), 0.125);
-        close(column_scale(2), 0.015625);
-        close(column_width(0), 3.0);
-        close(column_width(1), 1.5);
-        close(column_width(2), 0.75);
-        close(column_x(0), 0.0);
-        close(column_x(1), 3.0);
-        close(column_x(2), 4.5);
-        close(world_width(), 6.0);
-    }
-
-    #[test]
-    fn worked_example_rects() {
-        // root {0,0,1}
-        let r = node_world_rect(0, 0.0, 1);
-        close(r.x, 0.0);
-        close(r.y, 0.0);
-        close(r.w, 3.0);
-        close(r.h, 1.0);
-        // b.rs::g — depth 2, abs cell 44, len 1 (Phase 2 worked example)
-        let g = node_world_rect(2, 44.0, 1);
-        close(g.x, 4.5);
-        close(g.y, 0.6875);
-        close(g.w, 0.75);
-        close(g.h, 0.015625);
-    }
-
-    #[test]
-    fn rung_thresholds() {
-        assert_eq!(rung_for_px_height(3.9), None);
-        assert_eq!(rung_for_px_height(4.0), Some(Rung::Dot));
-        assert_eq!(rung_for_px_height(19.9), Some(Rung::Dot));
-        assert_eq!(rung_for_px_height(20.0), Some(Rung::Label));
-        assert_eq!(rung_for_px_height(79.9), Some(Rung::Label));
-        assert_eq!(rung_for_px_height(80.0), Some(Rung::Card));
-        assert_eq!(rung_for_px_height(100_000.0), Some(Rung::Card));
     }
 
     #[test]
@@ -398,5 +275,77 @@ mod tests {
         assert_eq!(rung_for(100_000.0, 60.0), Some(Rung::Card));
         // the merge rule wins over everything
         assert_eq!(rung_for(3.9, 24.0), None);
+    }
+
+    #[test]
+    fn worked_example_bands() {
+        // y-composition unchanged from the world-space model:
+        // b.rs::g — depth 2, abs cell 44, len 1 → y = 44/64, h = 1/64
+        let s = column_scale(2);
+        close(44.0 * s, 0.6875);
+        close(1.0 * s, 0.015625);
+    }
+
+    #[test]
+    fn culling_home_view() {
+        let tree = worked_example();
+        let layout = outrider_layout::layout(&tree);
+        // Home: root band (world height 1.0) fits 600px with 5% margin → zoom = 4000/7
+        let cam = Camera::frame(1.0, 600.0);
+        let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        // home zoom is now height-only (571.4) — even g (8.9px) is above merge
+        assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
+        let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
+        // heights: root 571.4, a.rs 285.7, b.rs 71.4, f 26.8, g 8.9
+        // widths:  d0 93.33 (decay side), d1 214.29, d2 26.79 (< LABEL_MIN_W → Dot)
+        assert_eq!(rungs, vec![Rung::Card, Rung::Card, Rung::Label, Rung::Dot, Rung::Dot]);
+        // hand-computed px rect for f (zoom = 4000/7):
+        // x = w0+w1 = 280/3 + 1500/7, y = 0.125·zoom + 300, w = 3·zoom/64, h = 3·zoom/64
+        let f = &items[3].px;
+        assert!((f.x - 307.6190476).abs() < 1e-6, "{}", f.x);
+        assert!((f.y - 371.4285714).abs() < 1e-6, "{}", f.y);
+        assert!((f.w - 26.7857143).abs() < 1e-6, "{}", f.w);
+        assert!((f.h - 26.7857143).abs() < 1e-6, "{}", f.h);
+    }
+
+    #[test]
+    fn culling_x_prune_stops_recursion() {
+        let tree = worked_example();
+        let layout = outrider_layout::layout(&tree);
+        let cam = Camera::frame(1.0, 600.0);
+        // viewport only 80px wide: x1 = 93.33 > 80 → depth ≥ 1 pruned
+        let items = visible_nodes(&tree, &layout, &cam, 80.0, 600.0);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        assert_eq!(names, vec![""]);
+    }
+
+    #[test]
+    fn gutters_are_clipped_narrow_dots() {
+        let tree = worked_example();
+        let layout = outrider_layout::layout(&tree);
+        // two octaves past home (zoom·64), centered on g: root and b.rs are
+        // zoomed-past ancestors → 24px gutter strips, clipped to the viewport
+        let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
+        let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        // a.rs and f are entirely above the viewport (y-pruned)
+        assert_eq!(names, vec!["", "b.rs", "g"]);
+        let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
+        assert_eq!(rungs, vec![Rung::Dot, Rung::Dot, Rung::Card]);
+        // root gutter: x=0, w=24, y clipped to [-2, 602]
+        let root = &items[0].px;
+        assert!((root.x - 0.0).abs() < 1e-6 && (root.w - 24.0).abs() < 1e-6);
+        assert!((root.y - -2.0).abs() < 1e-6 && (root.h - 604.0).abs() < 1e-6);
+        // g: x = 24+24 = 48, w = 93.33 (decay side), y = 300, h clipped to 302
+        let g = &items[2].px;
+        assert!((g.x - 48.0).abs() < 1e-6, "{}", g.x);
+        assert!((g.w - 93.3333333).abs() < 1e-6, "{}", g.w);
+        assert!((g.y - 300.0).abs() < 1e-6, "{}", g.y);
+        assert!((g.h - 302.0).abs() < 1e-6, "{}", g.h);
+        // nothing exceeds the clipped viewport band
+        for i in &items {
+            assert!(i.px.y >= -2.0 - 1e-9 && i.px.y + i.px.h <= 602.0 + 1e-9);
+        }
     }
 }

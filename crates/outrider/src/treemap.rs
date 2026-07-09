@@ -72,13 +72,13 @@ impl TreemapView {
             .unwrap_or(1.0)
     }
 
-    fn home_camera(&self, vw: f64, vh: f64) -> Camera {
-        Camera::frame(world::world_width(), self.root_world_height(), vw, vh)
+    fn home_camera(&self, vh: f64) -> Camera {
+        Camera::frame(self.root_world_height(), vh)
     }
 
     fn paint_items(&mut self, vw: f64, vh: f64) -> Vec<PaintItem> {
         if self.camera.is_none() {
-            let c = self.home_camera(vw, vh);
+            let c = self.home_camera(vh);
             self.home_zoom = c.zoom;
             self.camera = Some(c);
         }
@@ -142,9 +142,9 @@ impl Render for TreemapView {
                     return;
                 }
                 let Some(last) = this.drag_last else { return };
-                let (dx, dy) = (f64::from(e.position.x - last.x), f64::from(e.position.y - last.y));
+                let dy = f64::from(e.position.y - last.y);
                 if let Some(cam) = this.camera.as_mut() {
-                    cam.pan(dx, dy);
+                    cam.pan(dy);
                 }
                 this.drag_last = Some(e.position);
                 cx.notify();
@@ -154,28 +154,18 @@ impl Render for TreemapView {
                     gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
                     gpui::ScrollDelta::Lines(l) => l.y as f64 * 40.0,
                 };
-                let vp = w.viewport_size();
-                let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
+                let vh = f64::from(w.viewport_size().height);
                 if let Some(cam) = this.camera.as_mut() {
                     // scroll up (positive dy) zooms in; flip the sign here if
                     // manual testing shows it inverted on this platform
                     let factor = (dy * 0.002).exp();
-                    cam.zoom_about(
-                        f64::from(e.position.x),
-                        f64::from(e.position.y),
-                        vw,
-                        vh,
-                        factor,
-                        min_zoom,
-                        max_zoom,
-                    );
+                    cam.zoom_about(f64::from(e.position.y), vh, factor, min_zoom, max_zoom);
                 }
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
                 if e.keystroke.key == "home" {
-                    let vp = w.viewport_size();
-                    let c = this.home_camera(f64::from(vp.width), f64::from(vp.height));
+                    let c = this.home_camera(f64::from(w.viewport_size().height));
                     this.home_zoom = c.zoom;
                     this.camera = Some(c);
                     cx.notify();
