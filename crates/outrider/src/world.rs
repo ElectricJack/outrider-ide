@@ -124,7 +124,7 @@ pub enum Rung {
     Card,
 }
 
-use outrider_index::{SymbolNode, SymbolTree};
+use outrider_index::{SymbolId, SymbolNode, SymbolTree};
 use outrider_layout::WorldLayout;
 
 use crate::camera::Camera;
@@ -208,6 +208,28 @@ fn walk<'a>(
     for child in &node.children {
         walk(child, layout, camera, cols, vw, vh, abs, out);
     }
+}
+
+/// Absolute world-y band (y, h) of a node: full ancestor composition via
+/// WorldLayout::absolute_start, then y = abs·8^-level, h = len·8^-level.
+/// (The render walk composes incrementally; this is for framing targets.)
+#[allow(dead_code)] // TODO(task 3): remove
+pub fn world_band(id: &SymbolId, layout: &WorldLayout) -> Option<(f64, f64)> {
+    let nl = layout.nodes.get(id)?;
+    let abs = layout.absolute_start(id)? as f64;
+    debug_assert!(abs < 2f64.powi(53), "cell address exceeds exact f64 range");
+    let s = column_scale(nl.cells.level);
+    Some((abs * s, nl.cells.len as f64 * s))
+}
+
+/// Visible node containing the point. Columns are horizontally disjoint,
+/// so at most one item matches; take the last (deepest) for robustness.
+#[allow(dead_code)] // TODO(task 3): remove
+pub fn hit_test<'a>(items: &'a [DrawItem<'a>], x: f64, y: f64) -> Option<&'a DrawItem<'a>> {
+    items
+        .iter()
+        .rev()
+        .find(|i| x >= i.px.x && x < i.px.x + i.px.w && y >= i.px.y && y < i.px.y + i.px.h)
 }
 
 #[cfg(test)]
@@ -426,5 +448,40 @@ mod tests {
         for i in &items {
             assert!(i.px.y >= -2.0 - 1e-9 && i.px.y + i.px.h <= 602.0 + 1e-9);
         }
+    }
+
+    #[test]
+    fn world_band_composes_ancestors() {
+        let tree = worked_example();
+        let layout = outrider_layout::layout(&tree);
+        // g: depth 2, abs cell 44, len 1 (the Phase 2 worked example)
+        let g_id = tree.root.children[1].children[1].id.clone();
+        let (y, h) = world_band(&g_id, &layout).unwrap();
+        close(y, 0.6875);
+        close(h, 0.015625);
+        let (y, h) = world_band(&tree.root.id, &layout).unwrap();
+        close(y, 0.0);
+        close(h, 1.0);
+        let unknown = outrider_index::SymbolId {
+            kind: SymbolKind::Fn,
+            qualified_path: "nope".into(),
+            ordinal: 0,
+        };
+        assert!(world_band(&unknown, &layout).is_none());
+    }
+
+    #[test]
+    fn hit_test_picks_the_column_under_the_point() {
+        let tree = worked_example();
+        let layout = outrider_layout::layout(&tree);
+        // the zoomed-past-ancestors scene: root [0,36.19), b.rs [36.19,180.95),
+        // g [180.95,760) horizontally; g only spans y ∈ [300, 602]
+        let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
+        let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
+        assert_eq!(hit_test(&items, 10.0, 10.0).unwrap().node.name, "");
+        assert_eq!(hit_test(&items, 100.0, 500.0).unwrap().node.name, "b.rs");
+        assert_eq!(hit_test(&items, 400.0, 450.0).unwrap().node.name, "g");
+        assert!(hit_test(&items, 400.0, 100.0).is_none()); // above g's band
+        assert!(hit_test(&items, 790.0, 300.0).is_none()); // right of the stack
     }
 }

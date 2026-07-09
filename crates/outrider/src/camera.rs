@@ -34,6 +34,77 @@ impl Camera {
     }
 }
 
+/// Arrow-step framing: the focus band lands at half the viewport height.
+#[allow(dead_code)] // TODO(task 3): remove
+pub const FOCUS_FRACTION: f64 = 0.5;
+/// End-key framing: the focus band fills the viewport.
+#[allow(dead_code)] // TODO(task 3): remove
+pub const END_FRACTION: f64 = 0.95;
+/// Camera-follow tween duration, seconds (spec: ~250 ms, interruptible).
+#[allow(dead_code)] // TODO(task 3): remove
+pub const TWEEN_SECS: f64 = 0.25;
+
+/// Camera showing world band (y, h) at `fraction` of the viewport height,
+/// centered. The zoom clamp may prevent exact framing (accepted).
+#[allow(dead_code)] // TODO(task 3): remove
+pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64, min_zoom: f64, max_zoom: f64) -> Camera {
+    Camera {
+        center_y: y + h / 2.0,
+        zoom: (fraction * vh / h).clamp(min_zoom, max_zoom),
+    }
+}
+
+#[allow(dead_code)] // TODO(task 3): remove
+fn ease_in_out_cubic(t: f64) -> f64 {
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+    }
+}
+
+/// Eased camera animation, pure and clock-free: the caller supplies elapsed
+/// seconds. center_y interpolates linearly; zoom geometrically (log-space)
+/// so zoom speed feels uniform across octaves.
+#[allow(dead_code)] // TODO(task 3): remove
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraTween {
+    pub from: Camera,
+    pub to: Camera,
+    pub duration: f64,
+}
+
+impl CameraTween {
+    #[allow(dead_code)] // TODO(task 3): remove
+    pub fn new(from: Camera, to: Camera) -> Self {
+        CameraTween { from, to, duration: TWEEN_SECS }
+    }
+
+    #[allow(dead_code)] // TODO(task 3): remove
+    pub fn sample(&self, t: f64) -> Camera {
+        if t >= self.duration {
+            return self.to;
+        }
+        let e = ease_in_out_cubic((t / self.duration).max(0.0));
+        Camera {
+            center_y: self.from.center_y + (self.to.center_y - self.from.center_y) * e,
+            zoom: self.from.zoom * (self.to.zoom / self.from.zoom).powf(e),
+        }
+    }
+
+    #[allow(dead_code)] // TODO(task 3): remove
+    pub fn done(&self, t: f64) -> bool {
+        t >= self.duration
+    }
+
+    /// Retarget mid-flight: the new tween starts from the current sample,
+    /// so motion is continuous — never restarted from the old origin.
+    #[allow(dead_code)] // TODO(task 3): remove
+    pub fn retarget(&self, t: f64, to: Camera) -> CameraTween {
+        CameraTween::new(self.sample(t), to)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +155,66 @@ mod tests {
         close(c.center_y, 0.5);
         close(c.zoom, 600.0 / 1.05);
         assert!(c.zoom * 1.0 <= 600.0 + 1e-9); // framed band fits the viewport
+    }
+
+    #[test]
+    fn frame_band_centers_at_fraction() {
+        // b.rs::g worked example: band (0.6875, 0.015625), vh 600, fraction ½
+        let c = frame_band(0.6875, 0.015625, 600.0, FOCUS_FRACTION, 1e-9, 1e18);
+        close(c.zoom, 19200.0); // 0.5·600/0.015625
+        close(c.center_y, 0.6953125);
+        // clamp may prevent exact framing
+        let c = frame_band(0.6875, 0.015625, 600.0, FOCUS_FRACTION, 1e-9, 100.0);
+        close(c.zoom, 100.0);
+    }
+
+    #[test]
+    fn tween_endpoints_exact_and_done() {
+        let from = Camera { center_y: 0.0, zoom: 100.0 };
+        let to = Camera { center_y: 1.0, zoom: 6400.0 };
+        let tw = CameraTween::new(from, to);
+        close(tw.duration, TWEEN_SECS);
+        assert_eq!(tw.sample(0.0), from);
+        assert_eq!(tw.sample(TWEEN_SECS), to); // exact, not approximate
+        assert_eq!(tw.sample(TWEEN_SECS * 2.0), to);
+        assert!(!tw.done(TWEEN_SECS - 1e-6));
+        assert!(tw.done(TWEEN_SECS));
+    }
+
+    #[test]
+    fn tween_midpoint_linear_y_geometric_zoom() {
+        let from = Camera { center_y: 0.0, zoom: 100.0 };
+        let to = Camera { center_y: 1.0, zoom: 6400.0 };
+        let tw = CameraTween::new(from, to);
+        let mid = tw.sample(TWEEN_SECS / 2.0); // ease(½) = ½
+        close(mid.center_y, 0.5);
+        close(mid.zoom, 800.0); // √(100·6400)
+    }
+
+    #[test]
+    fn tween_monotonic() {
+        let from = Camera { center_y: 0.0, zoom: 100.0 };
+        let to = Camera { center_y: 1.0, zoom: 6400.0 };
+        let tw = CameraTween::new(from, to);
+        let mut last = tw.sample(0.0);
+        for i in 1..=100 {
+            let c = tw.sample(TWEEN_SECS * i as f64 / 100.0);
+            assert!(c.center_y >= last.center_y - 1e-12);
+            assert!(c.zoom >= last.zoom - 1e-9);
+            last = c;
+        }
+    }
+
+    #[test]
+    fn retarget_is_continuous() {
+        let tw = CameraTween::new(
+            Camera { center_y: 0.0, zoom: 100.0 },
+            Camera { center_y: 1.0, zoom: 6400.0 },
+        );
+        let other = Camera { center_y: -3.0, zoom: 50.0 };
+        let t = 0.1;
+        let re = tw.retarget(t, other);
+        assert_eq!(re.sample(0.0), tw.sample(t)); // no jump at the splice
+        assert_eq!(re.to, other);
     }
 }
