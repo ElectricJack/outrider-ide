@@ -108,8 +108,11 @@ pub fn column_table(zoom: f64, vw: f64, max_depth: usize) -> Vec<ColPx> {
 
 /// Rung by pixel height, downgraded to Dot when the column is too narrow
 /// for text (gutter strips) and from Full to Detail when too narrow for
-/// code. Heights below MERGE_PX merge into the parent.
-pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
+/// code. Heights below MERGE_PX merge into the parent. For leaf items,
+/// pass `natural_px`: the box is Full as soon as it fits its content
+/// (capped at FULL_PX for long methods) — code appears when close enough,
+/// no explicit dive required (spec 4c §6).
+pub fn rung_for(px_h: f64, px_w: f64, natural_px: Option<f64>) -> Option<Rung> {
     let by_height = if px_h < MERGE_PX {
         return None;
     } else if px_h < LABEL_PX {
@@ -122,6 +125,10 @@ pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
         Rung::Detail
     } else {
         Rung::Full
+    };
+    let by_height = match natural_px {
+        Some(n) if px_h >= n.min(FULL_PX) => Rung::Full,
+        _ => by_height,
     };
     let rung = if px_w < LABEL_MIN_W { Rung::Dot } else { by_height };
     Some(if rung == Rung::Full && px_w < CODE_MIN_W { Rung::Detail } else { rung })
@@ -140,6 +147,7 @@ use outrider_index::{SymbolId, SymbolNode, SymbolTree};
 use outrider_layout::WorldLayout;
 
 use crate::camera::Camera;
+use crate::content;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PxRect {
@@ -204,7 +212,8 @@ fn walk<'a>(
 
     // Below the merge threshold: this node merges into its parent's tile,
     // and children (8x smaller) are below it too. Stop.
-    let Some(rung) = rung_for(px_h, px_w) else { return };
+    let natural = content::is_leaf_item(node).then(|| content::natural_px(node));
+    let Some(rung) = rung_for(px_h, px_w, natural) else { return };
     // Children's y-ranges are contained in the parent's: off-screen y prunes the subtree.
     if px_y > vh || px_y + px_h < 0.0 {
         return;
@@ -370,26 +379,36 @@ mod tests {
     #[test]
     fn rung_for_thresholds_and_downgrade() {
         // height thresholds (wide column: no downgrade)
-        assert_eq!(rung_for(3.9, 400.0), None);
-        assert_eq!(rung_for(4.0, 400.0), Some(Rung::Dot));
-        assert_eq!(rung_for(19.9, 400.0), Some(Rung::Dot));
-        assert_eq!(rung_for(20.0, 400.0), Some(Rung::Label));
-        assert_eq!(rung_for(79.9, 400.0), Some(Rung::Label));
-        assert_eq!(rung_for(80.0, 400.0), Some(Rung::Card));
-        assert_eq!(rung_for(249.9, 400.0), Some(Rung::Card));
-        assert_eq!(rung_for(250.0, 400.0), Some(Rung::Detail));
-        assert_eq!(rung_for(699.9, 400.0), Some(Rung::Detail));
-        assert_eq!(rung_for(700.0, 400.0), Some(Rung::Full));
+        assert_eq!(rung_for(3.9, 400.0, None), None);
+        assert_eq!(rung_for(4.0, 400.0, None), Some(Rung::Dot));
+        assert_eq!(rung_for(19.9, 400.0, None), Some(Rung::Dot));
+        assert_eq!(rung_for(20.0, 400.0, None), Some(Rung::Label));
+        assert_eq!(rung_for(79.9, 400.0, None), Some(Rung::Label));
+        assert_eq!(rung_for(80.0, 400.0, None), Some(Rung::Card));
+        assert_eq!(rung_for(249.9, 400.0, None), Some(Rung::Card));
+        assert_eq!(rung_for(250.0, 400.0, None), Some(Rung::Detail));
+        assert_eq!(rung_for(699.9, 400.0, None), Some(Rung::Detail));
+        assert_eq!(rung_for(700.0, 400.0, None), Some(Rung::Full));
         // narrow columns are forced to Dot regardless of height (gutters)
-        assert_eq!(rung_for(100_000.0, 59.9), Some(Rung::Dot));
+        assert_eq!(rung_for(100_000.0, 59.9, None), Some(Rung::Dot));
         // Full downgrades to Detail when too narrow for code (spec §4.2)
-        assert_eq!(rung_for(100_000.0, 60.0), Some(Rung::Detail));
-        assert_eq!(rung_for(100_000.0, 299.9), Some(Rung::Detail));
-        assert_eq!(rung_for(100_000.0, 300.0), Some(Rung::Full));
+        assert_eq!(rung_for(100_000.0, 60.0, None), Some(Rung::Detail));
+        assert_eq!(rung_for(100_000.0, 299.9, None), Some(Rung::Detail));
+        assert_eq!(rung_for(100_000.0, 300.0, None), Some(Rung::Full));
         // the CODE_MIN_W downgrade applies only to Full
-        assert_eq!(rung_for(100.0, 60.0), Some(Rung::Card));
+        assert_eq!(rung_for(100.0, 60.0, None), Some(Rung::Card));
         // the merge rule wins over everything
-        assert_eq!(rung_for(3.9, 24.0), None);
+        assert_eq!(rung_for(3.9, 24.0, None), None);
+
+        // Leaf legibility (spec 4c §6): Full as soon as the box fits the
+        // content, even below FULL_PX
+        assert_eq!(rung_for(100.0, 400.0, Some(90.0)), Some(Rung::Full));
+        assert_eq!(rung_for(100.0, 400.0, None), Some(Rung::Card)); // container ladder
+        assert_eq!(rung_for(100.0, 250.0, Some(90.0)), Some(Rung::Detail)); // width gate holds
+        assert_eq!(rung_for(100.0, 59.0, Some(90.0)), Some(Rung::Dot)); // narrow gate holds
+        assert_eq!(rung_for(80.0, 400.0, Some(90.0)), Some(Rung::Card)); // below content → ladder
+        assert_eq!(rung_for(699.0, 400.0, Some(3000.0)), Some(Rung::Detail)); // long fn: FULL_PX cap
+        assert_eq!(rung_for(700.0, 400.0, Some(3000.0)), Some(Rung::Full));
     }
 
     #[test]
