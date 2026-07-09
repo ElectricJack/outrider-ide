@@ -5,7 +5,9 @@ pub const MERGE_PX: f64 = 4.0;
 pub const LABEL_PX: f64 = 20.0;
 pub const CARD_PX: f64 = 80.0;
 
-pub const MAX_COLUMN_PX: f64 = 400.0;
+/// The width cap is this fraction of the viewport width, so the peak column
+/// scales with the window instead of stranding wide monitors at 400px.
+pub const MAX_COLUMN_FRACTION: f64 = 0.5;
 pub const GUTTER_PX: f64 = 24.0;
 /// Columns narrower than this render fill + border only (forced Dot).
 pub const LABEL_MIN_W: f64 = 60.0;
@@ -23,15 +25,16 @@ pub fn cell_px_height(depth: u8, zoom: f64) -> f64 {
 }
 
 /// Peaked width profile (screen-space-columns spec §3): rises as
-/// CELL_ASPECT·h until the peak (h = MAX/CELL_ASPECT, cells comfortably in
+/// CELL_ASPECT·h until the peak (h = max_w/CELL_ASPECT, cells comfortably in
 /// Card rung), then decays as 1/h — 8× per zoom octave on both sides, so the
 /// profile is self-similar — floored at the gutter for zoomed-past ancestors.
-pub fn column_px_width(h: f64) -> f64 {
-    let peak_h = MAX_COLUMN_PX / CELL_ASPECT;
+/// `max_w` is the width cap (MAX_COLUMN_FRACTION · viewport width).
+pub fn column_px_width(h: f64, max_w: f64) -> f64 {
+    let peak_h = max_w / CELL_ASPECT;
     if h <= peak_h {
         CELL_ASPECT * h
     } else {
-        (MAX_COLUMN_PX * peak_h / h).max(GUTTER_PX)
+        (max_w * peak_h / h).max(GUTTER_PX)
     }
 }
 
@@ -43,11 +46,11 @@ pub struct ColPx {
 
 /// Per-frame column table: x is the prefix sum of shallower widths — the
 /// stack is left-anchored at x = 0 and fully determined by zoom.
-pub fn column_table(zoom: f64) -> Vec<ColPx> {
+pub fn column_table(zoom: f64, max_w: f64) -> Vec<ColPx> {
     let mut out = Vec::with_capacity(MAX_DEPTH + 1);
     let mut x = 0.0;
     for d in 0..=MAX_DEPTH {
-        let w = column_px_width(cell_px_height(d as u8, zoom));
+        let w = column_px_width(cell_px_height(d as u8, zoom), max_w);
         out.push(ColPx { x, w });
         x += w;
     }
@@ -105,7 +108,7 @@ pub fn visible_nodes<'a>(
     vw: f64,
     vh: f64,
 ) -> Vec<DrawItem<'a>> {
-    let cols = column_table(camera.zoom);
+    let cols = column_table(camera.zoom, MAX_COLUMN_FRACTION * vw);
     let mut out = Vec::new();
     walk(&tree.root, layout, camera, &cols, vw, vh, 0.0, &mut out);
     out
@@ -211,33 +214,36 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    /// Cap used by the pure-function tests: 0.5 fraction of an 800px viewport.
+    const MAX_W: f64 = 400.0;
+
     #[test]
     fn width_profile_rising_side() {
         // w = 3h up to the peak
-        close(column_px_width(10.0), 30.0);
-        close(column_px_width(100.0), 300.0);
-        let peak_h = MAX_COLUMN_PX / CELL_ASPECT; // ≈ 133.33 px cells
-        close(column_px_width(peak_h), MAX_COLUMN_PX);
+        close(column_px_width(10.0, MAX_W), 30.0);
+        close(column_px_width(100.0, MAX_W), 300.0);
+        let peak_h = MAX_W / CELL_ASPECT; // ≈ 133.33 px cells
+        close(column_px_width(peak_h, MAX_W), MAX_W);
     }
 
     #[test]
     fn width_profile_decay_side() {
-        // past the peak, w = MAX² / (3h): halves when h doubles
-        let peak_h = MAX_COLUMN_PX / CELL_ASPECT;
-        close(column_px_width(2.0 * peak_h), MAX_COLUMN_PX / 2.0);
-        close(column_px_width(8.0 * peak_h), MAX_COLUMN_PX / 8.0);
+        // past the peak, w = max_w² / (3h): halves when h doubles
+        let peak_h = MAX_W / CELL_ASPECT;
+        close(column_px_width(2.0 * peak_h, MAX_W), MAX_W / 2.0);
+        close(column_px_width(8.0 * peak_h, MAX_W), MAX_W / 8.0);
         // gutter floor is reached exactly and held forever
-        let floor_h = MAX_COLUMN_PX * peak_h / GUTTER_PX;
-        close(column_px_width(floor_h), GUTTER_PX);
-        close(column_px_width(floor_h * 100.0), GUTTER_PX);
+        let floor_h = MAX_W * peak_h / GUTTER_PX;
+        close(column_px_width(floor_h, MAX_W), GUTTER_PX);
+        close(column_px_width(floor_h * 100.0, MAX_W), GUTTER_PX);
     }
 
     #[test]
     fn width_profile_self_similar() {
         // spec §3: the table at zoom 8z equals the table at z shifted one depth right
         for &z in &[10.0, 127.0, 1000.0, 54321.0] {
-            let t1 = column_table(z);
-            let t8 = column_table(8.0 * z);
+            let t1 = column_table(z, MAX_W);
+            let t8 = column_table(8.0 * z, MAX_W);
             for d in 0..MAX_DEPTH {
                 close(t8[d + 1].w, t1[d].w);
             }
@@ -247,7 +253,7 @@ mod tests {
     #[test]
     fn column_table_prefix_sums_and_bound() {
         for &z in &[1.0, 571.4285714285714, 36571.42857142857, 1e12] {
-            let t = column_table(z);
+            let t = column_table(z, MAX_W);
             assert_eq!(t.len(), MAX_DEPTH + 1);
             close(t[0].x, 0.0);
             for d in 1..t.len() {
@@ -314,10 +320,11 @@ mod tests {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
         let cam = Camera::frame(1.0, 600.0);
-        // viewport only 80px wide: x1 = 93.33 > 80 → depth ≥ 1 pruned
-        let items = visible_nodes(&tree, &layout, &cam, 80.0, 600.0);
+        // viewport 40px wide (cap 20): every ancestor column is gutter-floored
+        // to 24px, so x1 = 24 ≤ 40 but x2 = 48 > 40 → depth ≥ 2 pruned
+        let items = visible_nodes(&tree, &layout, &cam, 40.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        assert_eq!(names, vec![""]);
+        assert_eq!(names, vec!["", "a.rs", "b.rs"]);
     }
 
     #[test]

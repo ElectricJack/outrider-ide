@@ -35,28 +35,32 @@ Settled during brainstorming:
 
 ## 3. Width profile
 
-Let `h_d = zoom · 8^-d` — the pixel height of one level-`d` cell.
+Let `h_d = zoom · 8^-d` — the pixel height of one level-`d` cell, and
+`max_w = MAX_COLUMN_FRACTION · viewport_width` — the width cap, computed per
+frame so the peak column scales with the window.
 
 ```
-w(h) = 3·h                                    if h ≤ MAX_COLUMN_PX / 3
-     = max(GUTTER_PX, MAX_COLUMN_PX² / (3·h)) otherwise
+w(h) = 3·h                              if h ≤ max_w / 3
+     = max(GUTTER_PX, max_w² / (3·h))   otherwise
 ```
 
-- `MAX_COLUMN_PX = 400`, `GUTTER_PX = 24` — tunable constants in `world.rs`
-  (revisit at the exit gate, esp. `MAX_COLUMN_PX` on wide monitors).
+- `MAX_COLUMN_FRACTION = 0.5`, `GUTTER_PX = 24` — tunable constants in
+  `world.rs`. (The cap was originally a fixed `MAX_COLUMN_PX = 400`, which
+  stranded wide windows at ~1/3 usage; the fraction replaces it.)
 - **Rising side** is today's 3:1 cell aspect: approaching columns grow
   naturally with zoom.
-- **Peak** at `h = MAX_COLUMN_PX / 3 ≈ 133 px` — cells comfortably in Card
-  rung when their column is widest.
+- **Peak** at `h = max_w / 3` — cells comfortably in Card rung when their
+  column is widest.
 - **Decay side** falls off as 1/h, floored at the gutter. A passed column
-  shrinks from 400 px to 24 px over ~1.2 zoom octaves.
+  shrinks from `max_w` to 24 px over ~1.2 zoom octaves.
 
 Both sides move 8× per octave, so the profile is **self-similar**: the width
 table at zoom `8z` equals the table at zoom `z` shifted one depth right.
 Widths are bounded — at any zoom, roughly: ancestors at ≤ 24 px each, one or
 two columns near the peak, then a 3·h tail shrinking 8× per depth (its sum
-converges). Total stack width stays in the ~1.3 kpx worst case; deep sliver
-columns may clip on narrow windows, accepted for the skeleton.
+converges). Total stack width stays within a small multiple of `max_w`
+(worst case ≈ 3.3·max_w); deep sliver columns may clip on narrow windows,
+accepted for the skeleton.
 
 Column x is the prefix sum: `x_d = Σ_{d' < d} w(h_{d'})`, computed once per
 frame into a per-depth table (depth ≤ ~20 entries). Screen x = `x_d`
@@ -125,5 +129,6 @@ at the exit gate.
 ## 7. Exit gate
 
 Zoom from home into a deep symbol in Outrider's own repo: no column ever
-grows past `MAX_COLUMN_PX`; passed ancestors compress to gutters; widths
+grows past the cap (`MAX_COLUMN_FRACTION` of the viewport width); passed
+ancestors compress to gutters; widths
 change smoothly with no popping; y behavior identical to before.
