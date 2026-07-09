@@ -7,7 +7,7 @@ pub const CARD_PX: f64 = 80.0;
 
 /// The width cap is this fraction of the viewport width, so the peak column
 /// scales with the window instead of stranding wide monitors at 400px.
-pub const MAX_COLUMN_FRACTION: f64 = 0.5;
+pub const MAX_COLUMN_FRACTION: f64 = 0.75;
 pub const GUTTER_PX: f64 = 24.0;
 /// Columns narrower than this render fill + border only (forced Dot).
 pub const LABEL_MIN_W: f64 = 60.0;
@@ -214,7 +214,8 @@ mod tests {
         assert!(items.is_empty());
     }
 
-    /// Cap used by the pure-function tests: 0.5 fraction of an 800px viewport.
+    /// Cap used by the pure-function tests (arbitrary fixed value; the
+    /// fraction-of-viewport scaling is exercised by the culling tests).
     const MAX_W: f64 = 400.0;
 
     #[test]
@@ -304,12 +305,13 @@ mod tests {
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
         let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
         // heights: root 571.4, a.rs 285.7, b.rs 71.4, f 26.8, g 8.9
-        // widths:  d0 93.33 (decay side), d1 214.29, d2 26.79 (< LABEL_MIN_W → Dot)
+        // widths (cap = 0.75·800 = 600, peak_h = 200):
+        //   d0 210 (decay side), d1 214.29, d2 26.79 (< LABEL_MIN_W → Dot)
         assert_eq!(rungs, vec![Rung::Card, Rung::Card, Rung::Label, Rung::Dot, Rung::Dot]);
         // hand-computed px rect for f (zoom = 4000/7):
-        // x = w0+w1 = 280/3 + 1500/7, y = 0.125·zoom + 300, w = 3·zoom/64, h = 3·zoom/64
+        // x = w0+w1 = 210 + 1500/7, y = 0.125·zoom + 300, w = 3·zoom/64, h = 3·zoom/64
         let f = &items[3].px;
-        assert!((f.x - 307.6190476).abs() < 1e-6, "{}", f.x);
+        assert!((f.x - 424.2857143).abs() < 1e-6, "{}", f.x);
         assert!((f.y - 371.4285714).abs() < 1e-6, "{}", f.y);
         assert!((f.w - 26.7857143).abs() < 1e-6, "{}", f.w);
         assert!((f.h - 26.7857143).abs() < 1e-6, "{}", f.h);
@@ -320,7 +322,7 @@ mod tests {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
         let cam = Camera::frame(1.0, 600.0);
-        // viewport 40px wide (cap 20): every ancestor column is gutter-floored
+        // viewport 40px wide (cap 30): every ancestor column is gutter-floored
         // to 24px, so x1 = 24 ≤ 40 but x2 = 48 > 40 → depth ≥ 2 pruned
         let items = visible_nodes(&tree, &layout, &cam, 40.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
@@ -332,7 +334,7 @@ mod tests {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
         // two octaves past home (zoom·64), centered on g: root and b.rs are
-        // zoomed-past ancestors → 24px gutter strips, clipped to the viewport
+        // zoomed-past ancestors → narrow strips, clipped to the viewport
         let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
@@ -344,10 +346,12 @@ mod tests {
         let root = &items[0].px;
         assert!((root.x - 0.0).abs() < 1e-6 && (root.w - 24.0).abs() < 1e-6);
         assert!((root.y - -2.0).abs() < 1e-6 && (root.h - 604.0).abs() < 1e-6);
-        // g: x = 24+24 = 48, w = 93.33 (decay side), y = 300, h clipped to 302
+        // cap = 0.75·800 = 600, peak_h = 200: b.rs (d1, h = 32000/7) is on the
+        // decay side just above the floor → w = 120000·7/32000 = 26.25
+        // g: x = 24 + 26.25 = 50.25, w = 210 (decay side), y = 300, h clipped to 302
         let g = &items[2].px;
-        assert!((g.x - 48.0).abs() < 1e-6, "{}", g.x);
-        assert!((g.w - 93.3333333).abs() < 1e-6, "{}", g.w);
+        assert!((g.x - 50.25).abs() < 1e-6, "{}", g.x);
+        assert!((g.w - 210.0).abs() < 1e-6, "{}", g.w);
         assert!((g.y - 300.0).abs() < 1e-6, "{}", g.y);
         assert!((g.h - 302.0).abs() < 1e-6, "{}", g.h);
         // nothing exceeds the clipped viewport band

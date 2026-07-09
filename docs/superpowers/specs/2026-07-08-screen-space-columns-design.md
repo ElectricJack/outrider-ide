@@ -44,7 +44,7 @@ w(h) = 3·h                              if h ≤ max_w / 3
      = max(GUTTER_PX, max_w² / (3·h))   otherwise
 ```
 
-- `MAX_COLUMN_FRACTION = 0.5`, `GUTTER_PX = 24` — tunable constants in
+- `MAX_COLUMN_FRACTION = 0.75`, `GUTTER_PX = 24` — tunable constants in
   `world.rs`. (The cap was originally a fixed `MAX_COLUMN_PX = 400`, which
   stranded wide windows at ~1/3 usage; the fraction replaces it.)
 - **Rising side** is today's 3:1 cell aspect: approaching columns grow
