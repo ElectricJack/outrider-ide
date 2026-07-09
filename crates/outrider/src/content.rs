@@ -3,7 +3,6 @@ use outrider_index::{SymbolKind, SymbolNode};
 use crate::world::Rung;
 
 /// One rendered body line under a box's name row.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyLine {
     /// TEXT_PRIMARY
@@ -13,13 +12,11 @@ pub enum BodyLine {
 }
 
 /// Card meta line — format unchanged from the pre-4b render (spec §4.4).
-#[allow(dead_code)]
 pub fn card_meta(node: &SymbolNode) -> String {
     format!("{} · p{:.0} · {}L", node.churn_count, node.churn * 100.0, node.measure)
 }
 
 /// e.g. "480L · 47 commits · p96"
-#[allow(dead_code)]
 pub fn churn_readout(node: &SymbolNode) -> String {
     format!("{}L · {} commits · p{:.0}", node.measure, node.churn_count, node.churn * 100.0)
 }
@@ -35,7 +32,6 @@ fn plural(n: usize, word: &str) -> String {
 /// Item counts by kind: all descendants for files/items ("3 fns · 1 struct");
 /// direct child files/folders for folders ("2 files · 1 folder"). Empty
 /// string when there is nothing to count.
-#[allow(dead_code)]
 pub fn kind_counts(node: &SymbolNode) -> String {
     if node.id.kind == SymbolKind::Folder {
         let files = node.children.iter().filter(|c| c.id.kind == SymbolKind::File).count();
@@ -76,7 +72,6 @@ pub fn kind_counts(node: &SymbolNode) -> String {
 
 /// The full inventory line (spec §4.3): kind counts + churn readout,
 /// e.g. "4 fns · 2 structs · 480L · 47 commits · p96".
-#[allow(dead_code)]
 pub fn inventory(node: &SymbolNode) -> String {
     let kinds = kind_counts(node);
     if kinds.is_empty() {
@@ -90,7 +85,6 @@ pub fn inventory(node: &SymbolNode) -> String {
 /// Full leaf items return only their signature; the paint path appends the
 /// highlighted code (or leaves this Detail-equivalent content when the
 /// buffer is unavailable).
-#[allow(dead_code)]
 pub fn body_lines(node: &SymbolNode, rung: Rung) -> Vec<BodyLine> {
     match rung {
         Rung::Dot | Rung::Label => vec![],

@@ -4,18 +4,15 @@ use std::path::PathBuf;
 use outrider_index::buffer::{AnchorId, FileBuffer};
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
-#[allow(dead_code)]
 pub const MAX_BUFFERS: usize = 64;
 
 /// A materialized file: rope-backed buffer plus one anchor per symbol,
 /// created at materialization (spec §3.3).
-#[allow(dead_code)]
 pub struct Materialized {
     pub buffer: FileBuffer,
     anchors: BTreeMap<SymbolId, AnchorId>,
 }
 
-#[allow(dead_code)]
 impl Materialized {
     /// Rope line index of the symbol's start, via its anchor — the Full
     /// render never reads raw `byte_range` offsets.
@@ -27,13 +24,11 @@ impl Materialized {
 
 /// LRU cache of materialized buffers, keyed by relative file path.
 /// Most-recently-used entry is last (spec §4.1).
-#[allow(dead_code)]
 pub struct BufferManager {
     repo_root: PathBuf,
     entries: Vec<(String, Materialized)>,
 }
 
-#[allow(dead_code)]
 impl BufferManager {
     pub fn new(repo_root: PathBuf) -> Self {
         Self { repo_root, entries: Vec::new() }
@@ -72,7 +67,6 @@ impl BufferManager {
 /// rel file path → (id, byte_range.start) of every item inside that file,
 /// from the tree. Built once at view construction; `get` uses it to create
 /// anchors at materialization.
-#[allow(dead_code)]
 pub fn collect_file_symbols(tree: &SymbolTree) -> BTreeMap<String, Vec<(SymbolId, usize)>> {
     fn items(node: &SymbolNode, out: &mut Vec<(SymbolId, usize)>) {
         for c in &node.children {

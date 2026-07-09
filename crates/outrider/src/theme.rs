@@ -1,3 +1,5 @@
+use outrider_index::buffer::HighlightKind;
+
 pub const BG: u32 = 0x1a1a1c;
 pub const FILL_COLD: u32 = 0x2a2a2e;
 pub const FILL_HOT: u32 = 0xb03030;
@@ -29,6 +31,21 @@ pub fn border_for(fill: u32) -> u32 {
     lerp_rgb(fill, 0xffffff, 0.12)
 }
 
+/// Syntax palette for Full-rung code: one color per HighlightKind,
+/// legible on BG (0x1a1a1c). Default falls back to TEXT_PRIMARY.
+pub fn syntax_color(kind: HighlightKind) -> u32 {
+    match kind {
+        HighlightKind::Keyword => 0xc586c0,
+        HighlightKind::Function => 0xdcdcaa,
+        HighlightKind::Type => 0x4ec9b0,
+        HighlightKind::String => 0xce9178,
+        HighlightKind::Comment => 0x6a9955,
+        HighlightKind::Number => 0xb5cea8,
+        HighlightKind::Property => 0x9cdcfe,
+        HighlightKind::Default => TEXT_PRIMARY,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +72,11 @@ mod tests {
         assert!((b >> 8) & 0xff >= (f >> 8) & 0xff);
         assert!(b & 0xff >= f & 0xff);
         assert_ne!(b, f);
+    }
+
+    #[test]
+    fn syntax_default_is_text_primary() {
+        use outrider_index::buffer::HighlightKind;
+        assert_eq!(syntax_color(HighlightKind::Default), TEXT_PRIMARY);
     }
 }

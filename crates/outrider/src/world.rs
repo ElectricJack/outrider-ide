@@ -155,7 +155,6 @@ pub struct DrawItem<'a> {
     pub px: PxRect,
     pub rung: Rung,
     /// UNclipped screen-y of the box top (`px.y` is clipped to the viewport).
-    #[allow(dead_code)]
     pub top: f64,
 }
 
