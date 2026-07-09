@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TODO(task 3): remove
-
 use std::collections::BTreeMap;
 
 use outrider_index::{SymbolId, SymbolNode, SymbolTree};

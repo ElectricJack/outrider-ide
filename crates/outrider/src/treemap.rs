@@ -5,7 +5,8 @@ use gpui::{
 use outrider_index::SymbolTree;
 use outrider_layout::WorldLayout;
 
-use crate::camera::Camera;
+use crate::camera::{self, Camera, CameraTween};
+use crate::focus::{Focus, TreeIndex};
 use crate::theme;
 use crate::world::{self, Rung};
 
@@ -35,6 +36,9 @@ pub struct TreemapView {
     camera: Option<Camera>,
     home_zoom: f64,
     drag_last: Option<gpui::Point<Pixels>>,
+    press_origin: Option<gpui::Point<Pixels>>,
+    focus: Focus,
+    tween: Option<(CameraTween, std::time::Instant)>,
     focus_handle: FocusHandle,
 }
 
@@ -47,6 +51,7 @@ struct PaintItem {
     h: f32,
     fill: u32,
     border: u32,
+    focused: bool,
     rung: Rung,
     name: String,
     meta: String,
@@ -54,12 +59,16 @@ struct PaintItem {
 
 impl TreemapView {
     pub fn new(tree: SymbolTree, layout: WorldLayout, cx: &mut Context<Self>) -> Self {
+        let root_id = tree.root.id.clone();
         Self {
             tree,
             layout,
             camera: None,
             home_zoom: 1.0,
             drag_last: None,
+            press_origin: None,
+            focus: Focus::new(root_id),
+            tween: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -76,13 +85,44 @@ impl TreemapView {
         Camera::frame(self.root_world_height(), vh)
     }
 
+    /// Start (or retarget) the camera-follow tween from the current sample.
+    /// Retargeting goes through CameraTween::retarget, whose continuity is
+    /// unit-tested (spec §7 item 7): from == sampled camera by construction.
+    fn start_tween(&mut self, to: Camera) {
+        let tw = match self.tween.take() {
+            Some((tw, started)) => tw.retarget(started.elapsed().as_secs_f64(), to),
+            None => match self.camera {
+                Some(c) => CameraTween::new(c, to),
+                None => return, // no viewport yet; ignore keys until first render
+            },
+        };
+        self.camera = Some(tw.from);
+        self.tween = Some((tw, std::time::Instant::now()));
+    }
+
+    /// Mouse is free (spec §4): manual camera ops drop any live tween,
+    /// continuing from the current sampled state.
+    fn cancel_tween(&mut self) {
+        if let Some((tw, started)) = self.tween.take() {
+            self.camera = Some(tw.sample(started.elapsed().as_secs_f64()));
+        }
+    }
+
     fn paint_items(&mut self, vw: f64, vh: f64) -> Vec<PaintItem> {
+        if let Some((tw, started)) = self.tween {
+            let t = started.elapsed().as_secs_f64();
+            self.camera = Some(tw.sample(t));
+            if tw.done(t) {
+                self.tween = None;
+            }
+        }
         if self.camera.is_none() {
             let c = self.home_camera(vh);
             self.home_zoom = c.zoom;
             self.camera = Some(c);
         }
         let camera = *self.camera.as_ref().unwrap();
+        let focus_id = self.focus.current.clone();
         world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh)
             .into_iter()
             .map(|item| {
@@ -94,6 +134,7 @@ impl TreemapView {
                     h: item.px.h as f32,
                     fill: f,
                     border: theme::border_for(f),
+                    focused: item.node.id == focus_id,
                     rung: item.rung,
                     name: item.node.name.clone(),
                     meta: format!(
@@ -118,6 +159,10 @@ impl Render for TreemapView {
         let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
         let items = self.paint_items(vw, vh);
 
+        if self.tween.is_some() {
+            window.request_animation_frame();
+        }
+
         let max_zoom = vh * 8f64.powi(15);
         let min_zoom = self.home_zoom * 0.5;
 
@@ -129,12 +174,39 @@ impl Render for TreemapView {
                 gpui::MouseButton::Left,
                 cx.listener(|this, e: &gpui::MouseDownEvent, _w, _cx| {
                     this.drag_last = Some(e.position);
+                    this.press_origin = Some(e.position);
                 }),
             )
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _e: &gpui::MouseUpEvent, _w, _cx| {
+                cx.listener(|this, e: &gpui::MouseUpEvent, w, cx| {
                     this.drag_last = None;
+                    let Some(origin) = this.press_origin.take() else { return };
+                    let slop = f64::from(e.position.x - origin.x)
+                        .abs()
+                        .max(f64::from(e.position.y - origin.y).abs());
+                    if slop > 4.0 {
+                        return; // drag, not click
+                    }
+                    let Some(cam) = this.camera else { return };
+                    let vp = w.viewport_size();
+                    let items = world::visible_nodes(
+                        &this.tree,
+                        &this.layout,
+                        &cam,
+                        f64::from(vp.width),
+                        f64::from(vp.height),
+                    );
+                    // view fills the window, so window coords == canvas coords
+                    let (mx, my) = (f64::from(e.position.x), f64::from(e.position.y));
+                    let hit = world::hit_test(&items, mx, my).map(|i| i.node.id.clone());
+                    drop(items);
+                    if let Some(id) = hit {
+                        let index = TreeIndex::new(&this.tree);
+                        // click sets focus; camera does NOT move (spec §2)
+                        this.focus.set(id, &index);
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _w, cx| {
@@ -142,6 +214,7 @@ impl Render for TreemapView {
                     return;
                 }
                 let Some(last) = this.drag_last else { return };
+                this.cancel_tween();
                 let dy = f64::from(e.position.y - last.y);
                 if let Some(cam) = this.camera.as_mut() {
                     cam.pan(dy);
@@ -150,6 +223,7 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_scroll_wheel(cx.listener(move |this, e: &gpui::ScrollWheelEvent, w, cx| {
+                this.cancel_tween();
                 let dy = match e.delta {
                     gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
                     gpui::ScrollDelta::Lines(l) => l.y as f64 * 40.0,
@@ -164,10 +238,42 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
-                if e.keystroke.key == "home" {
-                    let c = this.home_camera(f64::from(w.viewport_size().height));
-                    this.home_zoom = c.zoom;
-                    this.camera = Some(c);
+                if this.camera.is_none() {
+                    return;
+                }
+                let vh = f64::from(w.viewport_size().height);
+                let max_zoom = vh * 8f64.powi(15);
+                let min_zoom = this.home_zoom * 0.5;
+                let index = TreeIndex::new(&this.tree);
+                let key = e.keystroke.key.as_str();
+                let moved = match key {
+                    "right" => this.focus.step_in(&index),
+                    "left" => this.focus.step_back(&index),
+                    "up" => this.focus.step_sibling(-1, &index),
+                    "down" => this.focus.step_sibling(1, &index),
+                    _ => false,
+                };
+                let target = match key {
+                    "right" | "left" | "up" | "down" => {
+                        if !moved {
+                            return;
+                        }
+                        world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
+                            camera::frame_band(y, h, vh, camera::FOCUS_FRACTION, min_zoom, max_zoom)
+                        })
+                    }
+                    "end" => world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
+                        camera::frame_band(y, h, vh, camera::END_FRACTION, min_zoom, max_zoom)
+                    }),
+                    "home" => {
+                        let c = this.home_camera(vh);
+                        this.home_zoom = c.zoom;
+                        Some(c)
+                    }
+                    _ => return, // Tab included: explicitly no handler
+                };
+                if let Some(to) = target {
+                    this.start_tween(to);
                     cx.notify();
                 }
             }))
@@ -181,12 +287,17 @@ impl Render for TreemapView {
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
                                 size(px(item.w), px(item.h)),
                             );
+                            let (bw, bc) = if item.focused {
+                                (2.0, theme::FOCUS_BORDER)
+                            } else {
+                                (1.0, item.border)
+                            };
                             window.paint_quad(quad(
                                 b,
                                 px(0.),
                                 rgb(item.fill),
-                                px(1.),
-                                rgb(item.border),
+                                px(bw),
+                                rgb(bc),
                                 BorderStyle::default(),
                             ));
                             if item.rung == Rung::Dot || item.h < 14.0 {

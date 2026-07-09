@@ -35,18 +35,14 @@ impl Camera {
 }
 
 /// Arrow-step framing: the focus band lands at half the viewport height.
-#[allow(dead_code)] // TODO(task 3): remove
 pub const FOCUS_FRACTION: f64 = 0.5;
 /// End-key framing: the focus band fills the viewport.
-#[allow(dead_code)] // TODO(task 3): remove
 pub const END_FRACTION: f64 = 0.95;
 /// Camera-follow tween duration, seconds (spec: ~250 ms, interruptible).
-#[allow(dead_code)] // TODO(task 3): remove
 pub const TWEEN_SECS: f64 = 0.25;
 
 /// Camera showing world band (y, h) at `fraction` of the viewport height,
 /// centered. The zoom clamp may prevent exact framing (accepted).
-#[allow(dead_code)] // TODO(task 3): remove
 pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64, min_zoom: f64, max_zoom: f64) -> Camera {
     Camera {
         center_y: y + h / 2.0,
@@ -54,7 +50,6 @@ pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64, min_zoom: f64, max_zoo
     }
 }
 
-#[allow(dead_code)] // TODO(task 3): remove
 fn ease_in_out_cubic(t: f64) -> f64 {
     if t < 0.5 {
         4.0 * t * t * t
@@ -66,7 +61,6 @@ fn ease_in_out_cubic(t: f64) -> f64 {
 /// Eased camera animation, pure and clock-free: the caller supplies elapsed
 /// seconds. center_y interpolates linearly; zoom geometrically (log-space)
 /// so zoom speed feels uniform across octaves.
-#[allow(dead_code)] // TODO(task 3): remove
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CameraTween {
     pub from: Camera,
@@ -75,12 +69,10 @@ pub struct CameraTween {
 }
 
 impl CameraTween {
-    #[allow(dead_code)] // TODO(task 3): remove
     pub fn new(from: Camera, to: Camera) -> Self {
         CameraTween { from, to, duration: TWEEN_SECS }
     }
 
-    #[allow(dead_code)] // TODO(task 3): remove
     pub fn sample(&self, t: f64) -> Camera {
         if t >= self.duration {
             return self.to;
@@ -92,14 +84,12 @@ impl CameraTween {
         }
     }
 
-    #[allow(dead_code)] // TODO(task 3): remove
     pub fn done(&self, t: f64) -> bool {
         t >= self.duration
     }
 
     /// Retarget mid-flight: the new tween starts from the current sample,
     /// so motion is continuous — never restarted from the old origin.
-    #[allow(dead_code)] // TODO(task 3): remove
     pub fn retarget(&self, t: f64, to: Camera) -> CameraTween {
         CameraTween::new(self.sample(t), to)
     }

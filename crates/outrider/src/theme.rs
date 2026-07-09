@@ -3,6 +3,8 @@ pub const FILL_COLD: u32 = 0x2a2a2e;
 pub const FILL_HOT: u32 = 0xb03030;
 pub const TEXT_PRIMARY: u32 = 0xd8d8d8;
 pub const TEXT_SECONDARY: u32 = 0x9a9a9a;
+/// Focused-node border accent (clearly distinct from churn fills/borders).
+pub const FOCUS_BORDER: u32 = 0x4da6ff;
 /// Adjust if this family is absent under WSLg (`fc-list | grep -i mono`).
 pub const FONT_FAMILY: &str = "DejaVu Sans Mono";
 
