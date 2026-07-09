@@ -1,4 +1,5 @@
 mod camera;
+mod focus;
 mod theme;
 mod treemap;
 mod world;
