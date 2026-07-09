@@ -177,6 +177,19 @@ pub struct DrawItem<'a> {
     pub top: f64,
 }
 
+/// Deepest level that exists in the layout (capped at MAX_DEPTH) — the
+/// column-table normalization domain. Framing must use the same domain
+/// as rendering or widths won't match.
+fn tree_max_level(layout: &WorldLayout) -> usize {
+    layout
+        .nodes
+        .values()
+        .map(|nl| nl.cells.level as usize)
+        .max()
+        .unwrap_or(0)
+        .min(MAX_DEPTH)
+}
+
 /// Cull the tree against the viewport and the 4px merge rule.
 /// Returns visible nodes in pre-order (parents before children = painter's order).
 pub fn visible_nodes<'a>(
@@ -188,14 +201,7 @@ pub fn visible_nodes<'a>(
 ) -> Vec<DrawItem<'a>> {
     // Normalize over the depths that actually exist, so phantom deep levels
     // don't steal window width from a shallow tree.
-    let max_level = layout
-        .nodes
-        .values()
-        .map(|nl| nl.cells.level as usize)
-        .max()
-        .unwrap_or(0)
-        .min(MAX_DEPTH);
-    let cols = column_table(camera.zoom, vw, max_level);
+    let cols = column_table(camera.zoom, vw, tree_max_level(layout));
     let mut out = Vec::new();
     walk(&tree.root, layout, camera, &cols, vw, vh, 0.0, &mut out);
     out
@@ -269,6 +275,31 @@ pub fn world_band(id: &SymbolId, layout: &WorldLayout) -> Option<(f64, f64)> {
     debug_assert!(abs < 2f64.powi(53), "cell address exceeds exact f64 range");
     let s = column_scale(nl.cells.level);
     Some((abs * s, nl.cells.len as f64 * s))
+}
+
+/// Camera framing a leaf item at its natural content height (spec 4c §5):
+/// zoom starts at min(natural_px, END_FRACTION·vh) of box height and
+/// steps up by 1.25× only as needed to make the leaf's column code-wide,
+/// capped at END_FRACTION framing; the result is clamped like frame_band.
+// Task 6 calls this from the key handler; allow until then.
+#[allow(dead_code)]
+pub fn frame_leaf(
+    node: &SymbolNode,
+    layout: &WorldLayout,
+    vw: f64,
+    vh: f64,
+    min_zoom: f64,
+    max_zoom: f64,
+) -> Option<Camera> {
+    let (y, h) = world_band(&node.id, layout)?;
+    let level = layout.nodes.get(&node.id)?.cells.level as usize;
+    let max_level = tree_max_level(layout);
+    let z_end = crate::camera::END_FRACTION * vh / h;
+    let mut z = content::natural_px(node).min(crate::camera::END_FRACTION * vh) / h;
+    while z < z_end && column_table(z, vw, max_level)[level].w < CODE_MIN_W {
+        z = (z * 1.25).min(z_end);
+    }
+    Some(Camera { center_y: y + h / 2.0, zoom: z.clamp(min_zoom, max_zoom) })
 }
 
 /// Visible node containing the point. Rects nest (ancestors extend over
@@ -520,6 +551,49 @@ mod tests {
         // DrawItem.top is the UNclipped screen top (px.y is clipped to -2)
         assert!((items[0].top - (300.0 - 0.6875 * (256000.0 / 7.0))).abs() < 1e-6);
         assert!((items[2].top - 300.0).abs() < 1e-6); // on-screen: top == px.y
+    }
+
+    /// worked example with byte ranges so f and g are leaf items
+    fn leafy_example() -> SymbolTree {
+        let mut t = worked_example();
+        t.root.children[1].children[0].byte_range = Some(0..10); // f, measure 10
+        t.root.children[1].children[1].byte_range = Some(10..20); // g, measure 1
+        t
+    }
+
+    #[test]
+    fn frame_leaf_natural_size_and_width_floor() {
+        let tree = leafy_example();
+        let layout = outrider_layout::layout(&tree);
+        let (vw, vh) = (800.0, 600.0);
+        // f: measure 10 → natural = 20.8 + 11·15.6 + 6 = 198.4; its cell
+        // height at z_nat is ~198 ≈ PEAK_CELL_PX, so the column is already
+        // code-wide: zoom lands exactly at natural height
+        let f = &tree.root.children[1].children[0];
+        let (fy, fh) = world_band(&f.id, &layout).unwrap();
+        let cam = frame_leaf(f, &layout, vw, vh, 1e-9, 1e18).unwrap();
+        assert!((cam.zoom * fh - 198.4).abs() < 1e-6); // box = natural px
+        assert!((cam.center_y - (fy + fh / 2.0)).abs() < 1e-12);
+        let cols = column_table(cam.zoom, vw, 2);
+        assert!(cols[2].w >= CODE_MIN_W);
+        // g: measure 1 → natural = 58; at that zoom the leaf column is
+        // narrower than CODE_MIN_W, so the width floor zooms further in:
+        // result is the smallest 1.25-step ≥ natural-height zoom that is
+        // code-wide (and its 1.25-times-smaller neighbor is not)
+        let g = &tree.root.children[1].children[1];
+        let (gy, gh) = world_band(&g.id, &layout).unwrap();
+        let z_nat = 58.0 / gh;
+        let cam = frame_leaf(g, &layout, vw, vh, 1e-9, 1e18).unwrap();
+        assert!(cam.zoom > z_nat);
+        assert!((cam.center_y - (gy + gh / 2.0)).abs() < 1e-12);
+        assert!(column_table(cam.zoom, vw, 2)[2].w >= CODE_MIN_W);
+        assert!(column_table(cam.zoom / 1.25, vw, 2)[2].w < CODE_MIN_W);
+        // cap: a viewport too short for natural height caps at END framing
+        let cam = frame_leaf(g, &layout, vw, 60.0, 1e-9, 1e18).unwrap();
+        assert!((cam.zoom - crate::camera::END_FRACTION * 60.0 / gh).abs() < 1e-9);
+        // clamp: min_zoom wins over the search result
+        let cam = frame_leaf(g, &layout, vw, vh, 1e9, 1e18).unwrap();
+        assert!((cam.zoom - 1e9).abs() < 1.0);
     }
 
     #[test]
