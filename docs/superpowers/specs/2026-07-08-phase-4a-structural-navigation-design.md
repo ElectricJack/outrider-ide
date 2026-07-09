@@ -89,9 +89,9 @@ pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64,
   viewport height (Card territory, siblings and parent visible around it —
   "frame focus plus its parent" in the column model, where ancestors are
   always on-screen as the columns to the left). *Superseded by Phase 4c
-(`2026-07-09-phase-4c-nested-rendering-design.md` §5):* arrow steps onto
-leaf items use natural-size framing (`world::frame_leaf`); containers
-frame at FOCUS_FRACTION; there is no sticky fraction.
+  (`2026-07-09-phase-4c-nested-rendering-design.md` §5):* arrow steps onto
+  leaf items use natural-size framing (`world::frame_leaf`); containers
+  frame at FOCUS_FRACTION; there is no sticky fraction.
 - `END_FRACTION = 0.95` — **End** frames the focus to fill the viewport.
 - **Home** keeps its current framing (`Camera::frame`) but now animates.
 - Constants live in `camera.rs`, tunable at the exit gate.
