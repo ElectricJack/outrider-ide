@@ -3647,6 +3647,7 @@ dependencies = [
  "gpui_platform",
  "outrider-index",
  "outrider-layout",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+mod buffers;
 mod camera;
 mod focus;
 mod theme;
