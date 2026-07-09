@@ -1,13 +1,20 @@
 use outrider_layout::RATIO;
 
-pub const CELL_ASPECT: f64 = 3.0;
 pub const MERGE_PX: f64 = 4.0;
 pub const LABEL_PX: f64 = 20.0;
 pub const CARD_PX: f64 = 80.0;
 
-/// The width cap is this fraction of the viewport width, so the peak column
-/// scales with the window instead of stranding wide monitors at 400px.
-pub const MAX_COLUMN_FRACTION: f64 = 0.75;
+/// The normalized column stack sums to this fraction of the viewport width
+/// at every zoom, eliminating the mid-octave total-width dip of the raw
+/// peaked profile.
+pub const STACK_FRACTION: f64 = 0.95;
+/// Cell height (px) at which a column carries the most weight; the widest
+/// column is the one whose cells are nearest this height.
+pub const PEAK_CELL_PX: f64 = 200.0;
+/// Raw width ratio between adjacent depths. Cell heights differ by RATIO
+/// (8x) per depth; widths differ by only this much, so the peak's neighbor
+/// columns stay comparable instead of vanishing.
+pub const WIDTH_RATIO: f64 = 4.0;
 pub const GUTTER_PX: f64 = 24.0;
 /// Columns narrower than this render fill + border only (forced Dot).
 pub const LABEL_MIN_W: f64 = 60.0;
@@ -24,17 +31,21 @@ pub fn cell_px_height(depth: u8, zoom: f64) -> f64 {
     zoom * column_scale(depth)
 }
 
-/// Peaked width profile (screen-space-columns spec §3): rises as
-/// CELL_ASPECT·h until the peak (h = max_w/CELL_ASPECT, cells comfortably in
-/// Card rung), then decays as 1/h — 8× per zoom octave on both sides, so the
-/// profile is self-similar — floored at the gutter for zoomed-past ancestors.
-/// `max_w` is the width cap (MAX_COLUMN_FRACTION · viewport width).
-pub fn column_px_width(h: f64, max_w: f64) -> f64 {
-    let peak_h = max_w / CELL_ASPECT;
-    if h <= peak_h {
-        CELL_ASPECT * h
+/// Exponent turning the 8x-per-depth cell-height falloff into the
+/// WIDTH_RATIO-per-depth width falloff: h^alpha with alpha = log_8(4) = 2/3.
+fn width_alpha() -> f64 {
+    WIDTH_RATIO.ln() / (RATIO as f64).ln()
+}
+
+/// Dimensionless column weight (screen-space-columns spec §3): peaked at
+/// h = PEAK_CELL_PX and falling off WIDTH_RATIO× per depth step on both
+/// sides, so the profile is self-similar under zoom.
+pub fn column_weight(h: f64) -> f64 {
+    let a = width_alpha();
+    if h <= PEAK_CELL_PX {
+        (h / PEAK_CELL_PX).powf(a)
     } else {
-        (max_w * peak_h / h).max(GUTTER_PX)
+        (PEAK_CELL_PX / h).powf(a)
     }
 }
 
@@ -44,13 +55,47 @@ pub struct ColPx {
     pub w: f64,
 }
 
-/// Per-frame column table: x is the prefix sum of shallower widths — the
-/// stack is left-anchored at x = 0 and fully determined by zoom.
-pub fn column_table(zoom: f64, max_w: f64) -> Vec<ColPx> {
-    let mut out = Vec::with_capacity(MAX_DEPTH + 1);
+/// Per-frame column table over depths 0..=max_depth: weights are normalized
+/// so the stack sums to STACK_FRACTION·vw at every zoom, with zoomed-past
+/// (decay-side) columns floored at GUTTER_PX. Flooring one column re-scales
+/// the rest, which may floor more — iterate until stable (waterfill; the
+/// re-scale is continuous at the floor boundary, so widths never pop).
+/// x is the prefix sum of shallower widths — the stack is left-anchored at
+/// x = 0 and fully determined by zoom.
+pub fn column_table(zoom: f64, vw: f64, max_depth: usize) -> Vec<ColPx> {
+    let n = max_depth + 1;
+    let target = STACK_FRACTION * vw;
+    let heights: Vec<f64> = (0..n).map(|d| cell_px_height(d as u8, zoom)).collect();
+    let weights: Vec<f64> = heights.iter().map(|&h| column_weight(h)).collect();
+    let mut floored = vec![false; n];
+    let mut scale;
+    loop {
+        let free_sum: f64 = weights.iter().zip(&floored).filter(|&(_, &f)| !f).map(|(w, _)| w).sum();
+        let budget = target - GUTTER_PX * floored.iter().filter(|&&f| f).count() as f64;
+        if free_sum <= 0.0 || budget <= 0.0 {
+            // Degenerate (gutters alone overflow a tiny window, or every
+            // depth is floored): free columns collapse to zero width.
+            scale = 0.0;
+            break;
+        }
+        scale = budget / free_sum;
+        let mut changed = false;
+        for d in 0..n {
+            // Only zoomed-past columns get the gutter floor; the deep rising
+            // tail is allowed to be arbitrarily thin.
+            if !floored[d] && heights[d] > PEAK_CELL_PX && scale * weights[d] < GUTTER_PX {
+                floored[d] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out = Vec::with_capacity(n);
     let mut x = 0.0;
-    for d in 0..=MAX_DEPTH {
-        let w = column_px_width(cell_px_height(d as u8, zoom), max_w);
+    for d in 0..n {
+        let w = if floored[d] { GUTTER_PX } else { scale * weights[d] };
         out.push(ColPx { x, w });
         x += w;
     }
@@ -108,7 +153,16 @@ pub fn visible_nodes<'a>(
     vw: f64,
     vh: f64,
 ) -> Vec<DrawItem<'a>> {
-    let cols = column_table(camera.zoom, MAX_COLUMN_FRACTION * vw);
+    // Normalize over the depths that actually exist, so phantom deep levels
+    // don't steal window width from a shallow tree.
+    let max_level = layout
+        .nodes
+        .values()
+        .map(|nl| nl.cells.level as usize)
+        .max()
+        .unwrap_or(0)
+        .min(MAX_DEPTH);
+    let cols = column_table(camera.zoom, vw, max_level);
     let mut out = Vec::new();
     walk(&tree.root, layout, camera, &cols, vw, vh, 0.0, &mut out);
     out
@@ -214,57 +268,66 @@ mod tests {
         assert!(items.is_empty());
     }
 
-    /// Cap used by the pure-function tests (arbitrary fixed value; the
-    /// fraction-of-viewport scaling is exercised by the culling tests).
-    const MAX_W: f64 = 400.0;
-
     #[test]
-    fn width_profile_rising_side() {
-        // w = 3h up to the peak
-        close(column_px_width(10.0, MAX_W), 30.0);
-        close(column_px_width(100.0, MAX_W), 300.0);
-        let peak_h = MAX_W / CELL_ASPECT; // ≈ 133.33 px cells
-        close(column_px_width(peak_h, MAX_W), MAX_W);
-    }
-
-    #[test]
-    fn width_profile_decay_side() {
-        // past the peak, w = max_w² / (3h): halves when h doubles
-        let peak_h = MAX_W / CELL_ASPECT;
-        close(column_px_width(2.0 * peak_h, MAX_W), MAX_W / 2.0);
-        close(column_px_width(8.0 * peak_h, MAX_W), MAX_W / 8.0);
-        // gutter floor is reached exactly and held forever
-        let floor_h = MAX_W * peak_h / GUTTER_PX;
-        close(column_px_width(floor_h, MAX_W), GUTTER_PX);
-        close(column_px_width(floor_h * 100.0, MAX_W), GUTTER_PX);
-    }
-
-    #[test]
-    fn width_profile_self_similar() {
-        // spec §3: the table at zoom 8z equals the table at z shifted one depth right
-        for &z in &[10.0, 127.0, 1000.0, 54321.0] {
-            let t1 = column_table(z, MAX_W);
-            let t8 = column_table(8.0 * z, MAX_W);
-            for d in 0..MAX_DEPTH {
-                close(t8[d + 1].w, t1[d].w);
-            }
+    fn weight_profile_peak_and_falloff() {
+        // peak weight is 1; one depth step (8x in h) is WIDTH_RATIO (4x) in
+        // weight, on both sides of the peak
+        close(column_weight(PEAK_CELL_PX), 1.0);
+        close(column_weight(PEAK_CELL_PX / 8.0), 0.25);
+        close(column_weight(PEAK_CELL_PX / 64.0), 0.0625);
+        close(column_weight(PEAK_CELL_PX * 8.0), 0.25);
+        // symmetric in log-h around the peak
+        close(column_weight(PEAK_CELL_PX / 2.0), column_weight(PEAK_CELL_PX * 2.0));
+        // self-similar at arbitrary h: one step away from the peak is /4
+        for &h in &[1.0, 37.0, 200.0] {
+            close(column_weight(h / 8.0), column_weight(h) / 4.0);
+        }
+        for &h in &[200.0, 5000.0] {
+            close(column_weight(8.0 * h), column_weight(h) / 4.0);
         }
     }
 
     #[test]
-    fn column_table_prefix_sums_and_bound() {
-        for &z in &[1.0, 571.4285714285714, 36571.42857142857, 1e12] {
-            let t = column_table(z, MAX_W);
+    fn column_table_sums_to_target() {
+        // normalization: total stack width = STACK_FRACTION·vw at every zoom
+        // (gutter floors included in the budget) — no mid-octave breathing
+        for &z in &[10.0, 571.4285714285714, 36571.42857142857, 1e6] {
+            let t = column_table(z, 800.0, MAX_DEPTH);
             assert_eq!(t.len(), MAX_DEPTH + 1);
             close(t[0].x, 0.0);
             for d in 1..t.len() {
                 close(t[d].x, t[d - 1].x + t[d - 1].w);
                 assert!(t[d - 1].w > 0.0, "widths must be positive");
-                assert!(t[d].x >= t[d - 1].x, "x must be non-decreasing");
             }
-            // spec §3: total stack width is bounded at any zoom
             let total = t[MAX_DEPTH].x + t[MAX_DEPTH].w;
-            assert!(total < 1600.0, "total {total} not bounded at zoom {z}");
+            close(total, 0.95 * 800.0);
+        }
+    }
+
+    #[test]
+    fn column_table_gutter_floor() {
+        // two octaves past home on a deep table: depth 0 is floored at
+        // exactly GUTTER_PX while nearer ancestors are still free
+        let t = column_table(256000.0 / 7.0, 800.0, MAX_DEPTH);
+        close(t[0].w, GUTTER_PX);
+        assert!(t[1].w > GUTTER_PX);
+    }
+
+    #[test]
+    fn width_ratios_self_similar() {
+        // spec §3: zooming 8x shifts the profile one depth; gutter floors
+        // shift the budget, so it's the adjacent-width RATIOS that carry over
+        for &z in &[10.0, 127.0, 1000.0, 54321.0] {
+            let t1 = column_table(z, 800.0, MAX_DEPTH);
+            let t8 = column_table(8.0 * z, 800.0, MAX_DEPTH);
+            for d in 0..MAX_DEPTH - 1 {
+                let free = [t1[d].w, t1[d + 1].w, t8[d + 1].w, t8[d + 2].w]
+                    .iter()
+                    .all(|&w| w > GUTTER_PX + 0.5);
+                if free {
+                    close(t8[d + 1].w / t8[d + 2].w, t1[d].w / t1[d + 1].w);
+                }
+            }
         }
     }
 
@@ -305,15 +368,16 @@ mod tests {
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
         let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
         // heights: root 571.4, a.rs 285.7, b.rs 71.4, f 26.8, g 8.9
-        // widths (cap = 0.75·800 = 600, peak_h = 200):
-        //   d0 210 (decay side), d1 214.29, d2 26.79 (< LABEL_MIN_W → Dot)
-        assert_eq!(rungs, vec![Rung::Card, Rung::Card, Rung::Label, Rung::Dot, Rung::Dot]);
-        // hand-computed px rect for f (zoom = 4000/7):
-        // x = w0+w1 = 210 + 1500/7, y = 0.125·zoom + 300, w = 3·zoom/64, h = 3·zoom/64
+        // tree max level 2 → 3 columns normalized to 0.95·800 = 760:
+        // weights (0.35)^⅔, (5/14)^⅔, (5/112)^⅔ → widths 335.25, 339.80, 84.95
+        // (f is 84.9px wide, ≥ LABEL_MIN_W, so it keeps its height rung)
+        assert_eq!(rungs, vec![Rung::Card, Rung::Card, Rung::Label, Rung::Label, Rung::Dot]);
+        // externally computed px rect for f (zoom = 4000/7):
+        // x = w0+w1, y = 0.125·zoom + 300, w = w2, h = 3·zoom/64
         let f = &items[3].px;
-        assert!((f.x - 424.2857143).abs() < 1e-6, "{}", f.x);
+        assert!((f.x - 675.0504578).abs() < 1e-6, "{}", f.x);
         assert!((f.y - 371.4285714).abs() < 1e-6, "{}", f.y);
-        assert!((f.w - 26.7857143).abs() < 1e-6, "{}", f.w);
+        assert!((f.w - 84.9495422).abs() < 1e-6, "{}", f.w);
         assert!((f.h - 26.7857143).abs() < 1e-6, "{}", f.h);
     }
 
@@ -321,37 +385,41 @@ mod tests {
     fn culling_x_prune_stops_recursion() {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
-        let cam = Camera::frame(1.0, 600.0);
-        // viewport 40px wide (cap 30): every ancestor column is gutter-floored
-        // to 24px, so x1 = 24 ≤ 40 but x2 = 48 > 40 → depth ≥ 2 pruned
+        // extreme zoom on a 40px-wide viewport: gutters alone (24+24) exceed
+        // the 38px budget, so depths 0/1 floor at 24 and x2 = 48 > 40 →
+        // depth 2 pruned; a.rs is above the viewport (y-pruned)
+        let cam = Camera { center_y: 0.6875, zoom: 1e9 };
         let items = visible_nodes(&tree, &layout, &cam, 40.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        assert_eq!(names, vec!["", "a.rs", "b.rs"]);
+        assert_eq!(names, vec!["", "b.rs"]);
+        assert!((items[0].px.w - 24.0).abs() < 1e-6);
+        assert!((items[1].px.w - 24.0).abs() < 1e-6);
     }
 
     #[test]
-    fn gutters_are_clipped_narrow_dots() {
+    fn zoomed_past_ancestors_clip_and_compress() {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
         // two octaves past home (zoom·64), centered on g: root and b.rs are
-        // zoomed-past ancestors → narrow strips, clipped to the viewport
+        // zoomed-past ancestors, clipped to the viewport. With the 4x
+        // falloff they compress gradually: weights (7/1280)^⅔, (7/160)^⅔,
+        // (7/20)^⅔ normalized to 760 → widths 36.19, 144.76, 579.05
         let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         // a.rs and f are entirely above the viewport (y-pruned)
         assert_eq!(names, vec!["", "b.rs", "g"]);
         let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
-        assert_eq!(rungs, vec![Rung::Dot, Rung::Dot, Rung::Card]);
-        // root gutter: x=0, w=24, y clipped to [-2, 602]
+        // root is narrow (36.2 < LABEL_MIN_W) → Dot; b.rs still wide → Card
+        assert_eq!(rungs, vec![Rung::Dot, Rung::Card, Rung::Card]);
+        // root strip: x=0, w=36.19, y clipped to [-2, 602]
         let root = &items[0].px;
-        assert!((root.x - 0.0).abs() < 1e-6 && (root.w - 24.0).abs() < 1e-6);
+        assert!((root.x - 0.0).abs() < 1e-6 && (root.w - 36.1904762).abs() < 1e-6, "{:?}", root);
         assert!((root.y - -2.0).abs() < 1e-6 && (root.h - 604.0).abs() < 1e-6);
-        // cap = 0.75·800 = 600, peak_h = 200: b.rs (d1, h = 32000/7) is on the
-        // decay side just above the floor → w = 120000·7/32000 = 26.25
-        // g: x = 24 + 26.25 = 50.25, w = 210 (decay side), y = 300, h clipped to 302
+        // g: x = w0 + w1, w = w2 (peak-side), y = 300, h clipped to 302
         let g = &items[2].px;
-        assert!((g.x - 50.25).abs() < 1e-6, "{}", g.x);
-        assert!((g.w - 210.0).abs() < 1e-6, "{}", g.w);
+        assert!((g.x - 180.9523810).abs() < 1e-6, "{}", g.x);
+        assert!((g.w - 579.0476190).abs() < 1e-6, "{}", g.w);
         assert!((g.y - 300.0).abs() < 1e-6, "{}", g.y);
         assert!((g.h - 302.0).abs() < 1e-6, "{}", g.h);
         // nothing exceeds the clipped viewport band

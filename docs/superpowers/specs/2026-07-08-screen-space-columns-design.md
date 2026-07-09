@@ -35,40 +35,46 @@ Settled during brainstorming:
 
 ## 3. Width profile
 
-Let `h_d = zoom · 8^-d` — the pixel height of one level-`d` cell, and
-`max_w = MAX_COLUMN_FRACTION · viewport_width` — the width cap, computed per
-frame so the peak column scales with the window.
+Revised post-exit-gate: the original raw profile (`w = 3h` rising, `1/h`
+decay, both 8×/octave) made the total stack width dip mid-octave — as the
+big column shrank, the incoming one didn't grow fast enough — and 8×
+between adjacent columns made the tail vanish too fast. Widths are now
+**normalized weights** with a gentler falloff.
+
+Let `h_d = zoom · 8^-d` — the pixel height of one level-`d` cell. Each
+depth gets a dimensionless weight, peaked where cells are most readable:
 
 ```
-w(h) = 3·h                              if h ≤ max_w / 3
-     = max(GUTTER_PX, max_w² / (3·h))   otherwise
+u(h) = (h / PEAK_CELL_PX)^α    if h ≤ PEAK_CELL_PX      (rising side)
+     = (PEAK_CELL_PX / h)^α    otherwise                (decay side)
+
+α = log_8(WIDTH_RATIO) = ⅔
 ```
 
-- `MAX_COLUMN_FRACTION = 0.75`, `GUTTER_PX = 24` — tunable constants in
-  `world.rs`. (The cap was originally a fixed `MAX_COLUMN_PX = 400`, which
-  stranded wide windows at ~1/3 usage; the fraction replaces it.)
-- **Rising side** is today's 3:1 cell aspect: approaching columns grow
-  naturally with zoom.
-- **Peak** at `h = max_w / 3` — cells comfortably in Card rung when their
-  column is widest.
-- **Decay side** falls off as 1/h, floored at the gutter. A passed column
-  shrinks from `max_w` to 24 px over ~1.2 zoom octaves.
+- `PEAK_CELL_PX = 200`, `WIDTH_RATIO = 4`, `STACK_FRACTION = 0.95`,
+  `GUTTER_PX = 24` — tunable constants in `world.rs`.
+- One depth step changes `h` by 8× but weight by only `WIDTH_RATIO` (4×),
+  so the peak's neighbor columns stay comparable instead of vanishing.
+- **Normalization:** per frame, weights over depths `0..=max_level` (the
+  tree's actual depth, capped at MAX_DEPTH) are scaled so the stack sums to
+  `STACK_FRACTION · viewport_width` — total width is constant under zoom,
+  no mid-octave breathing.
+- **Gutter floor:** decay-side (zoomed-past) columns are floored at
+  `GUTTER_PX`; flooring re-scales the rest (waterfill, continuous at the
+  boundary so widths never pop). The rising tail has no floor. With 4×
+  falloff a passed column compresses gradually over ~2.4 octaves.
 
-Both sides move 8× per octave, so the profile is **self-similar**: the width
-table at zoom `8z` equals the table at zoom `z` shifted one depth right.
-Widths are bounded — at any zoom, roughly: ancestors at ≤ 24 px each, one or
-two columns near the peak, then a 3·h tail shrinking 8× per depth (its sum
-converges). Total stack width stays within a small multiple of `max_w`
-(worst case ≈ 3.3·max_w); deep sliver columns may clip on narrow windows,
-accepted for the skeleton.
+The weight profile still moves one depth per 8× zoom, so it is
+**self-similar**: adjacent-column width *ratios* at zoom `8z` equal those
+at zoom `z` shifted one depth right (absolute widths shift slightly as
+accumulating gutters eat budget). On very deep zooms accumulated gutters
+(24 px per passed level) can exceed the target on narrow windows — the
+free columns squeeze, and x-pruning clips the rest; accepted for the
+skeleton.
 
-Column x is the prefix sum: `x_d = Σ_{d' < d} w(h_{d'})`, computed once per
-frame into a per-depth table (depth ≤ ~20 entries). Screen x = `x_d`
-directly — no offset, no camera term.
-
-One visible consequence, accepted by design: at home view the root column
-sits on the decay side (~90 px), and depth 1 gets the widest column. The
-peak follows whichever level is at readable cell height.
+Column x is the prefix sum: `x_d = Σ_{d' < d} w_{d'}`, computed once per
+frame into a per-depth table. Screen x = `x_d` directly — no offset, no
+camera term.
 
 ## 4. Camera
 
@@ -109,18 +115,19 @@ downgrade produce the gutter appearance by themselves.
 
 Headless, in `world.rs` / `camera.rs`:
 
-1. **Width profile:** rising side `w = 3h`; `w(MAX/3) = MAX`; decay side
-   values; gutter floor reached and held.
-2. **Self-similarity:** width table at zoom `8z` = table at `z` shifted one
-   depth (property-style over random zooms).
-3. **Prefix sums:** widths positive, x non-decreasing (deep columns are
-   below f64 resolution of the running sum — strictness is not achievable);
-   total bounded.
-4. **Rung downgrade:** tall-but-narrow → Dot; tall-and-wide → by height.
-5. **`zoom_about` y-invariant:** world-y under the cursor fixed
+1. **Weight profile:** peak weight 1 at `PEAK_CELL_PX`; one depth step
+   (8× in h) is `WIDTH_RATIO`× in weight on both sides; symmetric in log-h.
+2. **Normalization:** total stack width = `STACK_FRACTION · vw` at every
+   zoom; gutter floor reached exactly on far-decay columns while nearer
+   ancestors stay free.
+3. **Self-similarity:** adjacent-width ratios at zoom `8z` = ratios at `z`
+   shifted one depth (free columns only; gutters shift the budget).
+4. **Prefix sums:** widths positive, x = running sum.
+5. **Rung downgrade:** tall-but-narrow → Dot; tall-and-wide → by height.
+6. **`zoom_about` y-invariant:** world-y under the cursor fixed
    (property-style).
-6. **Home round-trip:** root band fits `vh` with the 5% margin.
-7. **Worked-example culling** re-derived at hand-picked zooms (the Phase 2
+7. **Home round-trip:** root band fits `vh` with the 5% margin.
+8. **Worked-example culling** re-derived at hand-picked zooms (the Phase 2
    worked example: `b.rs::g` abs cell 44).
 
 Feel — smooth ramping, gutter appearance, no popping — is verified manually
@@ -128,7 +135,7 @@ at the exit gate.
 
 ## 7. Exit gate
 
-Zoom from home into a deep symbol in Outrider's own repo: no column ever
-grows past the cap (`MAX_COLUMN_FRACTION` of the viewport width); passed
-ancestors compress to gutters; widths
-change smoothly with no popping; y behavior identical to before.
+Zoom from home into a deep symbol in Outrider's own repo: the stack fills
+`STACK_FRACTION` of the window at every zoom with no mid-octave breathing;
+passed ancestors compress gradually to gutters; widths change smoothly with
+no popping; y behavior identical to before.
