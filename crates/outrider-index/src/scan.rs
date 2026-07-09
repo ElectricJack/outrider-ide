@@ -66,7 +66,7 @@ fn count_lines(bytes: &[u8]) -> u64 {
 }
 
 /// Build the folder/file skeleton. `rs_children` maps a file's rel_path to its
-/// parsed item nodes (empty map until Task 4 wires in the parser).
+/// parsed contents (item nodes plus the file's `//!` doc block).
 pub fn build_tree(
     repo_root: &Path,
     files: &[ScannedFile],
