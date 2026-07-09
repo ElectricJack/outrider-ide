@@ -88,13 +88,10 @@ pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64,
 - `FOCUS_FRACTION = 0.5` — arrow steps land the focus band at half the
   viewport height (Card territory, siblings and parent visible around it —
   "frame focus plus its parent" in the column model, where ancestors are
-  always on-screen as the columns to the left). *Amended after the 4b exit
-  gate (second pass):* the step fraction is **sticky** — End sets it to
-  `END_FRACTION`, Home resets it to `FOCUS_FRACTION`, and every arrow step
-  re-frames the new focus at the sticky fraction. Re-framing per node keeps
-  the fidelity rung constant across different-sized siblings (a first-pass
-  zoom floor did not: box height is zoom × node height, so a smaller
-  sibling dropped below `FULL_PX`), and Left zooms out to frame the parent.
+  always on-screen as the columns to the left). *Superseded by Phase 4c
+(`2026-07-09-phase-4c-nested-rendering-design.md` §5):* arrow steps onto
+leaf items use natural-size framing (`world::frame_leaf`); containers
+frame at FOCUS_FRACTION; there is no sticky fraction.
 - `END_FRACTION = 0.95` — **End** frames the focus to fill the viewport.
 - **Home** keeps its current framing (`Camera::frame`) but now animates.
 - Constants live in `camera.rs`, tunable at the exit gate.
@@ -144,11 +141,10 @@ animation frame, and clears it when done.
 ## 6. Input wiring (`treemap.rs`)
 
 - Key handlers: Right/Left/Up/Down mutate `Focus` then tween to
-  `frame_band(world_band(focus), vh, step_fraction, …)`, where
-  `step_fraction` is the view's sticky fraction (FOCUS_FRACTION by
-  default); End sets the sticky fraction to `END_FRACTION` and tweens to
-  that framing of the current focus (no focus change); Home resets the
-  sticky fraction and tweens to `Camera::frame(root_world_height(), vh)`.
+  `world::frame_leaf(focus, …)` for leaf items or `frame_band(…,
+  FOCUS_FRACTION, …)` for containers (superseded framing — Phase 4c §5);
+  End tweens to `END_FRACTION` framing of the current focus (no focus
+  change); Home tweens to `Camera::frame(root_world_height(), vh)`.
 - Click: hit-test → focus change only.
 - Zoom clamps stay as computed today (min = 0.5 × home zoom,
   max = vh · 8¹⁵); framing targets are clamped through the same values.

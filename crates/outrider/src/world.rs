@@ -167,10 +167,7 @@ pub struct DrawItem<'a> {
     /// (+ NEST_PAD per level of depth difference). Overlaps ancestors.
     pub px: PxRect,
     /// The node's own column width — text lives in this left strip.
-    // Task 6 reads label_w and level for depth-shaded fills; allow until then.
-    #[allow(dead_code)]
     pub label_w: f64,
-    #[allow(dead_code)]
     pub level: u8,
     pub rung: Rung,
     /// UNclipped screen-y of the box top (`px.y` is clipped to the viewport).
@@ -281,8 +278,6 @@ pub fn world_band(id: &SymbolId, layout: &WorldLayout) -> Option<(f64, f64)> {
 /// zoom starts at min(natural_px, END_FRACTION·vh) of box height and
 /// steps up by 1.25× only as needed to make the leaf's column code-wide,
 /// capped at END_FRACTION framing; the result is clamped like frame_band.
-// Task 6 calls this from the key handler; allow until then.
-#[allow(dead_code)]
 pub fn frame_leaf(
     node: &SymbolNode,
     layout: &WorldLayout,

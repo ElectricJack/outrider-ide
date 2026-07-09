@@ -43,12 +43,6 @@ pub struct TreemapView {
     drag_last: Option<gpui::Point<Pixels>>,
     press_origin: Option<gpui::Point<Pixels>>,
     focus: Focus,
-    /// Sticky framing fraction for arrow steps: FOCUS_FRACTION by default,
-    /// END_FRACTION after End, reset by Home. Re-framing every step at this
-    /// fraction keeps the fidelity rung constant across different-sized
-    /// nodes (a zoom floor cannot: box height = zoom × node height) and
-    /// lets Left zoom out to frame the parent.
-    step_fraction: f64,
     tween: Option<(CameraTween, std::time::Instant)>,
     focus_handle: FocusHandle,
     buffers: BufferManager,
@@ -69,8 +63,10 @@ struct PaintItem {
     y: f32,
     w: f32,
     h: f32,
+    label_w: f32,
     fill: u32,
     border: u32,
+    stripe: Option<u32>,
     focused: bool,
     rung: Rung,
     name: String,
@@ -122,10 +118,12 @@ fn code_line(
 /// symbol's highlighted code laid out from the UNCLIPPED top and
 /// line-window culled to the viewport (spec §4.4). Rows that would sit
 /// under the pinned name/signature block or off-screen are skipped.
+#[allow(clippy::too_many_arguments)]
 fn build_body(
     node: &SymbolNode,
     rung: Rung,
     px: &world::PxRect,
+    label_w: f64,
     top: f64,
     vh: f64,
     buffers: &mut BufferManager,
@@ -146,7 +144,7 @@ fn build_body(
             BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
             BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
         };
-        if let Some(shown) = truncate_to_width(&text, px.w as f32, FONT_PX as f32) {
+        if let Some(shown) = truncate_to_width(&text, label_w as f32, FONT_PX as f32) {
             let len = shown.len();
             out.push(BodyText { y: y as f32, text: shown, runs: vec![(len, color)] });
         }
@@ -170,7 +168,7 @@ fn build_body(
                     }
                     if let Some((text, spans)) = m.buffer.line(start + j) {
                         if let Some((shown, runs)) =
-                            code_line(&text, spans, px.w as f32, FONT_PX as f32)
+                            code_line(&text, spans, label_w as f32, FONT_PX as f32)
                         {
                             out.push(BodyText { y: y as f32, text: shown, runs });
                         }
@@ -195,7 +193,6 @@ impl TreemapView {
             drag_last: None,
             press_origin: None,
             focus: Focus::new(root_id),
-            step_fraction: camera::FOCUS_FRACTION,
             tween: None,
             focus_handle: cx.focus_handle(),
             buffers,
@@ -256,11 +253,13 @@ impl TreemapView {
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            let f = theme::churn_heat(item.node.churn);
+            let is_code = item.rung == Rung::Full && content::is_leaf_item(item.node);
+            let fill = if is_code { theme::CODE_BG } else { theme::depth_fill(item.level) };
             let body = build_body(
                 item.node,
                 item.rung,
                 &item.px,
+                item.label_w,
                 item.top,
                 vh,
                 &mut self.buffers,
@@ -271,8 +270,10 @@ impl TreemapView {
                 y: item.px.y as f32,
                 w: item.px.w as f32,
                 h: item.px.h as f32,
-                fill: f,
-                border: theme::border_for(f),
+                label_w: item.label_w as f32,
+                fill,
+                border: theme::border_for(fill),
+                stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
                 focused: item.node.id == focus_id,
                 rung: item.rung,
                 name: item.node.name.clone(),
@@ -376,6 +377,7 @@ impl Render for TreemapView {
                     return;
                 }
                 let vh = f64::from(w.viewport_size().height);
+                let vw = f64::from(w.viewport_size().width);
                 let max_zoom = vh * 8f64.powi(15);
                 let min_zoom = this.home_zoom * 0.5;
                 let index = TreeIndex::new(&this.tree);
@@ -392,18 +394,28 @@ impl Render for TreemapView {
                         if !moved {
                             return;
                         }
-                        world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
-                            camera::frame_band(y, h, vh, this.step_fraction, min_zoom, max_zoom)
-                        })
+                        match index.node(&this.focus.current) {
+                            Some(n) if content::is_leaf_item(n) => {
+                                world::frame_leaf(n, &this.layout, vw, vh, min_zoom, max_zoom)
+                            }
+                            _ => world::world_band(&this.focus.current, &this.layout).map(
+                                |(y, h)| {
+                                    camera::frame_band(
+                                        y,
+                                        h,
+                                        vh,
+                                        camera::FOCUS_FRACTION,
+                                        min_zoom,
+                                        max_zoom,
+                                    )
+                                },
+                            ),
+                        }
                     }
-                    "end" => {
-                        this.step_fraction = camera::END_FRACTION;
-                        world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
-                            camera::frame_band(y, h, vh, camera::END_FRACTION, min_zoom, max_zoom)
-                        })
-                    }
+                    "end" => world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
+                        camera::frame_band(y, h, vh, camera::END_FRACTION, min_zoom, max_zoom)
+                    }),
                     "home" => {
-                        this.step_fraction = camera::FOCUS_FRACTION;
                         let c = this.home_camera(vh);
                         this.home_zoom = c.zoom;
                         Some(c)
@@ -432,12 +444,26 @@ impl Render for TreemapView {
                             };
                             window.paint_quad(quad(
                                 b,
-                                px(0.),
+                                px(theme::CORNER_RADIUS),
                                 rgb(item.fill),
                                 px(bw),
                                 rgb(bc),
                                 BorderStyle::default(),
                             ));
+                            if let Some(heat) = item.stripe {
+                                let sb = Bounds::new(
+                                    point(origin.x + px(item.x + 1.0), origin.y + px(item.y + 1.0)),
+                                    size(px(theme::STRIPE_W), px((item.h - 2.0).max(0.0))),
+                                );
+                                window.paint_quad(quad(
+                                    sb,
+                                    px(0.),
+                                    rgb(heat),
+                                    px(0.),
+                                    rgb(heat),
+                                    BorderStyle::default(),
+                                ));
+                            }
                             if item.rung == Rung::Dot || item.h < 14.0 {
                                 continue;
                             }
@@ -451,7 +477,7 @@ impl Render for TreemapView {
                                 underline: None,
                                 strikethrough: None,
                             };
-                            if let Some(name) = truncate_to_width(&item.name, item.w, font_px) {
+                            if let Some(name) = truncate_to_width(&item.name, item.label_w, font_px) {
                                 let line = window.text_system().shape_line(
                                     name.clone().into(),
                                     px(font_px),
@@ -564,7 +590,7 @@ mod tests {
         let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
         let mut mgr = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
-        let body = build_body(&f, Rung::Detail, &px, 0.0, 600.0, &mut mgr, &BTreeMap::new());
+        let body = build_body(&f, Rung::Detail, &px, 400.0, 0.0, 600.0, &mut mgr, &BTreeMap::new());
         // churn readout + doc first line (no items → no kind-counts line)
         assert_eq!(body.len(), 2);
         assert_eq!(body[1].text, "Doc line.");
@@ -581,7 +607,7 @@ mod tests {
         let mut file_symbols = BTreeMap::new();
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 800.0 };
-        let body = build_body(&leaf, Rung::Full, &px, 0.0, 600.0, &mut mgr, &file_symbols);
+        let body = build_body(&leaf, Rung::Full, &px, 400.0, 0.0, 600.0, &mut mgr, &file_symbols);
         // signature row + exactly the symbol's one code line (line-window)
         assert_eq!(body.len(), 2);
         assert_eq!(body[0].text, "fn two()");
@@ -591,7 +617,7 @@ mod tests {
         assert!((f64::from(body[1].y) - (HEADER + LINE_STEP)).abs() < 1e-3);
         // buffer unavailable → Detail-equivalent content (signature, no code)
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
-        let body = build_body(&leaf, Rung::Full, &px, 0.0, 600.0, &mut broken, &BTreeMap::new());
+        let body = build_body(&leaf, Rung::Full, &px, 400.0, 0.0, 600.0, &mut broken, &BTreeMap::new());
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two()");
     }

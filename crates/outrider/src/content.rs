@@ -8,7 +8,6 @@ pub const LINE_STEP: f64 = FONT_PX * 1.3;
 /// Name-row height: text top padding (4) plus one meta-line offset.
 pub const HEADER: f64 = 4.0 + FONT_PX * 1.4;
 /// Padding below the last body row inside a leaf box.
-#[allow(dead_code)]
 pub const BOTTOM_PAD: f64 = 6.0;
 
 /// A code-bearing leaf: has source bytes, no children, and is an item
@@ -21,7 +20,6 @@ pub fn is_leaf_item(node: &SymbolNode) -> bool {
 
 /// Natural pixel height of a leaf item's box: header + signature row +
 /// one row per code line + bottom pad.
-#[allow(dead_code)]
 pub fn natural_px(node: &SymbolNode) -> f64 {
     HEADER + (1.0 + node.measure as f64) * LINE_STEP + BOTTOM_PAD
 }
