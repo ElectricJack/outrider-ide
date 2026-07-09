@@ -24,6 +24,9 @@ pub const GUTTER_PX: f64 = 24.0;
 pub const LABEL_MIN_W: f64 = 60.0;
 /// Depths beyond this are sub-merge at any legal zoom (max zoom = vh·8^15).
 pub const MAX_DEPTH: usize = 24;
+/// Horizontal nesting margin: each ancestor's box extends this much
+/// further right than its children's boxes.
+pub const NEST_PAD: f64 = 6.0;
 
 /// 8^-depth: the size scale of level-`depth` cells relative to level 0.
 pub fn column_scale(depth: u8) -> f64 {
@@ -160,7 +163,15 @@ pub struct PxRect {
 #[derive(Debug)]
 pub struct DrawItem<'a> {
     pub node: &'a SymbolNode,
+    /// Containment rect: extends rightward over visible descendants
+    /// (+ NEST_PAD per level of depth difference). Overlaps ancestors.
     pub px: PxRect,
+    /// The node's own column width — text lives in this left strip.
+    // Task 6 reads label_w and level for depth-shaded fills; allow until then.
+    #[allow(dead_code)]
+    pub label_w: f64,
+    #[allow(dead_code)]
+    pub level: u8,
     pub rung: Rung,
     /// UNclipped screen-y of the box top (`px.y` is clipped to the viewport).
     pub top: f64,
@@ -200,37 +211,53 @@ fn walk<'a>(
     vh: f64,
     parent_abs: f64,
     out: &mut Vec<DrawItem<'a>>,
-) {
-    let Some(nl) = layout.nodes.get(&node.id) else { return };
+) -> Option<u8> {
+    let nl = layout.nodes.get(&node.id)?;
     let depth = nl.cells.level;
     let abs = parent_abs * outrider_layout::RATIO as f64 + nl.cells.start as f64;
     debug_assert!(abs < 2f64.powi(53), "cell address exceeds exact f64 range");
     let s = column_scale(depth);
     let px_y = camera.world_to_screen_y(abs * s, vh);
     let px_h = nl.cells.len as f64 * s * camera.zoom;
-    let Some(&ColPx { x: px_x, w: px_w }) = cols.get(depth as usize) else { return };
+    let &ColPx { x: px_x, w: px_w } = cols.get(depth as usize)?;
 
     // Below the merge threshold: this node merges into its parent's tile,
     // and children (8x smaller) are below it too. Stop.
     let natural = content::is_leaf_item(node).then(|| content::natural_px(node));
-    let Some(rung) = rung_for(px_h, px_w, natural) else { return };
+    let rung = rung_for(px_h, px_w, natural)?;
     // Children's y-ranges are contained in the parent's: off-screen y prunes the subtree.
     if px_y > vh || px_y + px_h < 0.0 {
-        return;
+        return None;
     }
     // Deeper columns are further right: past the right edge prunes the subtree.
     if px_x > vw {
-        return;
+        return None;
     }
     // Zoomed-past ancestors have enormous pixel heights; clip to the viewport
     // (2px slack keeps their borders off-screen) before f32 ever sees them.
     // The rung above is chosen from the UNclipped height.
     let y0 = px_y.max(-2.0);
     let y1 = (px_y + px_h).min(vh + 2.0);
-    out.push(DrawItem { node, px: PxRect { x: px_x, y: y0, w: px_w, h: y1 - y0 }, rung, top: px_y });
+    let idx = out.len();
+    out.push(DrawItem {
+        node,
+        px: PxRect { x: px_x, y: y0, w: px_w, h: y1 - y0 },
+        label_w: px_w,
+        level: depth,
+        rung,
+        top: px_y,
+    });
+    let mut deepest = depth;
     for child in &node.children {
-        walk(child, layout, camera, cols, vw, vh, abs, out);
+        if let Some(d) = walk(child, layout, camera, cols, vw, vh, abs, out) {
+            deepest = deepest.max(d);
+        }
     }
+    if deepest > depth {
+        let dc = &cols[deepest as usize];
+        out[idx].px.w = dc.x + dc.w + NEST_PAD * f64::from(deepest - depth) - px_x;
+    }
+    Some(deepest)
 }
 
 /// Absolute world-y band (y, h) of a node: full ancestor composition via
@@ -244,8 +271,8 @@ pub fn world_band(id: &SymbolId, layout: &WorldLayout) -> Option<(f64, f64)> {
     Some((abs * s, nl.cells.len as f64 * s))
 }
 
-/// Visible node containing the point. Columns are horizontally disjoint,
-/// so at most one item matches; take the last (deepest) for robustness.
+/// Visible node containing the point. Rects nest (ancestors extend over
+/// descendants), so take the last hit in DFS order — the deepest node.
 pub fn hit_test<'a>(items: &'a [DrawItem<'a>], x: f64, y: f64) -> Option<&'a DrawItem<'a>> {
     items
         .iter()
@@ -453,7 +480,8 @@ mod tests {
         let items = visible_nodes(&tree, &layout, &cam, 40.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "b.rs"]);
-        assert!((items[0].px.w - 24.0).abs() < 1e-6);
+        assert!((items[0].px.w - 54.0).abs() < 1e-6);
+        assert!((items[0].label_w - 24.0).abs() < 1e-6);
         assert!((items[1].px.w - 24.0).abs() < 1e-6);
     }
 
@@ -474,10 +502,11 @@ mod tests {
         // root narrow (36.2 < LABEL_MIN_W) → Dot; b.rs Full-height but
         // 144.76 < CODE_MIN_W → Detail; g 571.4px → Detail
         assert_eq!(rungs, vec![Rung::Dot, Rung::Detail, Rung::Detail]);
-        // root strip: x=0, w=36.19, y clipped to [-2, 602]
+        // root strip: x=0, w extended to 772 (encloses g at level 2), y clipped to [-2, 602]
         let root = &items[0].px;
-        assert!((root.x - 0.0).abs() < 1e-6 && (root.w - 36.1904762).abs() < 1e-6, "{:?}", root);
+        assert!((root.x - 0.0).abs() < 1e-6 && (root.w - 772.0).abs() < 1e-6, "{:?}", root);
         assert!((root.y - -2.0).abs() < 1e-6 && (root.h - 604.0).abs() < 1e-6);
+        assert!((items[0].label_w - 36.1904762).abs() < 1e-6);
         // g: x = w0 + w1, w = w2 (peak-side), y = 300, h clipped to 302
         let g = &items[2].px;
         assert!((g.x - 180.9523810).abs() < 1e-6, "{}", g.x);
@@ -524,7 +553,35 @@ mod tests {
         assert_eq!(hit_test(&items, 10.0, 10.0).unwrap().node.name, "");
         assert_eq!(hit_test(&items, 100.0, 500.0).unwrap().node.name, "b.rs");
         assert_eq!(hit_test(&items, 400.0, 450.0).unwrap().node.name, "g");
-        assert!(hit_test(&items, 400.0, 100.0).is_none()); // above g's band
+        assert_eq!(hit_test(&items, 400.0, 100.0).unwrap().node.name, "b.rs"); // above g's band, inside b.rs's extended rect
         assert!(hit_test(&items, 790.0, 300.0).is_none()); // right of the stack
+    }
+
+    #[test]
+    fn nested_rects_extend_over_descendants() {
+        let tree = worked_example();
+        let layout = outrider_layout::layout(&tree);
+        // zoomed-past scene: cols w = 36.19, 144.76, 579.05; stack right = 760
+        let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
+        let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        assert_eq!(names, vec!["", "b.rs", "g"]);
+        // root (level 0) encloses g (level 2): right = 760 + 2·NEST_PAD
+        assert!((items[0].px.w - 772.0).abs() < 1e-6, "{}", items[0].px.w);
+        // b.rs (level 1): right = 760 + 1·NEST_PAD → w = 766 − 36.190…
+        assert!((items[1].px.w - 729.8095238).abs() < 1e-6, "{}", items[1].px.w);
+        // g is a leaf: keeps its own column width
+        assert!((items[2].px.w - 579.0476190).abs() < 1e-6, "{}", items[2].px.w);
+        // label_w stays the own-column width for text layout
+        assert!((items[0].label_w - 36.1904762).abs() < 1e-6);
+        assert!((items[1].label_w - 144.7619048).abs() < 1e-6);
+        assert!((items[2].label_w - 579.0476190).abs() < 1e-6);
+        assert_eq!((items[0].level, items[1].level, items[2].level), (0, 1, 2));
+        // a parent whose children are all culled keeps its column edge:
+        // the x-prune scene (40px viewport) draws root+b.rs only
+        let cam = Camera { center_y: 0.6875, zoom: 1e9 };
+        let items = visible_nodes(&tree, &layout, &cam, 40.0, 600.0);
+        assert!((items[1].px.w - 24.0).abs() < 1e-6); // b.rs: g x-pruned
+        assert!((items[0].px.w - 54.0).abs() < 1e-6); // root: 24+24 + NEST_PAD
     }
 }
