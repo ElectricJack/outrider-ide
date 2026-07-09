@@ -109,7 +109,9 @@ Headless, in `world.rs` / `camera.rs`:
    values; gutter floor reached and held.
 2. **Self-similarity:** width table at zoom `8z` = table at `z` shifted one
    depth (property-style over random zooms).
-3. **Prefix sums:** strictly increasing; total bounded.
+3. **Prefix sums:** widths positive, x non-decreasing (deep columns are
+   below f64 resolution of the running sum — strictness is not achievable);
+   total bounded.
 4. **Rung downgrade:** tall-but-narrow → Dot; tall-and-wide → by height.
 5. **`zoom_about` y-invariant:** world-y under the cursor fixed
    (property-style).
