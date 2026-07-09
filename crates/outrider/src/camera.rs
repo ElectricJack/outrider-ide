@@ -34,11 +34,10 @@ impl Camera {
     }
 }
 
-/// Default arrow-step framing: the focus band lands at half the viewport
-/// height. The view's sticky step fraction resets to this on Home.
+/// Default arrow-step framing for containers: the focus band lands at half
+/// the viewport height. (Leaf items use `world::frame_leaf` instead.)
 pub const FOCUS_FRACTION: f64 = 0.5;
-/// End-key framing: the focus band fills the viewport. End makes this the
-/// sticky step fraction, so subsequent arrow steps stay at Full.
+/// End-key framing: the focus band fills the viewport.
 pub const END_FRACTION: f64 = 0.95;
 /// Camera-follow tween duration, seconds (spec: ~250 ms, interruptible).
 pub const TWEEN_SECS: f64 = 0.25;
