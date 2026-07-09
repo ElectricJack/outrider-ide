@@ -1,0 +1,290 @@
+use outrider_index::{SymbolKind, SymbolNode};
+
+use crate::world::Rung;
+
+/// One rendered body line under a box's name row.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyLine {
+    /// TEXT_PRIMARY
+    Plain(String),
+    /// TEXT_SECONDARY
+    Dim(String),
+}
+
+/// Card meta line — format unchanged from the pre-4b render (spec §4.4).
+#[allow(dead_code)]
+pub fn card_meta(node: &SymbolNode) -> String {
+    format!("{} · p{:.0} · {}L", node.churn_count, node.churn * 100.0, node.measure)
+}
+
+/// e.g. "480L · 47 commits · p96"
+#[allow(dead_code)]
+pub fn churn_readout(node: &SymbolNode) -> String {
+    format!("{}L · {} commits · p{:.0}", node.measure, node.churn_count, node.churn * 100.0)
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+/// Item counts by kind: all descendants for files/items ("3 fns · 1 struct");
+/// direct child files/folders for folders ("2 files · 1 folder"). Empty
+/// string when there is nothing to count.
+#[allow(dead_code)]
+pub fn kind_counts(node: &SymbolNode) -> String {
+    if node.id.kind == SymbolKind::Folder {
+        let files = node.children.iter().filter(|c| c.id.kind == SymbolKind::File).count();
+        let folders = node.children.iter().filter(|c| c.id.kind == SymbolKind::Folder).count();
+        let mut parts = Vec::new();
+        if files > 0 {
+            parts.push(plural(files, "file"));
+        }
+        if folders > 0 {
+            parts.push(plural(folders, "folder"));
+        }
+        return parts.join(" · ");
+    }
+    fn count(node: &SymbolNode, c: &mut [usize; 6]) {
+        for k in &node.children {
+            match k.id.kind {
+                SymbolKind::Fn => c[0] += 1,
+                SymbolKind::Struct => c[1] += 1,
+                SymbolKind::Enum => c[2] += 1,
+                SymbolKind::Trait => c[3] += 1,
+                SymbolKind::Impl => c[4] += 1,
+                SymbolKind::Module => c[5] += 1,
+                SymbolKind::File | SymbolKind::Folder => {}
+            }
+            count(k, c);
+        }
+    }
+    let mut c = [0usize; 6];
+    count(node, &mut c);
+    let words = ["fn", "struct", "enum", "trait", "impl", "mod"];
+    c.iter()
+        .zip(words)
+        .filter(|(&n, _)| n > 0)
+        .map(|(&n, w)| plural(n, w))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The full inventory line (spec §4.3): kind counts + churn readout,
+/// e.g. "4 fns · 2 structs · 480L · 47 commits · p96".
+#[allow(dead_code)]
+pub fn inventory(node: &SymbolNode) -> String {
+    let kinds = kind_counts(node);
+    if kinds.is_empty() {
+        churn_readout(node)
+    } else {
+        format!("{kinds} · {}", churn_readout(node))
+    }
+}
+
+/// Non-code body lines by node type and rung — the spec §4.3 content table.
+/// Full leaf items return only their signature; the paint path appends the
+/// highlighted code (or leaves this Detail-equivalent content when the
+/// buffer is unavailable).
+#[allow(dead_code)]
+pub fn body_lines(node: &SymbolNode, rung: Rung) -> Vec<BodyLine> {
+    match rung {
+        Rung::Dot | Rung::Label => vec![],
+        Rung::Card => vec![BodyLine::Dim(card_meta(node))],
+        Rung::Detail | Rung::Full => match node.id.kind {
+            SymbolKind::Folder => {
+                if rung == Rung::Detail {
+                    let mut out = vec![BodyLine::Dim(churn_readout(node))];
+                    let kinds = kind_counts(node);
+                    if !kinds.is_empty() {
+                        out.push(BodyLine::Dim(kinds));
+                    }
+                    out
+                } else {
+                    vec![BodyLine::Dim(inventory(node))]
+                }
+            }
+            SymbolKind::File => {
+                if rung == Rung::Detail {
+                    let mut out = vec![BodyLine::Dim(churn_readout(node))];
+                    if let Some(first) = node.doc.as_deref().and_then(|d| d.lines().next()) {
+                        out.push(BodyLine::Plain(first.to_string()));
+                    }
+                    let kinds = kind_counts(node);
+                    if !kinds.is_empty() {
+                        out.push(BodyLine::Dim(kinds));
+                    }
+                    out
+                } else {
+                    let mut out: Vec<BodyLine> = node
+                        .doc
+                        .as_deref()
+                        .map(|d| d.lines().map(|l| BodyLine::Plain(l.to_string())).collect())
+                        .unwrap_or_default();
+                    out.push(BodyLine::Dim(inventory(node)));
+                    out
+                }
+            }
+            _ => {
+                let mut out = Vec::new();
+                if let Some(sig) = &node.signature {
+                    out.push(BodyLine::Plain(sig.clone()));
+                }
+                if rung == Rung::Full && !node.children.is_empty() {
+                    out.push(BodyLine::Dim(inventory(node)));
+                }
+                out
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use outrider_index::{SymbolId, SymbolKind, SymbolNode};
+
+    #[allow(clippy::too_many_arguments)]
+    fn node(
+        kind: SymbolKind,
+        qual: &str,
+        measure: u64,
+        churn: f32,
+        churn_count: u64,
+        signature: Option<&str>,
+        doc: Option<&str>,
+        children: Vec<SymbolNode>,
+    ) -> SymbolNode {
+        SymbolNode {
+            id: SymbolId { kind, qualified_path: qual.into(), ordinal: 0 },
+            name: qual.rsplit(['/', ':']).next().unwrap_or(qual).to_string(),
+            byte_range: None,
+            signature: signature.map(str::to_string),
+            doc: doc.map(str::to_string),
+            measure,
+            churn,
+            churn_count,
+            children,
+        }
+    }
+
+    /// File m.rs: struct Point, impl Point { fn new, fn norm }, fn free —
+    /// 480L, 47 commits, p96, two-line doc.
+    fn file() -> SymbolNode {
+        node(
+            SymbolKind::File,
+            "m.rs",
+            480,
+            0.96,
+            47,
+            None,
+            Some("Doc first.\nDoc second."),
+            vec![
+                node(SymbolKind::Struct, "m.rs::Point", 4, 0.5, 3, Some("struct Point"), None, vec![]),
+                node(
+                    SymbolKind::Impl,
+                    "m.rs::Point",
+                    9,
+                    0.5,
+                    3,
+                    Some("impl Point"),
+                    None,
+                    vec![
+                        node(SymbolKind::Fn, "m.rs::Point::new", 3, 0.5, 3, Some("fn new() -> Self"), None, vec![]),
+                        node(SymbolKind::Fn, "m.rs::Point::norm", 3, 0.5, 3, Some("fn norm(&self) -> f64"), None, vec![]),
+                    ],
+                ),
+                node(SymbolKind::Fn, "m.rs::free", 3, 0.5, 3, Some("fn free()"), None, vec![]),
+            ],
+        )
+    }
+
+    fn folder() -> SymbolNode {
+        node(
+            SymbolKind::Folder,
+            "src",
+            812,
+            0.4,
+            12,
+            None,
+            None,
+            vec![
+                node(SymbolKind::File, "src/a.rs", 400, 0.0, 0, None, None, vec![]),
+                node(SymbolKind::File, "src/b.rs", 400, 0.0, 0, None, None, vec![]),
+                node(SymbolKind::Folder, "src/sub", 12, 0.0, 0, None, None, vec![]),
+            ],
+        )
+    }
+
+    #[test]
+    fn inventory_strings_are_exact() {
+        let f = file();
+        assert_eq!(churn_readout(&f), "480L · 47 commits · p96");
+        assert_eq!(kind_counts(&f), "3 fns · 1 struct · 1 impl");
+        assert_eq!(inventory(&f), "3 fns · 1 struct · 1 impl · 480L · 47 commits · p96");
+        let d = folder();
+        assert_eq!(kind_counts(&d), "2 files · 1 folder");
+        assert_eq!(inventory(&d), "2 files · 1 folder · 812L · 12 commits · p40");
+        // empty node: inventory degrades to the readout alone
+        let empty = node(SymbolKind::File, "e.rs", 0, 0.0, 0, None, None, vec![]);
+        assert_eq!(kind_counts(&empty), "");
+        assert_eq!(inventory(&empty), "0L · 0 commits · p0");
+        // card meta keeps the pre-4b format exactly
+        assert_eq!(card_meta(&f), "47 · p96 · 480L");
+    }
+
+    #[test]
+    fn body_lines_follow_the_content_table() {
+        use BodyLine::{Dim, Plain};
+        let f = file();
+        let leaf = &f.children[2]; // fn free
+        let container = &f.children[1]; // impl Point (2 children)
+        let d = folder();
+
+        // leaf item: signature at Detail AND Full (code appended by paint)
+        assert_eq!(body_lines(leaf, Rung::Detail), vec![Plain("fn free()".into())]);
+        assert_eq!(body_lines(leaf, Rung::Full), vec![Plain("fn free()".into())]);
+        // container item: signature; Full adds the inventory
+        assert_eq!(body_lines(container, Rung::Detail), vec![Plain("impl Point".into())]);
+        assert_eq!(
+            body_lines(container, Rung::Full),
+            vec![Plain("impl Point".into()), Dim(inventory(container))]
+        );
+        // file Detail: churn readout + doc first line + kind counts
+        assert_eq!(
+            body_lines(&f, Rung::Detail),
+            vec![
+                Dim("480L · 47 commits · p96".into()),
+                Plain("Doc first.".into()),
+                Dim("3 fns · 1 struct · 1 impl".into()),
+            ]
+        );
+        // file Full: whole doc block + inventory
+        assert_eq!(
+            body_lines(&f, Rung::Full),
+            vec![
+                Plain("Doc first.".into()),
+                Plain("Doc second.".into()),
+                Dim(inventory(&f)),
+            ]
+        );
+        // folder Detail: readout + counts; Full: inventory only
+        assert_eq!(
+            body_lines(&d, Rung::Detail),
+            vec![Dim("812L · 12 commits · p40".into()), Dim("2 files · 1 folder".into())]
+        );
+        assert_eq!(body_lines(&d, Rung::Full), vec![Dim(inventory(&d))]);
+        // file without docs
+        let nodoc = node(SymbolKind::File, "n.rs", 9, 0.0, 0, None, None, vec![]);
+        assert_eq!(body_lines(&nodoc, Rung::Detail), vec![Dim("9L · 0 commits · p0".into())]);
+        assert_eq!(body_lines(&nodoc, Rung::Full), vec![Dim("9L · 0 commits · p0".into())]);
+        // Card keeps the legacy meta; Dot/Label have no body
+        assert_eq!(body_lines(&f, Rung::Card), vec![Dim("47 · p96 · 480L".into())]);
+        assert_eq!(body_lines(&f, Rung::Dot), vec![]);
+        assert_eq!(body_lines(&f, Rung::Label), vec![]);
+    }
+}
