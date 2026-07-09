@@ -1,3 +1,6 @@
+//! Mini fixture library.
+//! Exercises doc extraction.
+
 mod inner {
     pub fn helper() {
         println!("help");

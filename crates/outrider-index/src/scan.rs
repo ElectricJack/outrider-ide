@@ -6,6 +6,13 @@ use ignore::WalkBuilder;
 
 use crate::types::{finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
+/// Parsed per-file payload: item nodes plus the file's `//!` doc block.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedFile {
+    pub items: Vec<SymbolNode>,
+    pub doc: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedFile {
     pub rel_path: PathBuf,
@@ -63,7 +70,7 @@ fn count_lines(bytes: &[u8]) -> u64 {
 pub fn build_tree(
     repo_root: &Path,
     files: &[ScannedFile],
-    rs_children: &BTreeMap<PathBuf, Vec<SymbolNode>>,
+    rs_children: &BTreeMap<PathBuf, ParsedFile>,
 ) -> SymbolTree {
     let root_name = repo_root
         .file_name()
@@ -92,7 +99,7 @@ fn build_folder(
     name: &str,
     qualified: &str,
     entries: &[(Vec<String>, &ScannedFile)],
-    rs_children: &BTreeMap<PathBuf, Vec<SymbolNode>>,
+    rs_children: &BTreeMap<PathBuf, ParsedFile>,
 ) -> SymbolNode {
     let mut children: Vec<SymbolNode> = Vec::new();
     let mut by_subfolder: BTreeMap<String, Vec<(Vec<String>, &ScannedFile)>> = BTreeMap::new();
@@ -101,10 +108,7 @@ fn build_folder(
         match comps.as_slice() {
             [file_name] => {
                 let qual = join_path(qualified, file_name);
-                let file_children = rs_children
-                    .get(&file.rel_path)
-                    .cloned()
-                    .unwrap_or_default();
+                let parsed = rs_children.get(&file.rel_path).cloned().unwrap_or_default();
                 children.push(SymbolNode {
                     id: SymbolId {
                         kind: SymbolKind::File,
@@ -113,10 +117,12 @@ fn build_folder(
                     },
                     name: file_name.clone(),
                     byte_range: Some(0..file.bytes as usize),
+                    signature: None,
+                    doc: parsed.doc,
                     measure: file.lines,
                     churn: 0.0,
                     churn_count: 0,
-                    children: file_children,
+                    children: parsed.items,
                 });
             }
             [folder, ..] => {
@@ -144,6 +150,8 @@ fn build_folder(
         },
         name: name.to_string(),
         byte_range: None,
+        signature: None,
+        doc: None,
         measure,
         churn: 0.0,
         churn_count: 0,

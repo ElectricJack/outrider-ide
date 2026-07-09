@@ -9,6 +9,7 @@ use crate::types::SymbolKind;
 pub struct RawItem {
     pub kind: SymbolKind,
     pub name: String,
+    pub signature: String,
     pub byte_range: Range<usize>,
     pub line_count: u64,
     pub children: Vec<RawItem>,
@@ -33,6 +34,7 @@ fn collect_items(node: Node, src: &[u8]) -> Vec<RawItem> {
             items.push(RawItem {
                 kind,
                 name: item_name(child, src),
+                signature: item_signature(child, src),
                 byte_range: child.byte_range(),
                 line_count: (child.end_position().row - child.start_position().row + 1) as u64,
                 children: collect_items(child, src),
@@ -74,6 +76,37 @@ fn item_name(node: Node, src: &[u8]) -> String {
     node.child_by_field_name("name")
         .map(|n| node_text(n, src))
         .unwrap_or_else(|| "<anon>".to_string())
+}
+
+/// Declaration text up to (excluding) the body `{` or a terminating `;`,
+/// whitespace collapsed to one line.
+fn item_signature(node: Node, src: &[u8]) -> String {
+    let text = node_text(node, src);
+    let end = text.find(['{', ';']).unwrap_or(text.len());
+    text[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Leading `//!` block: skip blank lines, collect consecutive `//!` lines,
+/// strip the marker plus one following space. None when there is no block.
+pub fn file_doc(source: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(source);
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        if lines.is_empty() && t.is_empty() {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("//!") {
+            lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        } else {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 #[cfg(test)]
@@ -146,5 +179,32 @@ fn free() {
         assert_eq!(items[0].name, "Show");
         assert_eq!(items[1].kind, SymbolKind::Impl);
         assert_eq!(items[1].name, "Show for i32");
+    }
+
+    #[test]
+    fn signatures_cut_before_body_and_collapse_whitespace() {
+        let items = parse_rust_items(SRC.as_bytes()).unwrap();
+        assert_eq!(items[0].signature, "mod inner");
+        assert_eq!(items[1].signature, "struct Point");
+        assert_eq!(items[2].signature, "impl Point");
+        assert_eq!(items[2].children[1].signature, "fn norm(&self) -> f64");
+        assert_eq!(items[3].signature, "fn free()");
+        // multi-line declarations collapse to one line; `;` terminators cut too
+        let src = b"fn multi(\n    a: i32,\n    b: i32,\n) -> i32 { a + b }\nstruct Unit;\n";
+        let items = parse_rust_items(src).unwrap();
+        assert_eq!(items[0].signature, "fn multi( a: i32, b: i32, ) -> i32");
+        assert_eq!(items[1].signature, "struct Unit");
+    }
+
+    #[test]
+    fn file_doc_extracts_leading_bang_comments() {
+        use super::file_doc;
+        assert_eq!(
+            file_doc(b"//! First line.\n//!\n//! Third.\nfn x() {}\n"),
+            Some("First line.\n\nThird.".to_string())
+        );
+        assert_eq!(file_doc(b"\n\n//! After blanks.\nfn x() {}\n"), Some("After blanks.".to_string()));
+        assert_eq!(file_doc(b"fn x() {}\n"), None);
+        assert_eq!(file_doc(b"// plain comment\n//! not leading\n"), None);
     }
 }

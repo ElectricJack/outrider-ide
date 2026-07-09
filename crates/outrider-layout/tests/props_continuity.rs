@@ -149,6 +149,8 @@ proptest! {
                 // siblings keep their ordinals (and therefore their ids)
                 name: FRESH_NAMES[name_sel.index(FRESH_NAMES.len())].to_string(),
                 byte_range: None,
+                signature: None,
+                doc: None,
                 measure: lines,
                 churn: 0.0,
                 churn_count: 0,

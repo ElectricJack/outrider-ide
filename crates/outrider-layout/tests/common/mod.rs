@@ -97,6 +97,8 @@ fn convert(g: &GNode, counter: &mut u64) -> SymbolNode {
         },
         name: NAMES[g.name_idx].to_string(),
         byte_range: None,
+        signature: None,
+        doc: None,
         measure: g.lines,
         churn: 0.0,
         churn_count: 0,

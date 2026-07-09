@@ -85,6 +85,8 @@ mod tests {
             },
             name: name.into(),
             byte_range: None,
+            signature: None,
+            doc: None,
             measure,
             churn: 0.0,
             churn_count: 0,

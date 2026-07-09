@@ -29,6 +29,11 @@ pub struct SymbolNode {
     pub name: String,
     /// Byte range within the containing file. `None` for folders.
     pub byte_range: Option<Range<usize>>,
+    /// Item declaration up to (excluding) the body `{`, whitespace
+    /// collapsed to one line. None for folders and files.
+    pub signature: Option<String>,
+    /// Leading `//!` block, comment markers stripped. File nodes only.
+    pub doc: Option<String>,
     pub measure: u64,
     /// Within-repo churn percentile, 0.0–1.0.
     pub churn: f32,
@@ -96,6 +101,8 @@ mod tests {
             },
             name: name.to_string(),
             byte_range: None,
+            signature: None,
+            doc: None,
             measure: 1,
             churn: 0.0,
             churn_count: 0,
@@ -137,6 +144,8 @@ mod tests {
                 },
                 name: "imp".into(),
                 byte_range: None,
+                signature: None,
+                doc: None,
                 measure: 2,
                 churn: 0.0,
                 churn_count: 0,
@@ -148,6 +157,8 @@ mod tests {
                     },
                     name: "connect".into(),
                     byte_range: None,
+                    signature: None,
+                    doc: None,
                     measure: 1,
                     churn: 0.0,
                     churn_count: 0,

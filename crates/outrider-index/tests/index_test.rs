@@ -44,6 +44,18 @@ fn index_repo_parses_rust_files_into_items() {
     assert_eq!(norm.id.kind, SymbolKind::Fn);
     assert_eq!(norm.measure, 3); // 3-line method body span
 
+    // Phase 4b metadata: signature + doc (spec §3.1)
+    assert_eq!(
+        lib.doc.as_deref(),
+        Some("Mini fixture library.\nExercises doc extraction.")
+    );
+    assert_eq!(lib.signature, None);
+    assert_eq!(norm.signature.as_deref(), Some("fn norm(&self) -> f64"));
+    let util = find(&tree.root, "src/util.rs").expect("util.rs node");
+    assert_eq!(util.doc, None);
+    assert_eq!(tree.root.signature, None);
+    assert_eq!(tree.root.doc, None);
+
     // ignored file contributed nothing (spec §8.2)
     assert!(find(&tree.root, "generated/junk.rs").is_none());
 
