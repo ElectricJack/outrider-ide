@@ -383,7 +383,7 @@ impl Render for TreemapView {
                 let key = e.keystroke.key.as_str();
                 let moved = match key {
                     "right" => this.focus.step_in(&index),
-                    "left" => this.focus.step_back(&index),
+                    "left" => this.focus.step_out(&index),
                     "up" => this.focus.step_sibling(-1, &index),
                     "down" => this.focus.step_sibling(1, &index),
                     _ => false,
@@ -393,8 +393,15 @@ impl Render for TreemapView {
                         if !moved {
                             return;
                         }
+                        // Floor at the tween target when one is live: stepping
+                        // right after End must keep the End zoom, not the
+                        // mid-flight sample.
+                        let cur_zoom = this
+                            .tween
+                            .map(|(tw, _)| tw.to.zoom)
+                            .unwrap_or_else(|| this.camera.expect("checked above").zoom);
                         world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
-                            camera::frame_band(y, h, vh, camera::FOCUS_FRACTION, min_zoom, max_zoom)
+                            camera::frame_band_step(y, h, vh, cur_zoom, min_zoom, max_zoom)
                         })
                     }
                     "end" => world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {

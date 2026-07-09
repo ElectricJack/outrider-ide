@@ -31,28 +31,25 @@ impl<'a> TreeIndex<'a> {
     }
 }
 
-/// Keyboard focus (phase-4a spec §2): linear history stack + last-visited
-/// child memory. Focus never dangles in 4a — the tree is immutable at
-/// runtime until live reload (Phase 6).
+/// Keyboard focus with last-visited child memory. Focus never dangles —
+/// the tree is immutable at runtime until live reload (Phase 6).
 pub struct Focus {
     pub current: SymbolId,
-    history: Vec<SymbolId>,
     last_child: BTreeMap<SymbolId, SymbolId>,
 }
 
 impl Focus {
     pub fn new(root: SymbolId) -> Self {
-        Focus { current: root, history: Vec::new(), last_child: BTreeMap::new() }
+        Focus { current: root, last_child: BTreeMap::new() }
     }
 
-    /// Land on `next`: push the previous focus, record last-visited on the
-    /// parent. Landing on the current focus is a no-op (returns false).
+    /// Land on `next`, recording last-visited on the parent. Landing on the
+    /// current focus is a no-op (returns false).
     fn land(&mut self, next: SymbolId, index: &TreeIndex) -> bool {
         if next == self.current {
             return false;
         }
-        let prev = std::mem::replace(&mut self.current, next);
-        self.history.push(prev);
+        self.current = next;
         self.record_visit(index);
         true
     }
@@ -92,12 +89,10 @@ impl Focus {
         self.land(next, index)
     }
 
-    /// Left: pop the history stack — no push (spec §2).
-    pub fn step_back(&mut self, index: &TreeIndex) -> bool {
-        let Some(prev) = self.history.pop() else { return false };
-        self.current = prev;
-        self.record_visit(index);
-        true
+    /// Left: move to the structural parent (no-op at the root).
+    pub fn step_out(&mut self, index: &TreeIndex) -> bool {
+        let Some(p) = index.parent(&self.current) else { return false };
+        self.land(p.clone(), index)
     }
 
     /// Click: set focus directly. The caller must not move the camera.
@@ -194,17 +189,32 @@ mod tests {
     }
 
     #[test]
-    fn left_pops_history_and_empty_is_noop() {
+    fn left_moves_to_parent_and_root_is_noop() {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
-        f.step_in(&idx); // a.rs (push root)
-        f.step_sibling(1, &idx); // b.rs (push a.rs)
-        assert!(f.step_back(&idx));
-        assert_eq!(f.current, id(SymbolKind::File, "a.rs"));
-        assert!(f.step_back(&idx));
+        f.step_in(&idx); // a.rs
+        f.step_sibling(1, &idx); // b.rs
+        f.step_in(&idx); // b.rs::f
+        assert!(f.step_out(&idx));
+        assert_eq!(f.current, id(SymbolKind::File, "b.rs"));
+        assert!(f.step_out(&idx));
         assert_eq!(f.current, t.root.id);
-        assert!(!f.step_back(&idx)); // stack empty
+        assert!(!f.step_out(&idx)); // root has no parent
+    }
+
+    #[test]
+    fn left_then_right_returns_to_the_same_child() {
+        let t = tree();
+        let idx = TreeIndex::new(&t);
+        let mut f = Focus::new(t.root.id.clone());
+        f.step_in(&idx); // a.rs
+        f.step_sibling(1, &idx); // b.rs
+        f.step_in(&idx); // b.rs::f
+        f.step_sibling(1, &idx); // b.rs::g
+        f.step_out(&idx); // b.rs
+        assert!(f.step_in(&idx));
+        assert_eq!(f.current, id(SymbolKind::Fn, "b.rs::g")); // last visited, not first
     }
 
     #[test]
@@ -220,11 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn set_to_current_is_noop_and_pushes_nothing() {
+    fn set_to_current_is_noop() {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
         assert!(!f.set(t.root.id.clone(), &idx));
-        assert!(!f.step_back(&idx)); // nothing was pushed
+        assert_eq!(f.current, t.root.id);
     }
 }

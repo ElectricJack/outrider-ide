@@ -50,6 +50,22 @@ pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64, min_zoom: f64, max_zoo
     }
 }
 
+/// Arrow-step framing: FOCUS_FRACTION framing, but never zoom out. At or
+/// above that zoom (e.g. after End) it only recenters, so stepping between
+/// methods at Full reads as moving through the code instead of dropping
+/// the box back below FULL_PX.
+pub fn frame_band_step(
+    y: f64,
+    h: f64,
+    vh: f64,
+    current_zoom: f64,
+    min_zoom: f64,
+    max_zoom: f64,
+) -> Camera {
+    let c = frame_band(y, h, vh, FOCUS_FRACTION, min_zoom, max_zoom);
+    Camera { center_y: c.center_y, zoom: c.zoom.max(current_zoom.clamp(min_zoom, max_zoom)) }
+}
+
 fn ease_in_out_cubic(t: f64) -> f64 {
     if t < 0.5 {
         4.0 * t * t * t
@@ -156,6 +172,20 @@ mod tests {
         // clamp may prevent exact framing
         let c = frame_band(0.6875, 0.015625, 600.0, FOCUS_FRACTION, 1e-9, 100.0);
         close(c.zoom, 100.0);
+    }
+
+    #[test]
+    fn step_framing_zooms_in_from_below_but_never_out() {
+        // Below the focus-framing zoom: identical to frame_band at ½.
+        let base = frame_band(0.6875, 0.015625, 600.0, FOCUS_FRACTION, 1e-9, 1e18);
+        let c = frame_band_step(0.6875, 0.015625, 600.0, 100.0, 1e-9, 1e18);
+        close(c.zoom, base.zoom); // 19200
+        close(c.center_y, base.center_y);
+        // At Full (e.g. after End): keep the current zoom, recenter only —
+        // stepping must not drop the box back below FULL_PX.
+        let c = frame_band_step(0.6875, 0.015625, 600.0, 50_000.0, 1e-9, 1e18);
+        close(c.zoom, 50_000.0);
+        close(c.center_y, 0.6953125);
     }
 
     #[test]

@@ -32,9 +32,10 @@ pub struct TreeIndex<'a> {
 
 pub struct Focus {
     pub current: SymbolId,
-    history: Vec<SymbolId>,                  // linear stack (spec §7.1)
     last_child: BTreeMap<SymbolId, SymbolId>,
 }
+// Amended after the 4b exit gate: the history stack is gone — Left moves
+// to the structural parent instead of popping history.
 ```
 
 Initial focus = root. Stepping semantics (children are already name-sorted
@@ -44,12 +45,10 @@ by `outrider-index`):
 |---|---|
 | **Right** | Step into `last_child[current]` if it is still a child of `current`, else the first child. Leaf → no-op. |
 | **Up / Down** | Cycle name-ordered siblings, wrapping at the ends. Root → no-op. |
-| **Left** | Pop the history stack and focus the popped id. Empty stack → no-op. |
+| **Left** | Move to the structural parent. Root → no-op. *(Amended after the 4b exit gate — was history-pop.)* |
 | **Click** | Hit-test and set focus. Camera does **not** move (spec §7.1). |
 | **Tab** | Disabled — no handler. |
 
-- Every focus change **except Left** pushes the previous focus onto
-  `history`. Left pops without pushing.
 - Whenever focus lands on node `N` with parent `P`, record
   `last_child[P] = N` — Right remembers the last-visited child no matter
   how you left it (Right, Up/Down, or click).
@@ -89,7 +88,11 @@ pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64,
 - `FOCUS_FRACTION = 0.5` — arrow steps land the focus band at half the
   viewport height (Card territory, siblings and parent visible around it —
   "frame focus plus its parent" in the column model, where ancestors are
-  always on-screen as the columns to the left).
+  always on-screen as the columns to the left). *Amended after the 4b exit
+  gate:* arrow steps use `frame_band_step`, which floors the target zoom at
+  the current (or live tween target) zoom — stepping never zooms out, so
+  stepping between methods after End stays at Full instead of dropping the
+  box back below `FULL_PX`.
 - `END_FRACTION = 0.95` — **End** frames the focus to fill the viewport.
 - **Home** keeps its current framing (`Camera::frame`) but now animates.
 - Constants live in `camera.rs`, tunable at the exit gate.
@@ -139,7 +142,8 @@ animation frame, and clears it when done.
 ## 6. Input wiring (`treemap.rs`)
 
 - Key handlers: Right/Left/Up/Down mutate `Focus` then tween to
-  `frame_band(world_band(focus), vh, FOCUS_FRACTION, …)`; End tweens to
+  `frame_band_step(world_band(focus), vh, current_zoom, …)` (FOCUS_FRACTION
+  framing floored at the current zoom); End tweens to
   `END_FRACTION` framing of the current focus (no focus change); Home
   tweens to `Camera::frame(root_world_height(), vh)`.
 - Click: hit-test → focus change only.
@@ -156,10 +160,11 @@ example (root / a.rs / b.rs{f, g}):
 2. **Last-visited:** Right → a.rs, Down → b.rs (records
    `last_child[root] = b.rs`), click root (click never touches the
    clicked node's own `last_child` entry), Right → **b.rs**, not a.rs.
-   Note the landing rule means Left-popping onto a child also updates its
-   parent's `last_child` — "last visited" is literally the child most
-   recently occupied, however you got there.
-3. **History:** each non-Left step pushes; Left pops; Left on empty no-op.
+   Note the landing rule means any step onto a child updates its parent's
+   `last_child` — "last visited" is literally the child most recently
+   occupied, however you got there.
+3. **Left:** moves to the structural parent; root no-op; Left-then-Right
+   returns to the child you came from (via `last_child`).
 4. **world_band:** `b.rs::g` → y = 44/64, h = 1/64 (abs cell 44, the
    worked example); root → (0, 1).
 5. **frame_band:** band (0.6875, 0.015625), vh = 600, fraction 0.5 →
