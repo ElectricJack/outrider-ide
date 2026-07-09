@@ -5,20 +5,15 @@ use gpui::{
     FocusHandle, Pixels, TextAlign, TextRun, Window,
 };
 use outrider_index::buffer::HighlightSpan;
-use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
+use outrider_index::{SymbolId, SymbolNode, SymbolTree};
 use outrider_layout::WorldLayout;
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
-use crate::content::{self, BodyLine};
+use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{Focus, TreeIndex};
 use crate::theme;
 use crate::world::{self, Rung};
-
-const FONT_PX: f64 = 12.0;
-const LINE_STEP: f64 = FONT_PX * 1.3;
-/// Name-row height: text top padding (4) plus one meta-line offset.
-const HEADER: f64 = 4.0 + FONT_PX * 1.4;
 
 /// Approximate char budget for a column `w_px` wide at `font_px` monospace.
 /// 0.62 ≈ advance-width/em for common monospace faces; exactness is not
@@ -156,10 +151,7 @@ fn build_body(
             out.push(BodyText { y: y as f32, text: shown, runs: vec![(len, color)] });
         }
     }
-    let is_leaf_item = node.byte_range.is_some()
-        && node.children.is_empty()
-        && !matches!(node.id.kind, SymbolKind::File | SymbolKind::Folder);
-    if rung == Rung::Full && is_leaf_item {
+    if rung == Rung::Full && content::is_leaf_item(node) {
         let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
         let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
         if let Some(m) = buffers.get(&rel, syms) {

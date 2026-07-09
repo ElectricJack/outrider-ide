@@ -2,6 +2,30 @@ use outrider_index::{SymbolKind, SymbolNode};
 
 use crate::world::Rung;
 
+/// Monospace body font size (px); shared by content math and the paint path.
+pub const FONT_PX: f64 = 12.0;
+pub const LINE_STEP: f64 = FONT_PX * 1.3;
+/// Name-row height: text top padding (4) plus one meta-line offset.
+pub const HEADER: f64 = 4.0 + FONT_PX * 1.4;
+/// Padding below the last body row inside a leaf box.
+#[allow(dead_code)]
+pub const BOTTOM_PAD: f64 = 6.0;
+
+/// A code-bearing leaf: has source bytes, no children, and is an item
+/// (not a file/folder). These are the boxes that render code at Full.
+pub fn is_leaf_item(node: &SymbolNode) -> bool {
+    node.byte_range.is_some()
+        && node.children.is_empty()
+        && !matches!(node.id.kind, SymbolKind::File | SymbolKind::Folder)
+}
+
+/// Natural pixel height of a leaf item's box: header + signature row +
+/// one row per code line + bottom pad.
+#[allow(dead_code)]
+pub fn natural_px(node: &SymbolNode) -> f64 {
+    HEADER + (1.0 + node.measure as f64) * LINE_STEP + BOTTOM_PAD
+}
+
 /// One rendered body line under a box's name row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyLine {
@@ -280,5 +304,28 @@ mod tests {
         assert_eq!(body_lines(&f, Rung::Card), vec![Dim("47 · p96 · 480L".into())]);
         assert_eq!(body_lines(&f, Rung::Dot), vec![]);
         assert_eq!(body_lines(&f, Rung::Label), vec![]);
+    }
+
+    #[test]
+    fn natural_px_arithmetic() {
+        // HEADER 20.8 + (1 + measure)·15.6 + BOTTOM_PAD 6
+        let three = node(SymbolKind::Fn, "a.rs::f", 3, 0.0, 0, Some("fn f()"), None, vec![]);
+        assert!((natural_px(&three) - 89.2).abs() < 1e-9);
+        let long = node(SymbolKind::Fn, "a.rs::g", 200, 0.0, 0, Some("fn g()"), None, vec![]);
+        assert!((natural_px(&long) - 3162.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn leaf_item_predicate() {
+        let mut f = node(SymbolKind::Fn, "a.rs::f", 3, 0.0, 0, None, None, vec![]);
+        assert!(!is_leaf_item(&f)); // no byte_range
+        f.byte_range = Some(0..10);
+        assert!(is_leaf_item(&f));
+        let mut file = node(SymbolKind::File, "a.rs", 3, 0.0, 0, None, None, vec![]);
+        file.byte_range = Some(0..10);
+        assert!(!is_leaf_item(&file)); // files are never leaf items
+        let parent = node(SymbolKind::Impl, "a.rs::I", 3, 0.0, 0, None, None,
+            vec![node(SymbolKind::Fn, "a.rs::I::m", 1, 0.0, 0, None, None, vec![])]);
+        assert!(!is_leaf_item(&parent)); // has children
     }
 }
