@@ -256,7 +256,7 @@ impl TreemapView {
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            let f = theme::churn_fill(item.node.churn);
+            let f = theme::churn_heat(item.node.churn);
             let body = build_body(
                 item.node,
                 item.rung,
