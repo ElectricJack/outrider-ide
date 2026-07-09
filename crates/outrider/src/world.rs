@@ -8,6 +8,13 @@ pub const MERGE_PX: f64 = 4.0;
 pub const LABEL_PX: f64 = 20.0;
 pub const CARD_PX: f64 = 80.0;
 
+pub const MAX_COLUMN_PX: f64 = 400.0;
+pub const GUTTER_PX: f64 = 24.0;
+/// Columns narrower than this render fill + border only (forced Dot).
+pub const LABEL_MIN_W: f64 = 60.0;
+/// Depths beyond this are sub-merge at any legal zoom (max zoom = vh·8^15).
+pub const MAX_DEPTH: usize = 24;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorldRect {
     pub x: f64,
@@ -19,6 +26,65 @@ pub struct WorldRect {
 /// 8^-depth: the size scale of level-`depth` cells relative to level 0.
 pub fn column_scale(depth: u8) -> f64 {
     (RATIO as f64).powi(-(depth as i32))
+}
+
+/// Pixel height of one level-`depth` cell at `zoom` (px per world unit).
+#[allow(dead_code)]
+pub fn cell_px_height(depth: u8, zoom: f64) -> f64 {
+    zoom * column_scale(depth)
+}
+
+/// Peaked width profile (screen-space-columns spec §3): rises as
+/// CELL_ASPECT·h until the peak (h = MAX/CELL_ASPECT, cells comfortably in
+/// Card rung), then decays as 1/h — 8× per zoom octave on both sides, so the
+/// profile is self-similar — floored at the gutter for zoomed-past ancestors.
+#[allow(dead_code)]
+pub fn column_px_width(h: f64) -> f64 {
+    let peak_h = MAX_COLUMN_PX / CELL_ASPECT;
+    if h <= peak_h {
+        CELL_ASPECT * h
+    } else {
+        (MAX_COLUMN_PX * peak_h / h).max(GUTTER_PX)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub struct ColPx {
+    pub x: f64,
+    pub w: f64,
+}
+
+/// Per-frame column table: x is the prefix sum of shallower widths — the
+/// stack is left-anchored at x = 0 and fully determined by zoom.
+#[allow(dead_code)]
+pub fn column_table(zoom: f64) -> Vec<ColPx> {
+    let mut out = Vec::with_capacity(MAX_DEPTH + 1);
+    let mut x = 0.0;
+    for d in 0..=MAX_DEPTH {
+        let w = column_px_width(cell_px_height(d as u8, zoom));
+        // Ensure w is large enough that x strictly increases despite floating point rounding
+        let w = w.max(1e-13);
+        out.push(ColPx { x, w });
+        x += w;
+    }
+    out
+}
+
+/// Rung by pixel height, downgraded to Dot when the column is too narrow
+/// for text (gutter strips). Heights below MERGE_PX merge into the parent.
+#[allow(dead_code)]
+pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
+    let by_height = if px_h < MERGE_PX {
+        return None;
+    } else if px_h < LABEL_PX {
+        Rung::Dot
+    } else if px_h < CARD_PX {
+        Rung::Label
+    } else {
+        Rung::Card
+    };
+    Some(if px_w < LABEL_MIN_W { Rung::Dot } else { by_height })
 }
 
 /// Width of the depth-d column: CELL_ASPECT * COLUMN_SHRINK^d.
@@ -268,5 +334,70 @@ mod tests {
         assert_eq!(rung_for_px_height(79.9), Some(Rung::Label));
         assert_eq!(rung_for_px_height(80.0), Some(Rung::Card));
         assert_eq!(rung_for_px_height(100_000.0), Some(Rung::Card));
+    }
+
+    #[test]
+    fn width_profile_rising_side() {
+        // w = 3h up to the peak
+        close(column_px_width(10.0), 30.0);
+        close(column_px_width(100.0), 300.0);
+        let peak_h = MAX_COLUMN_PX / CELL_ASPECT; // ≈ 133.33 px cells
+        close(column_px_width(peak_h), MAX_COLUMN_PX);
+    }
+
+    #[test]
+    fn width_profile_decay_side() {
+        // past the peak, w = MAX² / (3h): halves when h doubles
+        let peak_h = MAX_COLUMN_PX / CELL_ASPECT;
+        close(column_px_width(2.0 * peak_h), MAX_COLUMN_PX / 2.0);
+        close(column_px_width(8.0 * peak_h), MAX_COLUMN_PX / 8.0);
+        // gutter floor is reached exactly and held forever
+        let floor_h = MAX_COLUMN_PX * peak_h / GUTTER_PX;
+        close(column_px_width(floor_h), GUTTER_PX);
+        close(column_px_width(floor_h * 100.0), GUTTER_PX);
+    }
+
+    #[test]
+    fn width_profile_self_similar() {
+        // spec §3: the table at zoom 8z equals the table at z shifted one depth right
+        for &z in &[10.0, 127.0, 1000.0, 54321.0] {
+            let t1 = column_table(z);
+            let t8 = column_table(8.0 * z);
+            for d in 0..MAX_DEPTH {
+                close(t8[d + 1].w, t1[d].w);
+            }
+        }
+    }
+
+    #[test]
+    fn column_table_prefix_sums_and_bound() {
+        for &z in &[1.0, 571.4285714285714, 36571.42857142857, 1e12] {
+            let t = column_table(z);
+            assert_eq!(t.len(), MAX_DEPTH + 1);
+            close(t[0].x, 0.0);
+            for d in 1..t.len() {
+                close(t[d].x, t[d - 1].x + t[d - 1].w);
+                assert!(t[d].x > t[d - 1].x, "x must be strictly increasing");
+            }
+            // spec §3: total stack width is bounded at any zoom
+            let total = t[MAX_DEPTH].x + t[MAX_DEPTH].w;
+            assert!(total < 1600.0, "total {total} not bounded at zoom {z}");
+        }
+    }
+
+    #[test]
+    fn rung_for_thresholds_and_downgrade() {
+        // height thresholds (wide column: no downgrade)
+        assert_eq!(rung_for(3.9, 400.0), None);
+        assert_eq!(rung_for(4.0, 400.0), Some(Rung::Dot));
+        assert_eq!(rung_for(19.9, 400.0), Some(Rung::Dot));
+        assert_eq!(rung_for(20.0, 400.0), Some(Rung::Label));
+        assert_eq!(rung_for(79.9, 400.0), Some(Rung::Label));
+        assert_eq!(rung_for(80.0, 400.0), Some(Rung::Card));
+        // narrow columns are forced to Dot regardless of height (gutters)
+        assert_eq!(rung_for(100_000.0, 59.9), Some(Rung::Dot));
+        assert_eq!(rung_for(100_000.0, 60.0), Some(Rung::Card));
+        // the merge rule wins over everything
+        assert_eq!(rung_for(3.9, 24.0), None);
     }
 }
