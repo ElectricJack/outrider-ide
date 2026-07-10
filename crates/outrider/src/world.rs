@@ -170,6 +170,9 @@ pub struct DrawItem<'a> {
     pub label_w: f64,
     pub level: u8,
     pub rung: Rung,
+    /// UNclipped screen-x of the box left (`px.x` is clipped to the viewport).
+    #[allow(dead_code)] // TODO(pivot): consumed in the switchover task
+    pub left: f64,
     /// UNclipped screen-y of the box top (`px.y` is clipped to the viewport).
     pub top: f64,
     /// UNclipped pixel height (`px.h` is clipped) — drives the code scale.
@@ -250,6 +253,7 @@ fn walk<'a>(
         label_w: px_w,
         level: depth,
         rung,
+        left: px_x,
         top: px_y,
         full_h: px_h,
     });
@@ -298,6 +302,64 @@ pub fn frame_leaf(
         z = (z * 1.25).min(z_end);
     }
     Some(Camera { center_x: 0.0, center_y: y + h / 2.0, zoom: z.clamp(min_zoom, max_zoom) })
+}
+
+/// Cull the tree against the viewport using packed absolute rects.
+/// Returns visible nodes in pre-order (parents before children =
+/// painter's order). Children are strictly inside their parents, so an
+/// off-screen or sub-merge node prunes its whole subtree.
+#[allow(dead_code)] // TODO(pivot): consumed in the switchover task
+pub fn visible_packed<'a>(
+    tree: &'a SymbolTree,
+    pack: &outrider_layout::PackLayout,
+    camera: &Camera,
+    vw: f64,
+    vh: f64,
+) -> Vec<DrawItem<'a>> {
+    let mut out = Vec::new();
+    walk_packed(&tree.root, pack, camera, vw, vh, 0, &mut out);
+    out
+}
+
+#[allow(dead_code)] // TODO(pivot): consumed in the switchover task
+fn walk_packed<'a>(
+    node: &'a SymbolNode,
+    pack: &outrider_layout::PackLayout,
+    camera: &Camera,
+    vw: f64,
+    vh: f64,
+    level: u8,
+    out: &mut Vec<DrawItem<'a>>,
+) {
+    let Some(r) = pack.rects.get(&node.id) else { return };
+    let (sx, sy) = camera.world_to_screen(r.x, r.y, vw, vh);
+    let (pw, ph) = (r.w * camera.zoom, r.h * camera.zoom);
+    // Children sit strictly inside the parent: off-screen prunes the subtree.
+    if sx > vw || sx + pw < 0.0 || sy > vh || sy + ph < 0.0 {
+        return;
+    }
+    let natural = content::is_leaf_item(node).then(|| content::natural_px(node));
+    // Below MERGE_PX the node — and its strictly smaller children — merge away.
+    let Some(rung) = rung_for(ph, pw, natural) else { return };
+    // Clip to the viewport (±2px slack keeps borders off-screen) before f32
+    // ever sees the coordinates; rung and code scale use the UNclipped size.
+    let x0 = sx.max(-2.0);
+    let x1 = (sx + pw).min(vw + 2.0);
+    let y0 = sy.max(-2.0);
+    let y1 = (sy + ph).min(vh + 2.0);
+    out.push(DrawItem {
+        node,
+        px: PxRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+        label_w: pw,
+        level,
+        rung,
+        top: sy,
+        left: sx,
+        full_h: ph,
+    });
+    for child in &node.children {
+        walk_packed(child, pack, camera, vw, vh, level.saturating_add(1), out);
+    }
 }
 
 /// Visible node containing the point. Rects nest (ancestors extend over
@@ -631,6 +693,99 @@ mod tests {
         assert_eq!(hit_test(&items, 400.0, 450.0).unwrap().node.name, "g");
         assert_eq!(hit_test(&items, 400.0, 100.0).unwrap().node.name, "b.rs"); // above g's band, inside b.rs's extended rect
         assert!(hit_test(&items, 790.0, 300.0).is_none()); // right of the stack
+    }
+
+    fn pack_cfg() -> outrider_layout::PackConfig {
+        outrider_layout::PackConfig {
+            page_w: 480.0,
+            line_step: 15.6,
+            header: 20.8,
+            bottom_pad: 6.0,
+            gap: 8.0,
+            aspect: 1.6,
+        }
+    }
+
+    /// Worked example with measures matching the Task 1 pack fixtures and
+    /// byte ranges making f and g leaf items.
+    fn packed_example() -> (SymbolTree, outrider_layout::PackLayout) {
+        let mut t = worked_example();
+        t.root.children[0].measure = 100; // a.rs
+        t.root.children[1].measure = 40; // b.rs
+        t.root.children[1].children[0].measure = 10; // f
+        t.root.children[1].children[1].measure = 1; // g
+        t.root.children[1].children[0].byte_range = Some(0..10);
+        t.root.children[1].children[1].byte_range = Some(10..20);
+        let p = outrider_layout::pack(&t, &pack_cfg());
+        (t, p)
+    }
+
+    #[test]
+    fn packed_walk_zoom_one_clips_and_keeps_unclipped_fields() {
+        let (tree, p) = packed_example();
+        // zoom 1.0 centered on g's page center (744, 293)
+        let cam = Camera { center_x: 744.0, center_y: 293.0, zoom: 1.0 };
+        let items = visible_packed(&tree, &p, &cam, 800.0, 600.0);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
+        let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
+        // root 1639px → Full; a.rs 1602px file → Full; b.rs 301px → Detail;
+        // f (leaf, 198.4 ≥ 54.1) → Full; g (leaf, 58 ≥ min(58, 54.1)) → Full
+        assert_eq!(rungs, vec![Rung::Full, Rung::Full, Rung::Detail, Rung::Full, Rung::Full]);
+        assert_eq!(
+            items.iter().map(|i| i.level).collect::<Vec<_>>(),
+            vec![0, 1, 1, 2, 2]
+        );
+        // a.rs hangs off the left edge: clipped x/w, unclipped left/full_h
+        let a = &items[1];
+        close(a.px.x, -2.0);
+        close(a.left, -336.0); // 8 − 744 + 400
+        close(a.px.w, 146.0); // right edge 144, clipped left −2
+        close(a.px.y, 35.8);
+        close(a.top, 35.8); // on-screen top: clipped == unclipped
+        close(a.px.h, 566.2); // bottom clipped to 602
+        close(a.full_h, 1602.4);
+        assert!((a.label_w - 480.0).abs() < 1e-9); // truncation uses the box width
+        // root's top is above the viewport: top unclipped, px.y clipped
+        close(items[0].top, 7.0); // 0 − 293 + 300
+        close(items[0].left, -344.0);
+        close(items[0].px.x, -2.0);
+        // g fully on-screen: nothing clipped
+        let g = &items[4];
+        close(g.px.x, 160.0);
+        close(g.px.y, 271.0);
+        close(g.px.w, 480.0);
+        close(g.px.h, 58.0);
+        close(g.full_h, 58.0);
+        // hit-test picks the deepest node under the point
+        assert_eq!(hit_test(&items, 400.0, 290.0).unwrap().node.name, "g");
+        assert_eq!(hit_test(&items, 400.0, 100.0).unwrap().node.name, "f");
+    }
+
+    #[test]
+    fn packed_walk_merges_tiny_nodes() {
+        let (tree, p) = packed_example();
+        // zoomed far out: g is 58·0.03 = 1.74px < MERGE_PX and vanishes;
+        // everything else survives as Dot (all widths < LABEL_MIN_W)
+        let cam = Camera { center_x: 500.0, center_y: 819.6, zoom: 0.03 };
+        let items = visible_packed(&tree, &p, &cam, 800.0, 600.0);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        assert_eq!(names, vec!["", "a.rs", "b.rs", "f"]);
+        assert!(items.iter().all(|i| i.rung == Rung::Dot));
+    }
+
+    #[test]
+    fn packed_walk_prunes_offscreen_subtrees() {
+        let (tree, p) = packed_example();
+        let cam = Camera { center_x: 100_000.0, center_y: 100_000.0, zoom: 1.0 };
+        assert!(visible_packed(&tree, &p, &cam, 800.0, 600.0).is_empty());
+        // panned right so only b.rs's column of the map remains: a.rs's
+        // right edge (488) is left of the viewport's world-left edge
+        // (900 − 400 = 500) → a.rs pruned, b.rs subtree survives
+        let cam = Camera { center_x: 900.0, center_y: 293.0, zoom: 1.0 };
+        let items = visible_packed(&tree, &p, &cam, 800.0, 600.0);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        assert_eq!(names, vec!["", "b.rs", "f", "g"]);
     }
 
     #[test]
