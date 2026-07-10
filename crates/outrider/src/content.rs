@@ -19,12 +19,14 @@ pub const MIN_CODE_SCALE: f64 = MIN_CODE_FONT_PX / FONT_PX;
 /// container ladder (spec 4d §3).
 pub const LEAF_CODE_MIN_PX: f64 = HEADER + 3.0 * LINE_STEP * MIN_CODE_SCALE + BOTTOM_PAD;
 
-/// A code-bearing leaf: has source bytes, no children, and is an item
-/// (not a file/folder). These are the boxes that render code at Full.
+/// A leaf page: has source bytes, no children, and is not a folder.
+/// Items are code pages; childless files (markdown, TOML, plain text,
+/// unparsed .rs) are text pages. These boxes render their content at
+/// Full and keep the editor background at every rung.
 pub fn is_leaf_item(node: &SymbolNode) -> bool {
     node.byte_range.is_some()
         && node.children.is_empty()
-        && !matches!(node.id.kind, SymbolKind::File | SymbolKind::Folder)
+        && node.id.kind != SymbolKind::Folder
 }
 
 /// Natural pixel height of a leaf item's box: header + signature row +
@@ -152,6 +154,10 @@ pub fn body_lines(node: &SymbolNode, rung: Rung) -> Vec<BodyLine> {
                         out.push(BodyLine::Dim(kinds));
                     }
                     out
+                } else if node.children.is_empty() {
+                    // Text page: one signature-equivalent row; the paint
+                    // path appends the file text from row 1 (spec §3).
+                    vec![BodyLine::Dim(churn_readout(node))]
                 } else {
                     let mut out: Vec<BodyLine> = node
                         .doc
@@ -322,6 +328,30 @@ mod tests {
     }
 
     #[test]
+    fn childless_file_full_body_is_one_readout_row() {
+        use BodyLine::{Dim, Plain};
+        // even with a doc comment, Full is exactly one row: the paint
+        // path appends the file text (which contains the doc) from row 1,
+        // keeping natural_px = HEADER + (1+measure)·LINE_STEP + BOTTOM_PAD
+        let f = node(
+            SymbolKind::File,
+            "README.md",
+            12,
+            0.2,
+            5,
+            None,
+            Some("# Readme\nIntro."),
+            vec![],
+        );
+        assert_eq!(body_lines(&f, Rung::Full), vec![Dim("12L · 5 commits · p20".into())]);
+        // Detail is unchanged: readout + doc first line (no kinds — childless)
+        assert_eq!(
+            body_lines(&f, Rung::Detail),
+            vec![Dim("12L · 5 commits · p20".into()), Plain("# Readme".into())]
+        );
+    }
+
+    #[test]
     fn natural_px_arithmetic() {
         // HEADER 20.8 + (1 + measure)·15.6 + BOTTOM_PAD 6
         let three = node(SymbolKind::Fn, "a.rs::f", 3, 0.0, 0, Some("fn f()"), None, vec![]);
@@ -336,9 +366,28 @@ mod tests {
         assert!(!is_leaf_item(&f)); // no byte_range
         f.byte_range = Some(0..10);
         assert!(is_leaf_item(&f));
-        let mut file = node(SymbolKind::File, "a.rs", 3, 0.0, 0, None, None, vec![]);
+        // childless file WITH bytes is a leaf page now
+        let mut file = node(SymbolKind::File, "a.md", 3, 0.0, 0, None, None, vec![]);
+        assert!(!is_leaf_item(&file)); // no byte_range
         file.byte_range = Some(0..10);
-        assert!(!is_leaf_item(&file)); // files are never leaf items
+        assert!(is_leaf_item(&file));
+        // file with children is a container, not a page
+        let mut parent_file = node(
+            SymbolKind::File,
+            "a.rs",
+            3,
+            0.0,
+            0,
+            None,
+            None,
+            vec![node(SymbolKind::Fn, "a.rs::f", 1, 0.0, 0, None, None, vec![])],
+        );
+        parent_file.byte_range = Some(0..10);
+        assert!(!is_leaf_item(&parent_file));
+        // folders never qualify
+        let mut folder = node(SymbolKind::Folder, "src", 3, 0.0, 0, None, None, vec![]);
+        folder.byte_range = Some(0..10);
+        assert!(!is_leaf_item(&folder));
         let parent = node(SymbolKind::Impl, "a.rs::I", 3, 0.0, 0, None, None,
             vec![node(SymbolKind::Fn, "a.rs::I::m", 1, 0.0, 0, None, None, vec![])]);
         assert!(!is_leaf_item(&parent)); // has children
