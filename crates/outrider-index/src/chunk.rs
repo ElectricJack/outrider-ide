@@ -139,7 +139,7 @@ impl ChunkStrategy for MarkdownChunker {
             if start_new {
                 bounds.push(i);
                 cur_start = i;
-                seen_heading = is_heading(line);
+                seen_heading = seen_heading || is_heading(line);
             }
         }
         bounds
@@ -268,5 +268,31 @@ mod tests {
         let md = "# A\ntext\n# B\nmore\n";
         assert_eq!(strategy_for("md").chunks(md).len(), 2);
         assert_eq!(strategy_for("markdown").chunks(md).len(), 2);
+    }
+
+    #[test]
+    fn markdown_chunker_heading_after_blank_split_starts_new_chunk() {
+        // Section 1 heading + 65 body lines forces a blank-line split (blank at
+        // index 66); the heading at index 67 must start its OWN chunk, not merge
+        // into the post-blank tail.
+        let mut text = String::from("# One\n");
+        for _ in 0..65 {
+            text.push_str("x\n");
+        }
+        text.push('\n'); // blank, index 66
+        text.push_str("# Two\n"); // heading, index 67
+        text.push_str("tail\n");
+        let cs = MarkdownChunker.chunks(&text);
+        let labels: Vec<&str> = cs.iter().map(|c| c.label.as_str()).collect();
+        // Some chunk must be labeled by the second heading "Two" (i.e. it began
+        // on that heading, not merged into a range-labeled chunk).
+        assert!(labels.contains(&"Two"), "heading after blank split should start its own chunk; got {labels:?}");
+        assert!(!cs.is_empty());
+        assert_eq!(cs[0].start_line, 0);
+        assert_eq!(cs.last().unwrap().end_byte, text.len());
+        for w in cs.windows(2) {
+            assert_eq!(w[0].end_line, w[1].start_line);
+            assert_eq!(w[0].end_byte, w[1].start_byte);
+        }
     }
 }
