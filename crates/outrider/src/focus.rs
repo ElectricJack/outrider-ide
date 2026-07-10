@@ -110,10 +110,12 @@ pub enum Dir {
     Down,
 }
 
-/// Spatial arrow step (spec §6): among all nodes at the same tree depth
-/// as `current`, pick the candidate whose center lies strictly in `dir`,
-/// scored by primary distance + 2·|orthogonal offset|; SymbolId breaks
-/// exact ties. No wrap: no candidate → None.
+/// Spatial arrow step. When `current` is a leaf page
+/// (`content::is_leaf_item`), candidates are all other leaf pages at any
+/// tree depth; otherwise candidates are the nodes at `current`'s own
+/// depth. Among candidates whose center lies strictly in `dir`, pick the
+/// one scored lowest by primary distance + 2·|orthogonal offset|;
+/// SymbolId breaks exact ties. No wrap: no candidate → None.
 pub fn spatial_step(
     current: &SymbolId,
     dir: Dir,
@@ -123,9 +125,18 @@ pub fn spatial_step(
     let cur = pack.rects.get(current)?;
     let (cx, cy) = (cur.x + cur.w / 2.0, cur.y + cur.h / 2.0);
     let depth = index.depth(current)?;
+    let leaf_mode = index.node(current).is_some_and(crate::content::is_leaf_item);
     let mut best: Option<(f64, &SymbolId)> = None;
     for (id, r) in &pack.rects {
-        if id == current || index.depth(id) != Some(depth) {
+        if id == current {
+            continue;
+        }
+        let eligible = if leaf_mode {
+            index.node(id).is_some_and(crate::content::is_leaf_item)
+        } else {
+            index.depth(id) == Some(depth)
+        };
+        if !eligible {
             continue;
         }
         let (nx, ny) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -379,5 +390,60 @@ mod tests {
         assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
         // a node missing from the layout steps nowhere
         assert_eq!(spatial_step(&c, Dir::Right, &hand_layout(&[]), &idx), None);
+    }
+
+    /// A leaf page with source bytes (unlike `n`, which leaves byte_range None).
+    fn leaf(
+        kind: SymbolKind,
+        qp: &str,
+        name: &str,
+        children: Vec<outrider_index::SymbolNode>,
+    ) -> outrider_index::SymbolNode {
+        outrider_index::SymbolNode { byte_range: Some(0..1), ..n(kind, qp, name, children) }
+    }
+
+    /// root { a.md (leaf, d1), dir (empty folder, d1), b.rs (container, d1) { f (leaf, d2) } }
+    fn leaf_depth_tree() -> SymbolTree {
+        SymbolTree {
+            root: n(
+                SymbolKind::Folder,
+                "",
+                "",
+                vec![
+                    leaf(SymbolKind::File, "a.md", "a.md", vec![]),
+                    n(SymbolKind::Folder, "dir", "dir", vec![]),
+                    leaf(
+                        SymbolKind::File,
+                        "b.rs",
+                        "b.rs",
+                        vec![leaf(SymbolKind::Fn, "b.rs::f", "f", vec![])],
+                    ),
+                ],
+            ),
+            repo_root: std::path::PathBuf::from("/x"),
+        }
+    }
+
+    #[test]
+    fn spatial_step_leaf_mode_crosses_depth_and_skips_non_leaves() {
+        let t = leaf_depth_tree();
+        let idx = TreeIndex::new(&t);
+        let a_md = id(SymbolKind::File, "a.md");
+        let f = id(SymbolKind::Fn, "b.rs::f");
+        // Column top→bottom: a.md (leaf d1), dir (empty folder d1),
+        // b.rs (container d1), f (leaf d2). Only a.md and f are leaf pages.
+        let lay = hand_layout(&[
+            (a_md.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (id(SymbolKind::Folder, "dir"), Rect { x: 0.0, y: 15.0, w: 10.0, h: 10.0 }),
+            (id(SymbolKind::File, "b.rs"), Rect { x: 0.0, y: 30.0, w: 10.0, h: 10.0 }),
+            (f.clone(), Rect { x: 0.0, y: 45.0, w: 10.0, h: 10.0 }),
+        ]);
+        // Down from the shallow leaf skips the nearer folder+container and
+        // lands on the deeper leaf (crosses depth 1 → 2).
+        assert_eq!(spatial_step(&a_md, Dir::Down, &lay, &idx), Some(f.clone()));
+        // Up from the deep leaf returns to the shallow leaf (depth 2 → 1).
+        assert_eq!(spatial_step(&f, Dir::Up, &lay, &idx), Some(a_md.clone()));
+        // No leaf below the bottom leaf → no wrap.
+        assert_eq!(spatial_step(&f, Dir::Down, &lay, &idx), None);
     }
 }
