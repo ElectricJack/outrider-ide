@@ -74,7 +74,6 @@ pub fn syntax_color(kind: HighlightKind) -> u32 {
 
 /// Minimap bar color: the syntax color dimmed toward the page background so
 /// the far-zoom minimap reads as texture rather than full-brightness code.
-#[allow(dead_code)]
 pub fn minimap_color(kind: HighlightKind) -> u32 {
     lerp_rgb(syntax_color(kind), CODE_BG, 0.15)
 }
