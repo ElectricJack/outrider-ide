@@ -65,6 +65,16 @@ pub struct HighlightSpan {
     pub kind: HighlightKind,
 }
 
+/// Cheap per-line texture summary for the far-zoom minimap: leading
+/// whitespace width, trimmed visible length, and the dominant highlight
+/// kind. Precomputed once at materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinimapRow {
+    pub indent: u32,
+    pub len: u32,
+    pub kind: HighlightKind,
+}
+
 pub struct FileBuffer {
     rope: Rope,
     /// Held for Phase 6 incremental re-parse; unused until then. `None`
@@ -73,6 +83,7 @@ pub struct FileBuffer {
     tree: Option<Tree>,
     /// Per-line spans, computed once at materialization (spec §3.2).
     lines: Vec<Vec<HighlightSpan>>,
+    minimap: Vec<MinimapRow>,
     anchors: AnchorList,
 }
 
@@ -111,12 +122,18 @@ impl FileBuffer {
             }
             None => (None, vec![Vec::new(); line_bounds(&text).len()]),
         };
-        Ok(Self { rope: Rope::from(text), tree, lines, anchors: AnchorList::default() })
+        let minimap = compute_minimap(&text, &lines);
+        Ok(Self { rope: Rope::from(text), tree, lines, minimap, anchors: AnchorList::default() })
     }
 
     /// Content lines (the empty final line after a trailing newline is not counted).
     pub fn len_lines(&self) -> usize {
         self.lines.len()
+    }
+
+    /// The precomputed minimap summary for line `i`.
+    pub fn minimap_row(&self, i: usize) -> MinimapRow {
+        self.minimap[i]
     }
 
     /// Line text (newline stripped) plus its highlight spans. Text comes
@@ -153,6 +170,46 @@ fn line_bounds(text: &str) -> Vec<Range<usize>> {
         start += seg.len();
     }
     out
+}
+
+/// Dominant highlight kind on a line: the kind covering the most bytes,
+/// ties broken by first occurrence; `Default` when the line has no mapped
+/// spans (blank or all-default).
+fn dominant_kind(spans: &[HighlightSpan]) -> HighlightKind {
+    let mut acc: Vec<(HighlightKind, usize)> = Vec::new();
+    for s in spans {
+        let w = s.range.end - s.range.start;
+        if let Some(e) = acc.iter_mut().find(|(k, _)| *k == s.kind) {
+            e.1 += w;
+        } else {
+            acc.push((s.kind, w));
+        }
+    }
+    let mut best: Option<(HighlightKind, usize)> = None;
+    for &(k, w) in &acc {
+        if best.is_none_or(|(_, bw)| w > bw) {
+            best = Some((k, w));
+        }
+    }
+    best.map(|(k, _)| k).unwrap_or(HighlightKind::Default)
+}
+
+/// One MinimapRow per line, aligned with `lines` (the per-line spans).
+fn compute_minimap(text: &str, lines: &[Vec<HighlightSpan>]) -> Vec<MinimapRow> {
+    let bounds = line_bounds(text);
+    bounds
+        .iter()
+        .zip(lines)
+        .map(|(b, spans)| {
+            let content = &text[b.clone()];
+            let indent =
+                content.chars().take_while(|&c| c == ' ' || c == '\t').count() as u32;
+            let trimmed = content.trim();
+            let len = trimmed.chars().count() as u32;
+            let kind = if len == 0 { HighlightKind::Default } else { dominant_kind(spans) };
+            MinimapRow { indent, len, kind }
+        })
+        .collect()
 }
 
 /// Capture-name → HighlightKind (spec §3.2). Full-name matches first
@@ -384,5 +441,32 @@ mod tests {
         assert!(s2.iter().any(|s| s.kind == HighlightKind::String));
         let (_t3, s3) = buf.line(3).unwrap();
         assert!(s3.iter().any(|s| s.kind == HighlightKind::Number));
+    }
+
+    #[test]
+    fn minimap_rows_report_indent_len_and_dominant_kind() {
+        // line 0: comment; line 1: indented let with a string; line 2: blank
+        let text = "// hello world\n    let s = \"xy\";\n\n";
+        let buf = FileBuffer::new(text.to_string(), "rs").unwrap();
+        assert_eq!(buf.len_lines(), 3);
+        let r0 = buf.minimap_row(0);
+        assert_eq!(r0.indent, 0);
+        assert_eq!(r0.len, "// hello world".chars().count() as u32);
+        assert_eq!(r0.kind, HighlightKind::Comment); // whole line is comment
+        let r1 = buf.minimap_row(1);
+        assert_eq!(r1.indent, 4); // four leading spaces
+        assert_eq!(r1.len, "let s = \"xy\";".chars().count() as u32);
+        // blank line: no bar
+        let r2 = buf.minimap_row(2);
+        assert_eq!(r2.len, 0);
+        assert_eq!(r2.kind, HighlightKind::Default);
+    }
+
+    #[test]
+    fn minimap_dominant_kind_breaks_ties_by_first_occurrence() {
+        // plain-mode line has no spans → Default
+        let buf = FileBuffer::new("abcdef\n".to_string(), "txt").unwrap();
+        assert_eq!(buf.minimap_row(0).kind, HighlightKind::Default);
+        assert_eq!(buf.minimap_row(0).len, 6);
     }
 }
