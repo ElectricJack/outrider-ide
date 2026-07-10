@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod chunk;
 pub mod churn;
 pub mod dump;
 pub mod index;
