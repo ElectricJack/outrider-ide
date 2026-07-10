@@ -10,6 +10,7 @@ use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
+use crate::chrome;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
 use crate::theme;
@@ -217,6 +218,25 @@ impl TreemapView {
             .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 })
     }
 
+    /// Window title shown in the client titlebar and taskbar.
+    fn window_title(&self) -> String {
+        let name = self
+            .tree
+            .repo_root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "outrider".into());
+        format!("outrider — {name}")
+    }
+
+    /// The map's drawable size = the window minus the titlebar. Camera math
+    /// and mouse hit-testing both use these; the map canvas is offset down
+    /// by `chrome::TITLEBAR_H` in window coordinates.
+    fn map_viewport(window: &Window) -> (f64, f64) {
+        let vp = window.viewport_size();
+        (f64::from(vp.width), f64::from(vp.height) - chrome::TITLEBAR_H)
+    }
+
     /// Framing target for the current focus: leaf pages at natural size
     /// (capped END fit), containers at FOCUS_FRACTION.
     fn frame_focus(
@@ -320,8 +340,7 @@ impl Render for TreemapView {
             self.focus_handle.focus(window, cx);
         }
 
-        let vp = window.viewport_size();
-        let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
+        let (vw, vh) = Self::map_viewport(window);
         let items = self.paint_items(vw, vh);
 
         if self.tween.is_some() {
@@ -331,8 +350,12 @@ impl Render for TreemapView {
         let max_zoom = camera::MAX_ZOOM;
         let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
 
-        div()
-            .size_full()
+        let title = self.window_title();
+        let map = div()
+            .flex_grow(1.)
+            .w_full()
+            .relative()
+            .overflow_hidden()
             .bg(rgb(theme::BG))
             .track_focus(&self.focus_handle)
             .on_mouse_down(
@@ -354,16 +377,12 @@ impl Render for TreemapView {
                         return; // drag, not click
                     }
                     let Some(cam) = this.camera else { return };
-                    let vp = w.viewport_size();
-                    let items = world::visible_nodes(
-                        &this.tree,
-                        &this.layout,
-                        &cam,
-                        f64::from(vp.width),
-                        f64::from(vp.height),
-                    );
-                    // view fills the window, so window coords == canvas coords
-                    let (mx, my) = (f64::from(e.position.x), f64::from(e.position.y));
+                    let (vw, vh) = Self::map_viewport(w);
+                    let items = world::visible_nodes(&this.tree, &this.layout, &cam, vw, vh);
+                    // the map canvas sits below the titlebar; shift window
+                    // coords up by its height to get canvas coords
+                    let (mx, my) =
+                        (f64::from(e.position.x), f64::from(e.position.y) - chrome::TITLEBAR_H);
                     let hit = world::hit_test(&items, mx, my).map(|i| i.node.id.clone());
                     drop(items);
                     if let Some(id) = hit {
@@ -394,15 +413,14 @@ impl Render for TreemapView {
                     gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
                     gpui::ScrollDelta::Lines(l) => l.y as f64 * 40.0,
                 };
-                let vp = w.viewport_size();
-                let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
+                let (vw, vh) = Self::map_viewport(w);
                 if let Some(cam) = this.camera.as_mut() {
                     // scroll up (positive dy) zooms in; flip the sign here if
                     // manual testing shows it inverted on this platform
                     let factor = (dy * 0.002).exp();
                     cam.zoom_about(
                         f64::from(e.position.x),
-                        f64::from(e.position.y),
+                        f64::from(e.position.y) - chrome::TITLEBAR_H,
                         vw,
                         vh,
                         factor,
@@ -416,8 +434,7 @@ impl Render for TreemapView {
                 if this.camera.is_none() {
                     return;
                 }
-                let vp = w.viewport_size();
-                let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
+                let (vw, vh) = Self::map_viewport(w);
                 let max_zoom = camera::MAX_ZOOM;
                 let min_zoom = (this.home_zoom * 0.5).min(camera::MAX_ZOOM);
                 let index = TreeIndex::new(&this.tree);
@@ -565,7 +582,17 @@ impl Render for TreemapView {
                     },
                 )
                 .size_full(),
-            )
+            );
+
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::BG))
+            .child(chrome::titlebar(title, window))
+            .child(map)
+            .children(chrome::resize_rim(window))
     }
 }
 
