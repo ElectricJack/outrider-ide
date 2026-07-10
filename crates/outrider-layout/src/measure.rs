@@ -18,11 +18,12 @@ pub(crate) fn leaf_cells(measure: u64, kind: SymbolKind) -> u64 {
     std::cmp::max(1, measure.div_ceil(lines_per_cell(kind)))
 }
 
-/// Per-child slack: ceil(0.15 · len), in integer math. Per-child (not pooled
-/// per parent) so a child's position never depends on its successors — see
-/// plan "Interpretation Decisions" #1.
+/// Per-child slack: ceil(0.03 · len), in integer math (3% — spec 4d §2;
+/// was 15% before the density pass). Per-child (not pooled per parent) so
+/// a child's position never depends on its successors. The round-up keeps
+/// a minimum 1-cell gap for tiny nodes.
 pub(crate) fn gap_cells(len: u64) -> u64 {
-    (len * 15).div_ceil(100)
+    (len * 3).div_ceil(100)
 }
 
 /// Post-order measure pass (spec §6.2). Fills `lens` for every node in the
@@ -76,12 +77,13 @@ mod tests {
     }
 
     #[test]
-    fn gap_is_fifteen_percent_rounded_up() {
-        assert_eq!(gap_cells(1), 1);
+    fn gap_is_three_percent_rounded_up() {
+        assert_eq!(gap_cells(1), 1); // round-up floor keeps a minimum gap
         assert_eq!(gap_cells(4), 1);
-        assert_eq!(gap_cells(7), 2);   // ceil(1.05)
-        assert_eq!(gap_cells(20), 3);
-        assert_eq!(gap_cells(100), 15);
+        assert_eq!(gap_cells(7), 1);
+        assert_eq!(gap_cells(20), 1);
+        assert_eq!(gap_cells(34), 2); // ceil(1.02)
+        assert_eq!(gap_cells(100), 3);
     }
 
     #[test]
