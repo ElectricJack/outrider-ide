@@ -172,6 +172,8 @@ pub struct DrawItem<'a> {
     pub rung: Rung,
     /// UNclipped screen-y of the box top (`px.y` is clipped to the viewport).
     pub top: f64,
+    /// UNclipped pixel height (`px.h` is clipped) — drives the code scale.
+    pub full_h: f64,
 }
 
 /// Deepest level that exists in the layout (capped at MAX_DEPTH) — the
@@ -249,6 +251,7 @@ fn walk<'a>(
         level: depth,
         rung,
         top: px_y,
+        full_h: px_h,
     });
     let mut deepest = depth;
     for child in &node.children {

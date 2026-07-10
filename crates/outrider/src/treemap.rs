@@ -64,6 +64,9 @@ struct PaintItem {
     w: f32,
     h: f32,
     label_w: f32,
+    /// Font size for body rows: FONT_PX·scale for Full leaves, else 12.0.
+    /// The name row always paints at 12px.
+    body_font_px: f32,
     fill: u32,
     border: u32,
     stripe: Option<u32>,
@@ -118,6 +121,8 @@ fn code_line(
 /// symbol's highlighted code laid out from the UNCLIPPED top and
 /// line-window culled to the viewport (spec §4.4). Rows that would sit
 /// under the pinned name/signature block or off-screen are skipped.
+/// `scale` shrinks the row step and font of the whole body (spec 4d §4);
+/// callers pass 1.0 for everything except Full leaves.
 #[allow(clippy::too_many_arguments)]
 fn build_body(
     node: &SymbolNode,
@@ -125,6 +130,7 @@ fn build_body(
     px: &world::PxRect,
     label_w: f64,
     top: f64,
+    scale: f64,
     vh: f64,
     buffers: &mut BufferManager,
     file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
@@ -132,19 +138,21 @@ fn build_body(
     if rung == Rung::Dot || rung == Rung::Label {
         return Vec::new();
     }
+    let step = LINE_STEP * scale;
+    let font = (FONT_PX * scale) as f32;
     let mut out = Vec::new();
     let lines = content::body_lines(node, rung);
     let rows = lines.len();
     for (k, line) in lines.into_iter().enumerate() {
-        let y = px.y + HEADER + k as f64 * LINE_STEP;
-        if y + LINE_STEP > px.y + px.h || y > vh {
+        let y = px.y + HEADER + k as f64 * step;
+        if y + step > px.y + px.h || y > vh {
             break;
         }
         let (text, color) = match line {
             BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
             BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
         };
-        if let Some(shown) = truncate_to_width(&text, label_w as f32, FONT_PX as f32) {
+        if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
             let len = shown.len();
             out.push(BodyText { y: y as f32, text: shown, runs: vec![(len, color)] });
         }
@@ -155,11 +163,11 @@ fn build_body(
         if let Some(m) = buffers.get(&rel, syms) {
             if let Some(start) = m.symbol_start_line(&node.id) {
                 let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
-                let code_y0 = top + HEADER + rows as f64 * LINE_STEP;
-                let min_y = px.y + HEADER + rows as f64 * LINE_STEP - 0.5;
-                let max_y = (px.y + px.h).min(vh) - LINE_STEP;
+                let code_y0 = top + HEADER + rows as f64 * step;
+                let min_y = px.y + HEADER + rows as f64 * step - 0.5;
+                let max_y = (px.y + px.h).min(vh) - step;
                 for j in 0..count {
-                    let y = code_y0 + j as f64 * LINE_STEP;
+                    let y = code_y0 + j as f64 * step;
                     if y < min_y {
                         continue;
                     }
@@ -167,9 +175,7 @@ fn build_body(
                         break;
                     }
                     if let Some((text, spans)) = m.buffer.line(start + j) {
-                        if let Some((shown, runs)) =
-                            code_line(&text, spans, label_w as f32, FONT_PX as f32)
-                        {
+                        if let Some((shown, runs)) = code_line(&text, spans, label_w as f32, font) {
                             out.push(BodyText { y: y as f32, text: shown, runs });
                         }
                     }
@@ -254,6 +260,8 @@ impl TreemapView {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let is_code = item.rung == Rung::Full && content::is_leaf_item(item.node);
+            let scale =
+                if is_code { content::code_scale(item.node, item.full_h) } else { 1.0 };
             let fill = if is_code { theme::CODE_BG } else { theme::depth_fill(item.level) };
             let body = build_body(
                 item.node,
@@ -261,6 +269,7 @@ impl TreemapView {
                 &item.px,
                 item.label_w,
                 item.top,
+                scale,
                 vh,
                 &mut self.buffers,
                 &self.file_symbols,
@@ -271,6 +280,7 @@ impl TreemapView {
                 w: item.px.w as f32,
                 h: item.px.h as f32,
                 label_w: item.label_w as f32,
+                body_font_px: (FONT_PX * scale) as f32,
                 fill,
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
@@ -499,6 +509,7 @@ impl Render for TreemapView {
                                     _cx,
                                 );
                             }
+                            let body_line_height = px(item.body_font_px * 1.3);
                             for bt in &item.body {
                                 if bt.text.is_empty() {
                                     continue;
@@ -507,13 +518,13 @@ impl Render for TreemapView {
                                     bt.runs.iter().map(|&(len, color)| run(len, color)).collect();
                                 let line = window.text_system().shape_line(
                                     bt.text.clone().into(),
-                                    px(font_px),
+                                    px(item.body_font_px),
                                     &runs,
                                     None,
                                 );
                                 let _ = line.paint(
                                     point(origin.x + px(item.x + 6.0), origin.y + px(bt.y)),
-                                    line_height,
+                                    body_line_height,
                                     TextAlign::Left,
                                     None,
                                     window,
@@ -590,7 +601,7 @@ mod tests {
         let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
         let mut mgr = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
-        let body = build_body(&f, Rung::Detail, &px, 400.0, 0.0, 600.0, &mut mgr, &BTreeMap::new());
+        let body = build_body(&f, Rung::Detail, &px, 400.0, 0.0, 1.0, 600.0, &mut mgr, &BTreeMap::new());
         // churn readout + doc first line (no items → no kind-counts line)
         assert_eq!(body.len(), 2);
         assert_eq!(body[1].text, "Doc line.");
@@ -607,7 +618,7 @@ mod tests {
         let mut file_symbols = BTreeMap::new();
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 800.0 };
-        let body = build_body(&leaf, Rung::Full, &px, 400.0, 0.0, 600.0, &mut mgr, &file_symbols);
+        let body = build_body(&leaf, Rung::Full, &px, 400.0, 0.0, 1.0, 600.0, &mut mgr, &file_symbols);
         // signature row + exactly the symbol's one code line (line-window)
         assert_eq!(body.len(), 2);
         assert_eq!(body[0].text, "fn two()");
@@ -617,8 +628,40 @@ mod tests {
         assert!((f64::from(body[1].y) - (HEADER + LINE_STEP)).abs() < 1e-3);
         // buffer unavailable → Detail-equivalent content (signature, no code)
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
-        let body = build_body(&leaf, Rung::Full, &px, 400.0, 0.0, 600.0, &mut broken, &BTreeMap::new());
+        let body = build_body(&leaf, Rung::Full, &px, 400.0, 0.0, 1.0, 600.0, &mut broken, &BTreeMap::new());
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two()");
+    }
+
+    #[test]
+    fn build_body_full_leaf_scales_step_and_clips_at_box_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}\nfn five() {}\n",
+        )
+        .unwrap();
+        // 4-line symbol starting at line 1 (byte 12), natural 104.8px
+        let leaf = node(SymbolKind::Fn, "a.rs::two", Some(12..59), 4, Some("fn two()"), None);
+        let mut mgr = BufferManager::new(dir.path().to_path_buf());
+        let mut file_symbols = BTreeMap::new();
+        file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
+        let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 60.0 };
+        let scale = 0.8;
+        let step = LINE_STEP * scale; // 12.48
+        let body =
+            build_body(&leaf, Rung::Full, &px, 400.0, 0.0, scale, 600.0, &mut mgr, &file_symbols);
+        // signature + two scaled code rows; the third (y 58.24) would cross
+        // max_y = 60 − 12.48 = 47.52 and is clipped at the box edge.
+        assert_eq!(body.len(), 3);
+        assert_eq!(body[0].text, "fn two()");
+        assert_eq!(body[1].text, "fn two() {}");
+        assert_eq!(body[2].text, "fn three() {}");
+        assert!((f64::from(body[1].y) - (HEADER + step)).abs() < 1e-3);
+        assert!((f64::from(body[2].y) - (HEADER + 2.0 * step)).abs() < 1e-3);
+        // same box at scale 1.0 fits only one code row — scaling shows more
+        let body =
+            build_body(&leaf, Rung::Full, &px, 400.0, 0.0, 1.0, 600.0, &mut mgr, &file_symbols);
+        assert_eq!(body.len(), 2);
     }
 }

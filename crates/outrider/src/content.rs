@@ -11,9 +11,7 @@ pub const HEADER: f64 = 4.0 + FONT_PX * 1.4;
 pub const BOTTOM_PAD: f64 = 6.0;
 
 /// Floor for scaled code text (spec 4d §4).
-#[allow(dead_code)]
 pub const MIN_CODE_FONT_PX: f64 = 7.0;
-#[allow(dead_code)]
 pub const MIN_CODE_SCALE: f64 = MIN_CODE_FONT_PX / FONT_PX;
 
 /// Shortest leaf box that still shows code: header + three code rows at
@@ -39,7 +37,6 @@ pub fn natural_px(node: &SymbolNode) -> f64 {
 /// method, shrinking with the box down to the floor, after which the
 /// window clips. `px_h` must be the UNCLIPPED box height — the clipped
 /// height would wrongly shrink zoomed-in giants (spec 4d §4).
-#[allow(dead_code)]
 pub fn code_scale(node: &SymbolNode, px_h: f64) -> f64 {
     (px_h / natural_px(node)).clamp(MIN_CODE_SCALE, 1.0)
 }
