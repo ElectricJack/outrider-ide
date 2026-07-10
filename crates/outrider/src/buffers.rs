@@ -261,4 +261,46 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].0.qualified_path, "a.rs::f");
     }
+
+    #[test]
+    fn collect_file_symbols_anchors_each_chunk_at_its_start() {
+        fn node(kind: SymbolKind, qual: &str, byte_range: Option<std::ops::Range<usize>>, children: Vec<SymbolNode>) -> SymbolNode {
+            SymbolNode {
+                id: SymbolId { kind, qualified_path: qual.into(), ordinal: 0 },
+                name: qual.rsplit(['#', ':']).next().unwrap_or(qual).to_string(),
+                byte_range,
+                signature: None,
+                doc: None,
+                measure: 1,
+                churn: 0.0,
+                churn_count: 0,
+                children,
+            }
+        }
+        let tree = SymbolTree {
+            root: node(
+                SymbolKind::Folder,
+                "",
+                None,
+                vec![node(
+                    SymbolKind::File,
+                    "BIG.md",
+                    Some(0..300),
+                    vec![
+                        node(SymbolKind::Chunk, "BIG.md#0", Some(0..100), vec![]),
+                        node(SymbolKind::Chunk, "BIG.md#1", Some(100..300), vec![]),
+                    ],
+                )],
+            ),
+            repo_root: std::path::PathBuf::from("/x"),
+        };
+        let map = collect_file_symbols(&tree);
+        let got: Vec<(&str, usize)> = map
+            .get("BIG.md")
+            .unwrap()
+            .iter()
+            .map(|(id, s)| (id.qualified_path.as_str(), *s))
+            .collect();
+        assert_eq!(got, vec![("BIG.md#0", 0), ("BIG.md#1", 100)]);
+    }
 }
