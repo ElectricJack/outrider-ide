@@ -83,8 +83,29 @@ pub fn new(text: String, ext: &str) -> anyhow::Result<Self>
 |--------|----------------------------------|---------------------------|
 | `rs`   | `tree_sitter_rust::LANGUAGE`     | `HIGHLIGHTS_QUERY`        |
 | `md`   | `tree_sitter_md::LANGUAGE` (block grammar only) | `HIGHLIGHT_QUERY_BLOCK` |
-| `toml` | `tree_sitter_toml_ng::LANGUAGE`  | `HIGHLIGHTS_QUERY`        |
+| `toml` | `tree_sitter_toml_ng::LANGUAGE`  | embedded `TOML_HIGHLIGHTS` (below) |
 | other  | **plain mode**: no parse, no spans |                         |
+
+TOML cannot use the crate's shipped `HIGHLIGHTS_QUERY`: its
+`(pair (bare_key)) @property` pattern captures the **whole pair node**,
+and our outermost-first overlap resolution would keep that whole-line
+span and drop the inner key/string/number spans. Instead `buffer.rs`
+embeds a minimal leaf-only query:
+
+```rust
+const TOML_HIGHLIGHTS: &str = r#"
+(bare_key) @property
+(quoted_key) @string
+(boolean) @constant
+(comment) @comment
+(string) @string
+[(integer) (float)] @number
+[(offset_date_time) (local_date_time) (local_date) (local_time)] @string.special
+"#;
+```
+
+All its capture names already map through the existing `kind_for` prefix
+table (`property`, `string`, `constant`, `comment`, `number`).
 
 - Struct change: `tree: Tree` becomes `tree: Option<Tree>` (still
   `#[allow(dead_code)]`, held for Phase 6); plain mode stores `None` and
@@ -99,13 +120,14 @@ pub fn new(text: String, ext: &str) -> anyhow::Result<Self>
 - Markdown uses the **block** grammar only; inline emphasis/links inside
   paragraphs paint as Default. Headings, fenced code blocks, and URIs
   still color. The inline grammar + injections are out of scope.
-- `kind_for` extensions (checked before the existing prefix map):
+- `kind_for` extensions (full-name matches, checked before the existing
+  prefix map):
   - `"text.title"` → `Type` (headings)
-  - `"text.literal"` → `String` (code spans/fences)
+  - `"text.literal"` → `String` (fenced/indented code blocks — the
+    block-level capture spans the whole block, which is exactly what the
+    per-line splitter wants)
   - `"text.uri"` | `"text.reference"` → `Property`
-  - prefix `"boolean"` → `Number` (TOML `true`/`false`)
-  - everything else falls through to the existing prefix map
-    (TOML's `property`/`string`/`comment`/`number`/`type` already map).
+  - everything else falls through to the existing prefix map unchanged.
 
 ## 6. Leaf background at every rung (`treemap.rs`, `theme.rs`)
 
