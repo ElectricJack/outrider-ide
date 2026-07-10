@@ -90,6 +90,7 @@ pub fn frame_rect(
 
 /// Leaf framing: END_FRACTION fit, capped at natural size (zoom 1.0) —
 /// stepping onto a small method never blows its code up past 12px.
+/// The caller's min_zoom takes precedence over the natural-size cap.
 pub fn frame_page(rect: Rect, vw: f64, vh: f64, min_zoom: f64, max_zoom: f64) -> Camera {
     Camera {
         center_x: rect.x + rect.w / 2.0,

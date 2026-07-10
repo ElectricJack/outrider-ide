@@ -163,7 +163,9 @@ mod tests {
         // alpha is placed first: top-left of the content area
         close(a.x, 8.0);
         close(a.y, 28.8);
-        assert!(z.y > a.y, "zeta wraps below alpha (or right of it)");
+        / zeta is placed second: same shelf (target_w ≈ 7744 fits both), right of alpha
+        close(z.x, 496.0);
+        close(z.y, 28.8);
     }
 
     #[test]

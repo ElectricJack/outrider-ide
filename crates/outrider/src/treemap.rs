@@ -328,7 +328,7 @@ impl Render for TreemapView {
         }
 
         let max_zoom = camera::MAX_ZOOM;
-        let min_zoom = self.home_zoom * 0.5;
+        let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
 
         div()
             .size_full()
@@ -418,7 +418,7 @@ impl Render for TreemapView {
                 let vp = w.viewport_size();
                 let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
                 let max_zoom = camera::MAX_ZOOM;
-                let min_zoom = this.home_zoom * 0.5;
+                let min_zoom = (this.home_zoom * 0.5).min(camera::MAX_ZOOM);
                 let index = TreeIndex::new(&this.tree);
                 let target = match e.keystroke.key.as_str() {
                     "enter" => {

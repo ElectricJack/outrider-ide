@@ -43,7 +43,7 @@ pub enum Rung {
 }
 
 /// Rung by pixel height, downgraded to Dot when the column is too narrow
-/// for text (gutter strips) and from Full to Detail when too narrow for
+/// for text and from Full to Detail when too narrow for
 /// code. Heights below MERGE_PX merge into the parent. For leaf items,
 /// pass `natural_px`: the box is Full as soon as it holds about three
 /// floor-font code rows (LEAF_CODE_MIN_PX) or its whole content, whichever
@@ -151,8 +151,9 @@ fn walk<'a>(
     }
 }
 
-/// Visible node containing the point. Rects nest (ancestors extend over
-/// descendants), so take the last hit in DFS order — the deepest node.
+/// Visible node containing the point. Children sit strictly inside their
+/// parents, so a point inside a node is inside every ancestor; the last
+/// hit in DFS order is the deepest node.
 pub fn hit_test<'a>(items: &'a [DrawItem<'a>], x: f64, y: f64) -> Option<&'a DrawItem<'a>> {
     items
         .iter()
@@ -223,7 +224,7 @@ mod tests {
         assert_eq!(rung_for(250.0, 400.0, None), Some(Rung::Detail));
         assert_eq!(rung_for(699.9, 400.0, None), Some(Rung::Detail));
         assert_eq!(rung_for(700.0, 400.0, None), Some(Rung::Full));
-        // narrow columns are forced to Dot regardless of height (gutters)
+        // narrow boxes are forced to Dot regardless of height
         assert_eq!(rung_for(100_000.0, 59.9, None), Some(Rung::Dot));
         // Full downgrades to Detail when too narrow for code (spec §4.2)
         assert_eq!(rung_for(100_000.0, 60.0, None), Some(Rung::Detail));
