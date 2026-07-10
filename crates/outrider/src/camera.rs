@@ -11,7 +11,6 @@ pub struct Camera {
 }
 
 impl Camera {
-    #[allow(dead_code)] // TODO(pivot): consumed in the switchover task
     pub fn world_to_screen(&self, wx: f64, wy: f64, vw: f64, vh: f64) -> (f64, f64) {
         (
             (wx - self.center_x) * self.zoom + vw / 2.0,
@@ -24,12 +23,6 @@ impl Camera {
             (sx - vw / 2.0) / self.zoom + self.center_x,
             (sy - vh / 2.0) / self.zoom + self.center_y,
         )
-    }
-
-    /// Legacy y-only transform for the icicle render walk.
-    /// TODO(pivot): deleted in the switchover task.
-    pub fn world_to_screen_y(&self, wy: f64, vh: f64) -> f64 {
-        (wy - self.center_y) * self.zoom + vh / 2.0
     }
 
     /// Drag by (dx, dy) pixels: content follows the cursor.
@@ -58,7 +51,6 @@ impl Camera {
     }
 
     /// Home: `rect` fits the viewport with a 5% margin.
-    #[allow(dead_code)] // TODO(pivot): consumed in the switchover task
     pub fn fit(rect: Rect, vw: f64, vh: f64) -> Camera {
         Camera {
             center_x: rect.x + rect.w / 2.0,
@@ -67,11 +59,6 @@ impl Camera {
         }
     }
 
-    /// Legacy y-only Home framing (icicle).
-    /// TODO(pivot): deleted in the switchover task.
-    pub fn frame(world_h: f64, vh: f64) -> Camera {
-        Camera { center_x: 0.0, center_y: world_h / 2.0, zoom: vh / (world_h * 1.05) }
-    }
 }
 
 /// Enter/Esc framing for containers: the focus rect lands at half the
@@ -82,12 +69,10 @@ pub const END_FRACTION: f64 = 0.95;
 /// Camera-follow tween duration, seconds (spec: ~250 ms, interruptible).
 pub const TWEEN_SECS: f64 = 0.25;
 /// World units are natural pixels; 8× natural size is as far as zoom goes.
-#[allow(dead_code)] // TODO(pivot): consumed in the switchover task
 pub const MAX_ZOOM: f64 = 8.0;
 
 /// Camera showing `rect` at `fraction` of the viewport's tighter
 /// dimension, centered. The zoom clamp may prevent exact framing (accepted).
-#[allow(dead_code)] // TODO(pivot): consumed in the switchover task
 pub fn frame_rect(
     rect: Rect,
     vw: f64,
@@ -105,7 +90,6 @@ pub fn frame_rect(
 
 /// Leaf framing: END_FRACTION fit, capped at natural size (zoom 1.0) —
 /// stepping onto a small method never blows its code up past 12px.
-#[allow(dead_code)] // TODO(pivot): consumed in the switchover task
 pub fn frame_page(rect: Rect, vw: f64, vh: f64, min_zoom: f64, max_zoom: f64) -> Camera {
     Camera {
         center_x: rect.x + rect.w / 2.0,
@@ -113,15 +97,6 @@ pub fn frame_page(rect: Rect, vw: f64, vh: f64, min_zoom: f64, max_zoom: f64) ->
         zoom: (END_FRACTION * (vw / rect.w).min(vh / rect.h))
             .min(1.0)
             .clamp(min_zoom, max_zoom),
-    }
-}
-
-/// Legacy y-band framing (icicle). TODO(pivot): deleted in the switchover task.
-pub fn frame_band(y: f64, h: f64, vh: f64, fraction: f64, min_zoom: f64, max_zoom: f64) -> Camera {
-    Camera {
-        center_x: 0.0,
-        center_y: y + h / 2.0,
-        zoom: (fraction * vh / h).clamp(min_zoom, max_zoom),
     }
 }
 
@@ -302,14 +277,4 @@ mod tests {
         assert_eq!(re.to, other);
     }
 
-    #[test]
-    fn legacy_y_frames_until_switchover() {
-        // TODO(pivot): delete with Camera::frame / frame_band in the switchover
-        let c = Camera::frame(1.0, 600.0);
-        close(c.center_y, 0.5);
-        close(c.zoom, 600.0 / 1.05);
-        let c = frame_band(0.6875, 0.015625, 600.0, FOCUS_FRACTION, 1e-9, 1e18);
-        close(c.zoom, 19200.0);
-        close(c.center_y, 0.6953125);
-    }
 }

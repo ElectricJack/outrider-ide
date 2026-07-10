@@ -6,7 +6,7 @@ use gpui::{
 };
 use outrider_index::buffer::HighlightSpan;
 use outrider_index::{SymbolId, SymbolNode, SymbolTree};
-use outrider_layout::WorldLayout;
+use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
@@ -36,7 +36,7 @@ fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
 
 pub struct TreemapView {
     tree: SymbolTree,
-    layout: WorldLayout,
+    layout: PackLayout,
     /// None until the first render supplies a viewport; then Home-framed.
     camera: Option<Camera>,
     home_zoom: f64,
@@ -67,6 +67,9 @@ struct PaintItem {
     /// Font size for body rows: FONT_PX·scale for Full leaves, else 12.0.
     /// The name row always paints at 12px.
     body_font_px: f32,
+    /// UNclipped screen-x of the box: body/code rows move with the box,
+    /// while the name row pins to the clipped corner.
+    body_x: f32,
     fill: u32,
     border: u32,
     stripe: Option<u32>,
@@ -187,7 +190,7 @@ fn build_body(
 }
 
 impl TreemapView {
-    pub fn new(tree: SymbolTree, layout: WorldLayout, cx: &mut Context<Self>) -> Self {
+    pub fn new(tree: SymbolTree, layout: PackLayout, cx: &mut Context<Self>) -> Self {
         let root_id = tree.root.id.clone();
         let file_symbols = collect_file_symbols(&tree);
         let buffers = BufferManager::new(tree.repo_root.clone());
@@ -206,16 +209,31 @@ impl TreemapView {
         }
     }
 
-    fn root_world_height(&self) -> f64 {
+    fn root_rect(&self) -> Rect {
         self.layout
-            .nodes
+            .rects
             .get(&self.tree.root.id)
-            .map(|nl| nl.cells.len as f64)
-            .unwrap_or(1.0)
+            .copied()
+            .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 })
     }
 
-    fn home_camera(&self, vh: f64) -> Camera {
-        Camera::frame(self.root_world_height(), vh)
+    /// Framing target for the current focus: leaf pages at natural size
+    /// (capped END fit), containers at FOCUS_FRACTION.
+    fn frame_focus(
+        &self,
+        index: &TreeIndex,
+        vw: f64,
+        vh: f64,
+        min_zoom: f64,
+        max_zoom: f64,
+    ) -> Option<Camera> {
+        let r = *self.layout.rects.get(&self.focus.current)?;
+        match index.node(&self.focus.current) {
+            Some(n) if content::is_leaf_item(n) => {
+                Some(camera::frame_page(r, vw, vh, min_zoom, max_zoom))
+            }
+            _ => Some(camera::frame_rect(r, vw, vh, camera::FOCUS_FRACTION, min_zoom, max_zoom)),
+        }
     }
 
     /// Start (or retarget) the camera-follow tween from the current sample.
@@ -250,7 +268,7 @@ impl TreemapView {
             }
         }
         if self.camera.is_none() {
-            let c = self.home_camera(vh);
+            let c = Camera::fit(self.root_rect(), vw, vh);
             self.home_zoom = c.zoom;
             self.camera = Some(c);
         }
@@ -281,6 +299,7 @@ impl TreemapView {
                 h: item.px.h as f32,
                 label_w: item.label_w as f32,
                 body_font_px: (FONT_PX * scale) as f32,
+                body_x: item.left as f32,
                 fill,
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
@@ -308,7 +327,7 @@ impl Render for TreemapView {
             window.request_animation_frame();
         }
 
-        let max_zoom = vh * 8f64.powi(15);
+        let max_zoom = camera::MAX_ZOOM;
         let min_zoom = self.home_zoom * 0.5;
 
         div()
@@ -396,51 +415,34 @@ impl Render for TreemapView {
                 if this.camera.is_none() {
                     return;
                 }
-                let vh = f64::from(w.viewport_size().height);
-                let vw = f64::from(w.viewport_size().width);
-                let max_zoom = vh * 8f64.powi(15);
+                let vp = w.viewport_size();
+                let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
+                let max_zoom = camera::MAX_ZOOM;
                 let min_zoom = this.home_zoom * 0.5;
                 let index = TreeIndex::new(&this.tree);
-                let key = e.keystroke.key.as_str();
-                let moved = match key {
-                    "right" => this.focus.step_in(&index),
-                    "left" => this.focus.step_out(&index),
-                    "up" => this.focus.step_sibling(-1, &index),
-                    "down" => this.focus.step_sibling(1, &index),
-                    _ => false,
-                };
-                let target = match key {
-                    "right" | "left" | "up" | "down" => {
-                        if !moved {
+                let target = match e.keystroke.key.as_str() {
+                    "enter" => {
+                        if !this.focus.step_in(&index) {
                             return;
                         }
-                        match index.node(&this.focus.current) {
-                            Some(n) if content::is_leaf_item(n) => {
-                                world::frame_leaf(n, &this.layout, vw, vh, min_zoom, max_zoom)
-                            }
-                            _ => world::world_band(&this.focus.current, &this.layout).map(
-                                |(y, h)| {
-                                    camera::frame_band(
-                                        y,
-                                        h,
-                                        vh,
-                                        camera::FOCUS_FRACTION,
-                                        min_zoom,
-                                        max_zoom,
-                                    )
-                                },
-                            ),
-                        }
+                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
-                    "end" => world::world_band(&this.focus.current, &this.layout).map(|(y, h)| {
-                        camera::frame_band(y, h, vh, camera::END_FRACTION, min_zoom, max_zoom)
+                    "escape" => {
+                        if !this.focus.step_out(&index) {
+                            return;
+                        }
+                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                    }
+                    "end" => this.layout.rects.get(&this.focus.current).map(|&r| {
+                        camera::frame_rect(r, vw, vh, camera::END_FRACTION, min_zoom, max_zoom)
                     }),
                     "home" => {
-                        let c = this.home_camera(vh);
+                        let c = Camera::fit(this.root_rect(), vw, vh);
                         this.home_zoom = c.zoom;
                         Some(c)
                     }
-                    _ => return, // Tab included: explicitly no handler
+                    // Arrows land in the spatial-step task; Tab stays disabled.
+                    _ => return,
                 };
                 if let Some(to) = target {
                     this.start_tween(to);
@@ -533,7 +535,7 @@ impl Render for TreemapView {
                                     None,
                                 );
                                 let _ = line.paint(
-                                    point(origin.x + px(item.x + 6.0), origin.y + px(bt.y)),
+                                    point(origin.x + px(item.body_x + 6.0), origin.y + px(bt.y)),
                                     body_line_height,
                                     TextAlign::Left,
                                     None,

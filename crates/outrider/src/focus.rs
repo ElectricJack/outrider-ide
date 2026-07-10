@@ -60,7 +60,7 @@ impl Focus {
         }
     }
 
-    /// Right: last-visited child if still valid, else first child.
+    /// Enter: last-visited child if still valid, else first child.
     pub fn step_in(&mut self, index: &TreeIndex) -> bool {
         let Some(node) = index.node(&self.current) else { return false };
         if node.children.is_empty() {
@@ -75,21 +75,7 @@ impl Focus {
         self.land(next, index)
     }
 
-    /// Up (-1) / Down (+1): cycle name-ordered siblings, wrapping.
-    pub fn step_sibling(&mut self, delta: isize, index: &TreeIndex) -> bool {
-        let Some(parent_id) = index.parent(&self.current) else { return false };
-        let parent = index.node(parent_id).expect("parent id is in the index");
-        let n = parent.children.len() as isize;
-        let i = parent
-            .children
-            .iter()
-            .position(|c| c.id == self.current)
-            .expect("focus is a child of its parent") as isize;
-        let next = parent.children[(i + delta).rem_euclid(n) as usize].id.clone();
-        self.land(next, index)
-    }
-
-    /// Left: move to the structural parent (no-op at the root).
+    /// Esc: move to the structural parent (no-op at the root).
     pub fn step_out(&mut self, index: &TreeIndex) -> bool {
         let Some(p) = index.parent(&self.current) else { return false };
         self.land(p.clone(), index)
@@ -154,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn right_steps_into_first_child_and_leaf_is_noop() {
+    fn enter_steps_into_first_child_and_leaf_is_noop() {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
@@ -165,37 +151,11 @@ mod tests {
     }
 
     #[test]
-    fn up_down_cycle_and_wrap() {
+    fn esc_moves_to_parent_and_root_is_noop() {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
-        f.step_in(&idx); // a.rs
-        assert!(f.step_sibling(1, &idx));
-        assert_eq!(f.current, id(SymbolKind::File, "b.rs"));
-        assert!(f.step_sibling(1, &idx)); // wraps
-        assert_eq!(f.current, id(SymbolKind::File, "a.rs"));
-        assert!(f.step_sibling(-1, &idx)); // wraps the other way
-        assert_eq!(f.current, id(SymbolKind::File, "b.rs"));
-    }
-
-    #[test]
-    fn sibling_at_root_is_noop() {
-        let t = tree();
-        let idx = TreeIndex::new(&t);
-        let mut f = Focus::new(t.root.id.clone());
-        assert!(!f.step_sibling(1, &idx));
-        assert!(!f.step_sibling(-1, &idx));
-        assert_eq!(f.current, t.root.id);
-    }
-
-    #[test]
-    fn left_moves_to_parent_and_root_is_noop() {
-        let t = tree();
-        let idx = TreeIndex::new(&t);
-        let mut f = Focus::new(t.root.id.clone());
-        f.step_in(&idx); // a.rs
-        f.step_sibling(1, &idx); // b.rs
-        f.step_in(&idx); // b.rs::f
+        f.set(id(SymbolKind::Fn, "b.rs::f"), &idx);
         assert!(f.step_out(&idx));
         assert_eq!(f.current, id(SymbolKind::File, "b.rs"));
         assert!(f.step_out(&idx));
@@ -204,26 +164,22 @@ mod tests {
     }
 
     #[test]
-    fn left_then_right_returns_to_the_same_child() {
+    fn esc_then_enter_returns_to_the_same_child() {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
-        f.step_in(&idx); // a.rs
-        f.step_sibling(1, &idx); // b.rs
-        f.step_in(&idx); // b.rs::f
-        f.step_sibling(1, &idx); // b.rs::g
+        f.set(id(SymbolKind::Fn, "b.rs::g"), &idx);
         f.step_out(&idx); // b.rs
         assert!(f.step_in(&idx));
         assert_eq!(f.current, id(SymbolKind::Fn, "b.rs::g")); // last visited, not first
     }
 
     #[test]
-    fn right_remembers_last_visited_child() {
+    fn enter_remembers_last_visited_child() {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
-        f.step_in(&idx); // a.rs
-        f.step_sibling(1, &idx); // b.rs → last_child[root] = b.rs
+        f.set(id(SymbolKind::File, "b.rs"), &idx); // last_child[root] = b.rs
         assert!(f.set(t.root.id.clone(), &idx)); // click back to root
         assert!(f.step_in(&idx));
         assert_eq!(f.current, id(SymbolKind::File, "b.rs")); // not a.rs

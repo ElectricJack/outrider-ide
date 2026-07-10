@@ -26,8 +26,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let layout = outrider_layout::layout(&tree);
-    eprintln!("{} symbols laid out", layout.nodes.len());
+    let layout = outrider_layout::pack(&tree, &world::pack_config());
+    eprintln!("{} symbols packed", layout.rects.len());
 
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
