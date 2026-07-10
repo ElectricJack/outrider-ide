@@ -50,7 +50,11 @@ impl BufferManager {
             self.entries.push(e);
         } else {
             let text = std::fs::read_to_string(self.repo_root.join(rel_path)).ok()?;
-            let mut buffer = FileBuffer::new(text).ok()?;
+            let ext = std::path::Path::new(rel_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let mut buffer = FileBuffer::new(text, ext).ok()?;
             let anchors = symbols
                 .iter()
                 .map(|(id, start)| (id.clone(), buffer.create_anchor(*start)))

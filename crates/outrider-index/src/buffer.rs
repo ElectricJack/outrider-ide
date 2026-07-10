@@ -67,22 +67,50 @@ pub struct HighlightSpan {
 
 pub struct FileBuffer {
     rope: Rope,
-    /// Held for Phase 6 incremental re-parse; unused until then.
+    /// Held for Phase 6 incremental re-parse; unused until then. `None`
+    /// in plain mode (no grammar for the extension).
     #[allow(dead_code)]
-    tree: Tree,
+    tree: Option<Tree>,
     /// Per-line spans, computed once at materialization (spec §3.2).
     lines: Vec<Vec<HighlightSpan>>,
     anchors: AnchorList,
 }
 
+/// Leaf-only TOML captures. The crate's shipped HIGHLIGHTS_QUERY has a
+/// `(pair (bare_key)) @property` pattern that captures the whole pair
+/// node; outermost-first overlap resolution would keep that whole-line
+/// span and drop the inner key/string/number spans.
+const TOML_HIGHLIGHTS: &str = r#"
+(bare_key) @property
+(quoted_key) @string
+(boolean) @constant
+(comment) @comment
+(string) @string
+[(integer) (float)] @number
+[(offset_date_time) (local_date_time) (local_date) (local_time)] @string.special
+"#;
+
 impl FileBuffer {
-    pub fn new(text: String) -> anyhow::Result<Self> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .context("loading tree-sitter-rust grammar")?;
-        let tree = parser.parse(&text, None).context("tree-sitter parse failed")?;
-        let lines = highlight_lines(&text, &tree)?;
+    /// `ext` is the bare lowercase file extension (no dot). Known
+    /// extensions parse and highlight; anything else is plain mode —
+    /// no parse, every line's span list empty.
+    pub fn new(text: String, ext: &str) -> anyhow::Result<Self> {
+        let lang: Option<(tree_sitter::Language, &str)> = match ext {
+            "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
+            "md" => Some((tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK)),
+            "toml" => Some((tree_sitter_toml_ng::LANGUAGE.into(), TOML_HIGHLIGHTS)),
+            _ => None,
+        };
+        let (tree, lines) = match lang {
+            Some((language, query_src)) => {
+                let mut parser = tree_sitter::Parser::new();
+                parser.set_language(&language).context("loading tree-sitter grammar")?;
+                let tree = parser.parse(&text, None).context("tree-sitter parse failed")?;
+                let lines = highlight_lines(&text, &tree, &language, query_src)?;
+                (Some(tree), lines)
+            }
+            None => (None, vec![Vec::new(); line_bounds(&text).len()]),
+        };
         Ok(Self { rope: Rope::from(text), tree, lines, anchors: AnchorList::default() })
     }
 
@@ -127,9 +155,16 @@ fn line_bounds(text: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// Capture-name prefix → HighlightKind (spec §3.2). Unmapped captures
-/// (punctuation, operators, …) are skipped and paint as Default.
+/// Capture-name → HighlightKind (spec §3.2). Full-name matches first
+/// (markdown block captures), then the prefix map. Unmapped captures
+/// (punctuation, operators, `none`, …) are skipped and paint as Default.
 fn kind_for(capture: &str) -> Option<HighlightKind> {
+    match capture {
+        "text.title" => return Some(HighlightKind::Type),
+        "text.literal" => return Some(HighlightKind::String),
+        "text.uri" | "text.reference" => return Some(HighlightKind::Property),
+        _ => {}
+    }
     match capture.split('.').next().unwrap_or(capture) {
         "keyword" => Some(HighlightKind::Keyword),
         "function" => Some(HighlightKind::Function),
@@ -145,11 +180,15 @@ fn kind_for(capture: &str) -> Option<HighlightKind> {
 /// Run HIGHLIGHTS_QUERY over the whole file, splitting captures into
 /// per-line spans. Overlaps resolve outermost-first (sort by start asc,
 /// end desc; drop spans starting inside an earlier-kept span).
-fn highlight_lines(text: &str, tree: &Tree) -> anyhow::Result<Vec<Vec<HighlightSpan>>> {
+fn highlight_lines(
+    text: &str,
+    tree: &Tree,
+    language: &tree_sitter::Language,
+    query_src: &str,
+) -> anyhow::Result<Vec<Vec<HighlightSpan>>> {
     let bounds = line_bounds(text);
     let mut lines: Vec<Vec<HighlightSpan>> = vec![Vec::new(); bounds.len()];
-    let query = Query::new(&tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)
-        .context("compiling rust highlight query")?;
+    let query = Query::new(language, query_src).context("compiling highlight query")?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
     while let Some(m) = matches.next() {
@@ -236,7 +275,7 @@ mod tests {
 
     #[test]
     fn highlight_kinds_and_bounds() {
-        let buf = FileBuffer::new(SNIPPET.to_string()).unwrap();
+        let buf = FileBuffer::new(SNIPPET.to_string(), "rs").unwrap();
         assert_eq!(buf.len_lines(), 5);
         let (t0, s0) = buf.line(0).unwrap();
         assert_eq!(t0, "// a comment line");
@@ -267,11 +306,83 @@ mod tests {
 
     #[test]
     fn byte_to_line_and_anchor_roundtrip() {
-        let mut buf = FileBuffer::new(SNIPPET.to_string()).unwrap();
+        let mut buf = FileBuffer::new(SNIPPET.to_string(), "rs").unwrap();
         assert_eq!(buf.byte_to_line(0), 0);
         assert_eq!(buf.byte_to_line(18), 1); // first byte of "fn free…"
         let a = buf.create_anchor(18);
         assert_eq!(buf.resolve_anchor(a), 18);
         assert_eq!(buf.byte_to_line(buf.resolve_anchor(a)), 1);
+    }
+
+    #[test]
+    fn plain_mode_has_lines_but_no_spans() {
+        let text = "alpha beta\n\ngamma\n";
+        let buf = FileBuffer::new(text.to_string(), "txt").unwrap();
+        assert_eq!(buf.len_lines(), 3);
+        let (t0, s0) = buf.line(0).unwrap();
+        assert_eq!(t0, "alpha beta");
+        assert!(s0.is_empty());
+        let (t1, s1) = buf.line(1).unwrap();
+        assert_eq!(t1, "");
+        assert!(s1.is_empty());
+        let (t2, s2) = buf.line(2).unwrap();
+        assert_eq!(t2, "gamma");
+        assert!(s2.is_empty());
+        // anchors still work in plain mode
+        let mut buf = FileBuffer::new(text.to_string(), "").unwrap();
+        let a = buf.create_anchor(12);
+        assert_eq!(buf.byte_to_line(buf.resolve_anchor(a)), 2);
+    }
+
+    const MD_SNIPPET: &str = "# Title\n\nplain text\n\n```\nlet x = 1;\n```\n";
+
+    #[test]
+    fn markdown_headings_and_fences_highlight() {
+        let buf = FileBuffer::new(MD_SNIPPET.to_string(), "md").unwrap();
+        assert_eq!(buf.len_lines(), 7);
+        // heading content is Type ("text.title")
+        let (t0, s0) = buf.line(0).unwrap();
+        assert!(
+            s0.iter().any(|s| s.kind == HighlightKind::Type && &t0[s.range.clone()] == "Title"),
+            "no Type span over 'Title' in {s0:?}"
+        );
+        // plain paragraph line: no mapped spans
+        let (_t2, s2) = buf.line(2).unwrap();
+        assert!(s2.is_empty(), "paragraph should be unhighlighted: {s2:?}");
+        // fenced block ("text.literal" spans the whole block): every fence
+        // line carries a String span
+        for i in 4..=6 {
+            let (_t, s) = buf.line(i).unwrap();
+            assert!(
+                s.iter().any(|sp| sp.kind == HighlightKind::String),
+                "no String span on fence line {i}: {s:?}"
+            );
+        }
+    }
+
+    const TOML_SNIPPET: &str = "# note\n[package]\nname = \"x\"\ncount = 3\n";
+
+    #[test]
+    fn toml_keys_and_values_highlight() {
+        let buf = FileBuffer::new(TOML_SNIPPET.to_string(), "toml").unwrap();
+        assert_eq!(buf.len_lines(), 4);
+        let (t0, s0) = buf.line(0).unwrap();
+        assert!(s0
+            .iter()
+            .any(|s| s.kind == HighlightKind::Comment && &t0[s.range.clone()] == "# note"));
+        // table header key
+        let (t1, s1) = buf.line(1).unwrap();
+        assert!(s1
+            .iter()
+            .any(|s| s.kind == HighlightKind::Property && &t1[s.range.clone()] == "package"));
+        // pair: key is Property, value is String — both present (the
+        // embedded query must not let a whole-pair capture swallow them)
+        let (t2, s2) = buf.line(2).unwrap();
+        assert!(s2
+            .iter()
+            .any(|s| s.kind == HighlightKind::Property && &t2[s.range.clone()] == "name"));
+        assert!(s2.iter().any(|s| s.kind == HighlightKind::String));
+        let (_t3, s3) = buf.line(3).unwrap();
+        assert!(s3.iter().any(|s| s.kind == HighlightKind::Number));
     }
 }
