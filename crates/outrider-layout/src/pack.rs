@@ -25,7 +25,7 @@ pub struct PackConfig {
     pub bottom_pad: f64,
     /// Space between siblings, both axes; also the container's inner margin.
     pub gap: f64,
-    /// Target container width/height ratio for shelf wrapping.
+    /// Target container width/height ratio for column wrapping.
     pub aspect: f64,
 }
 
