@@ -68,9 +68,10 @@ impl BufferManager {
     }
 }
 
-/// rel file path → (id, byte_range.start) of every item inside that file,
-/// from the tree. Built once at view construction; `get` uses it to create
-/// anchors at materialization.
+/// rel file path → (id, byte_range.start) of every item inside that file
+/// — or, for a childless file, the file node itself at byte 0. Built once
+/// at view construction; `get` uses it to create anchors at
+/// materialization.
 pub fn collect_file_symbols(tree: &SymbolTree) -> BTreeMap<String, Vec<(SymbolId, usize)>> {
     fn items(node: &SymbolNode, out: &mut Vec<(SymbolId, usize)>) {
         for c in &node.children {
@@ -83,7 +84,15 @@ pub fn collect_file_symbols(tree: &SymbolTree) -> BTreeMap<String, Vec<(SymbolId
     fn walk(node: &SymbolNode, out: &mut BTreeMap<String, Vec<(SymbolId, usize)>>) {
         if node.id.kind == SymbolKind::File {
             let mut v = Vec::new();
-            items(node, &mut v);
+            if node.children.is_empty() {
+                // Text page: anchor the file itself so its window starts
+                // at rope line 0 (spec §4).
+                if let Some(r) = &node.byte_range {
+                    v.push((node.id.clone(), r.start));
+                }
+            } else {
+                items(node, &mut v);
+            }
             out.insert(node.id.qualified_path.clone(), v);
         } else {
             for c in &node.children {
@@ -206,5 +215,50 @@ mod tests {
             got,
             vec![("a.rs::T", SymbolKind::Impl, 0), ("a.rs::T::m", SymbolKind::Fn, 10)]
         );
+    }
+
+    #[test]
+    fn collect_file_symbols_anchors_childless_files_at_zero() {
+        fn node(kind: SymbolKind, qual: &str, byte_range: Option<std::ops::Range<usize>>, children: Vec<SymbolNode>) -> SymbolNode {
+            SymbolNode {
+                id: SymbolId { kind, qualified_path: qual.into(), ordinal: 0 },
+                name: qual.rsplit("::").next().unwrap_or(qual).to_string(),
+                byte_range,
+                signature: None,
+                doc: None,
+                measure: 1,
+                churn: 0.0,
+                churn_count: 0,
+                children,
+            }
+        }
+        let tree = SymbolTree {
+            root: node(
+                SymbolKind::Folder,
+                "",
+                None,
+                vec![
+                    node(SymbolKind::File, "README.md", Some(0..120), vec![]),
+                    node(
+                        SymbolKind::File,
+                        "a.rs",
+                        Some(0..40),
+                        vec![node(SymbolKind::Fn, "a.rs::f", Some(5..30), vec![])],
+                    ),
+                ],
+            ),
+            repo_root: std::path::PathBuf::from("/x"),
+        };
+        let map = collect_file_symbols(&tree);
+        // childless file: its own id at byte 0
+        let readme = map.get("README.md").unwrap();
+        assert_eq!(readme.len(), 1);
+        assert_eq!(readme[0].0.kind, SymbolKind::File);
+        assert_eq!(readme[0].0.qualified_path, "README.md");
+        assert_eq!(readme[0].1, 0);
+        // file with children: items only, own id absent
+        let a = map.get("a.rs").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].0.qualified_path, "a.rs::f");
     }
 }
