@@ -112,9 +112,9 @@ pub fn column_table(zoom: f64, vw: f64, max_depth: usize) -> Vec<ColPx> {
 /// Rung by pixel height, downgraded to Dot when the column is too narrow
 /// for text (gutter strips) and from Full to Detail when too narrow for
 /// code. Heights below MERGE_PX merge into the parent. For leaf items,
-/// pass `natural_px`: the box is Full as soon as it fits its content
-/// (capped at FULL_PX for long methods) — code appears when close enough,
-/// no explicit dive required (spec 4c §6).
+/// pass `natural_px`: the box is Full as soon as it holds about three
+/// floor-font code rows (LEAF_CODE_MIN_PX) or its whole content, whichever
+/// is smaller — code persists, scaled then clipped (spec 4d §3).
 pub fn rung_for(px_h: f64, px_w: f64, natural_px: Option<f64>) -> Option<Rung> {
     let by_height = if px_h < MERGE_PX {
         return None;
@@ -130,7 +130,7 @@ pub fn rung_for(px_h: f64, px_w: f64, natural_px: Option<f64>) -> Option<Rung> {
         Rung::Full
     };
     let by_height = match natural_px {
-        Some(n) if px_h >= n.min(FULL_PX) => Rung::Full,
+        Some(n) if px_h >= n.min(content::LEAF_CODE_MIN_PX) => Rung::Full,
         _ => by_height,
     };
     let rung = if px_w < LABEL_MIN_W { Rung::Dot } else { by_height };
@@ -453,14 +453,18 @@ mod tests {
         // the merge rule wins over everything
         assert_eq!(rung_for(3.9, 24.0, None), None);
 
-        // Leaf legibility (spec 4c §6): Full as soon as the box fits the
-        // content, even below FULL_PX
+        // Leaf code persistence (spec 4d §3): Full whenever the box holds
+        // ~three floor-font rows (LEAF_CODE_MIN_PX = 54.1) — or its whole
+        // natural height, if that is smaller.
         assert_eq!(rung_for(100.0, 400.0, Some(90.0)), Some(Rung::Full));
         assert_eq!(rung_for(100.0, 400.0, None), Some(Rung::Card)); // container ladder
         assert_eq!(rung_for(100.0, 250.0, Some(90.0)), Some(Rung::Detail)); // width gate holds
         assert_eq!(rung_for(100.0, 59.0, Some(90.0)), Some(Rung::Dot)); // narrow gate holds
-        assert_eq!(rung_for(80.0, 400.0, Some(90.0)), Some(Rung::Card)); // below content → ladder
-        assert_eq!(rung_for(699.0, 400.0, Some(3000.0)), Some(Rung::Detail)); // long fn: FULL_PX cap
+        assert_eq!(rung_for(80.0, 400.0, Some(90.0)), Some(Rung::Full)); // ≥ 54.1 → code, clipped
+        assert_eq!(rung_for(55.0, 400.0, Some(3000.0)), Some(Rung::Full)); // long fn, no FULL_PX cap
+        assert_eq!(rung_for(54.0, 400.0, Some(3000.0)), Some(Rung::Label)); // just below 54.1
+        assert_eq!(rung_for(43.0, 400.0, Some(42.4)), Some(Rung::Full)); // tiny leaf: natural wins
+        assert_eq!(rung_for(42.0, 400.0, Some(42.4)), Some(Rung::Label)); // below its natural height
         assert_eq!(rung_for(700.0, 400.0, Some(3000.0)), Some(Rung::Full));
     }
 

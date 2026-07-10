@@ -19,7 +19,6 @@ pub const MIN_CODE_SCALE: f64 = MIN_CODE_FONT_PX / FONT_PX;
 /// Shortest leaf box that still shows code: header + three code rows at
 /// the floor font + bottom pad (≈ 54.1px). Below this a leaf drops to the
 /// container ladder (spec 4d §3).
-#[allow(dead_code)]
 pub const LEAF_CODE_MIN_PX: f64 = HEADER + 3.0 * LINE_STEP * MIN_CODE_SCALE + BOTTOM_PAD;
 
 /// A code-bearing leaf: has source bytes, no children, and is an item
