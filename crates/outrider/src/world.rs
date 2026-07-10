@@ -42,13 +42,11 @@ pub enum Rung {
     Full,
 }
 
-/// Rung by pixel height, downgraded to Dot when the column is too narrow
-/// for text and from Full to Detail when too narrow for
-/// code. Heights below MERGE_PX merge into the parent. For leaf items,
-/// pass `natural_px`: the box is Full as soon as it holds about three
-/// floor-font code rows (LEAF_CODE_MIN_PX) or its whole content, whichever
-/// is smaller — code persists, scaled then clipped (spec 4d §3).
-pub fn rung_for(px_h: f64, px_w: f64, natural_px: Option<f64>) -> Option<Rung> {
+/// Container rung by pixel height, downgraded to Dot when the column is too
+/// narrow for text and from Full to Detail when too narrow for code.
+/// Heights below MERGE_PX merge into the parent. Leaf items do NOT use this
+/// — they go through `leaf_draw` (spec §3).
+pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
     let by_height = if px_h < MERGE_PX {
         return None;
     } else if px_h < LABEL_PX {
@@ -61,10 +59,6 @@ pub fn rung_for(px_h: f64, px_w: f64, natural_px: Option<f64>) -> Option<Rung> {
         Rung::Detail
     } else {
         Rung::Full
-    };
-    let by_height = match natural_px {
-        Some(n) if px_h >= n.min(content::LEAF_CODE_MIN_PX) => Rung::Full,
-        _ => by_height,
     };
     let rung = if px_w < LABEL_MIN_W { Rung::Dot } else { by_height };
     Some(if rung == Rung::Full && px_w < CODE_MIN_W { Rung::Detail } else { rung })
@@ -83,7 +77,6 @@ pub enum LeafDraw {
 /// Leaf LOD ladder. `None` => merged away (below MERGE_PX). First match wins:
 /// tiny → Dot, short → Label (pinned name), then Text once the font clears
 /// MIN_TEXT_FONT_PX and the column clears CODE_MIN_W, else Minimap.
-#[allow(dead_code)]
 pub fn leaf_draw(ph: f64, pw: f64, natural_px: f64) -> Option<LeafDraw> {
     if ph < MERGE_PX {
         return None;
@@ -102,6 +95,14 @@ pub fn leaf_draw(ph: f64, pw: f64, natural_px: f64) -> Option<LeafDraw> {
     }
 }
 
+/// The chosen draw mode for a visible node: containers keep the `Rung`
+/// ladder, leaf pages get a `LeafDraw` tier (spec §3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Draw {
+    Container(Rung),
+    Leaf(LeafDraw),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PxRect {
     pub x: f64,
@@ -118,7 +119,7 @@ pub struct DrawItem<'a> {
     /// The node's own box width — text lives in this strip.
     pub label_w: f64,
     pub level: u8,
-    pub rung: Rung,
+    pub draw: Draw,
     /// UNclipped screen-x of the box left (`px.x` is clipped to the viewport).
     pub left: f64,
     /// UNclipped screen-y of the box top (`px.y` is clipped to the viewport).
@@ -159,11 +160,19 @@ fn walk<'a>(
     if sx > vw || sx + pw < 0.0 || sy > vh || sy + ph < 0.0 {
         return;
     }
-    let natural = content::is_leaf_item(node).then(|| content::natural_px(node));
-    // Below MERGE_PX the node — and its strictly smaller children — merge away.
-    let Some(rung) = rung_for(ph, pw, natural) else { return };
+    let draw = if content::is_leaf_item(node) {
+        match leaf_draw(ph, pw, content::natural_px(node)) {
+            Some(ld) => Draw::Leaf(ld),
+            None => return, // merged away
+        }
+    } else {
+        match rung_for(ph, pw) {
+            Some(r) => Draw::Container(r),
+            None => return, // merged away
+        }
+    };
     // Clip to the viewport (±2px slack keeps borders off-screen) before f32
-    // ever sees the coordinates; rung and code scale use the UNclipped size.
+    // ever sees the coordinates; the draw mode and scale use the UNclipped size.
     let x0 = sx.max(-2.0);
     let x1 = (sx + pw).min(vw + 2.0);
     let y0 = sy.max(-2.0);
@@ -173,7 +182,7 @@ fn walk<'a>(
         px: PxRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
         label_w: pw,
         level,
-        rung,
+        draw,
         top: sy,
         left: sx,
         full_h: ph,
@@ -245,41 +254,26 @@ mod tests {
 
     #[test]
     fn rung_for_thresholds_and_downgrade() {
-        // height thresholds (wide column: no downgrade)
-        assert_eq!(rung_for(3.9, 400.0, None), None);
-        assert_eq!(rung_for(4.0, 400.0, None), Some(Rung::Dot));
-        assert_eq!(rung_for(19.9, 400.0, None), Some(Rung::Dot));
-        assert_eq!(rung_for(20.0, 400.0, None), Some(Rung::Label));
-        assert_eq!(rung_for(79.9, 400.0, None), Some(Rung::Label));
-        assert_eq!(rung_for(80.0, 400.0, None), Some(Rung::Card));
-        assert_eq!(rung_for(249.9, 400.0, None), Some(Rung::Card));
-        assert_eq!(rung_for(250.0, 400.0, None), Some(Rung::Detail));
-        assert_eq!(rung_for(699.9, 400.0, None), Some(Rung::Detail));
-        assert_eq!(rung_for(700.0, 400.0, None), Some(Rung::Full));
+        assert_eq!(rung_for(3.9, 400.0), None);
+        assert_eq!(rung_for(4.0, 400.0), Some(Rung::Dot));
+        assert_eq!(rung_for(19.9, 400.0), Some(Rung::Dot));
+        assert_eq!(rung_for(20.0, 400.0), Some(Rung::Label));
+        assert_eq!(rung_for(79.9, 400.0), Some(Rung::Label));
+        assert_eq!(rung_for(80.0, 400.0), Some(Rung::Card));
+        assert_eq!(rung_for(249.9, 400.0), Some(Rung::Card));
+        assert_eq!(rung_for(250.0, 400.0), Some(Rung::Detail));
+        assert_eq!(rung_for(699.9, 400.0), Some(Rung::Detail));
+        assert_eq!(rung_for(700.0, 400.0), Some(Rung::Full));
         // narrow boxes are forced to Dot regardless of height
-        assert_eq!(rung_for(100_000.0, 59.9, None), Some(Rung::Dot));
+        assert_eq!(rung_for(100_000.0, 59.9), Some(Rung::Dot));
         // Full downgrades to Detail when too narrow for code (spec §4.2)
-        assert_eq!(rung_for(100_000.0, 60.0, None), Some(Rung::Detail));
-        assert_eq!(rung_for(100_000.0, 299.9, None), Some(Rung::Detail));
-        assert_eq!(rung_for(100_000.0, 300.0, None), Some(Rung::Full));
+        assert_eq!(rung_for(100_000.0, 60.0), Some(Rung::Detail));
+        assert_eq!(rung_for(100_000.0, 299.9), Some(Rung::Detail));
+        assert_eq!(rung_for(100_000.0, 300.0), Some(Rung::Full));
         // the CODE_MIN_W downgrade applies only to Full
-        assert_eq!(rung_for(100.0, 60.0, None), Some(Rung::Card));
+        assert_eq!(rung_for(100.0, 60.0), Some(Rung::Card));
         // the merge rule wins over everything
-        assert_eq!(rung_for(3.9, 24.0, None), None);
-
-        // Leaf code persistence (spec 4d §3): Full whenever the box holds
-        // ~three floor-font rows (LEAF_CODE_MIN_PX = 54.1) — or its whole
-        // natural height, if that is smaller.
-        assert_eq!(rung_for(100.0, 400.0, Some(90.0)), Some(Rung::Full));
-        assert_eq!(rung_for(100.0, 400.0, None), Some(Rung::Card)); // container ladder
-        assert_eq!(rung_for(100.0, 250.0, Some(90.0)), Some(Rung::Detail)); // width gate holds
-        assert_eq!(rung_for(100.0, 59.0, Some(90.0)), Some(Rung::Dot)); // narrow gate holds
-        assert_eq!(rung_for(80.0, 400.0, Some(90.0)), Some(Rung::Full)); // ≥ 54.1 → code, clipped
-        assert_eq!(rung_for(55.0, 400.0, Some(3000.0)), Some(Rung::Full)); // long fn, no FULL_PX cap
-        assert_eq!(rung_for(54.0, 400.0, Some(3000.0)), Some(Rung::Label)); // just below 54.1
-        assert_eq!(rung_for(43.0, 400.0, Some(42.4)), Some(Rung::Full)); // tiny leaf: natural wins
-        assert_eq!(rung_for(42.0, 400.0, Some(42.4)), Some(Rung::Label)); // below its natural height
-        assert_eq!(rung_for(700.0, 400.0, Some(3000.0)), Some(Rung::Full));
+        assert_eq!(rung_for(3.9, 24.0), None);
     }
 
     fn pack_cfg() -> outrider_layout::PackConfig {
@@ -315,10 +309,18 @@ mod tests {
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
-        let rungs: Vec<Rung> = items.iter().map(|i| i.rung).collect();
-        // root 1639px → Full; a.rs 1602px file → Full; b.rs 301px → Detail;
-        // f (leaf, 198.4 ≥ 54.1) → Full; g (leaf, 58 ≥ min(58, 54.1)) → Full
-        assert_eq!(rungs, vec![Rung::Full, Rung::Full, Rung::Detail, Rung::Full, Rung::Full]);
+        use LeafDraw::{Label, Text};
+        let draws: Vec<Draw> = items.iter().map(|i| i.draw).collect();
+        assert_eq!(
+            draws,
+            vec![
+                Draw::Container(Rung::Full),   // root 1639px
+                Draw::Container(Rung::Full),   // a.rs 1602px (no byte_range → container)
+                Draw::Container(Rung::Detail), // b.rs 301px
+                Draw::Leaf(Text),              // f: 198.4px page, font 12, wide
+                Draw::Leaf(Label),             // g: 58px page (< CARD_PX)
+            ]
+        );
         assert_eq!(
             items.iter().map(|i| i.level).collect::<Vec<_>>(),
             vec![0, 1, 1, 2, 2]
@@ -358,7 +360,10 @@ mod tests {
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f"]);
-        assert!(items.iter().all(|i| i.rung == Rung::Dot));
+        assert!(items.iter().all(|i| matches!(
+            i.draw,
+            Draw::Container(Rung::Dot) | Draw::Leaf(LeafDraw::Dot)
+        )));
     }
 
     #[test]
