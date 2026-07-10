@@ -17,8 +17,8 @@ pub const LABEL_MIN_W: f64 = 60.0;
 pub const PAGE_W: f64 = 480.0;
 /// World-px gap between siblings and container inner margin.
 pub const PACK_GAP: f64 = 8.0;
-/// Target container width/height ratio.
-pub const PACK_ASPECT: f64 = 1.6;
+/// Target container width/height ratio (≈ square).
+pub const PACK_ASPECT: f64 = 1.0;
 
 /// The app's packing configuration: leaf pages sized by the content
 /// module's row metrics, so a page at zoom 1.0 is exactly natural size.

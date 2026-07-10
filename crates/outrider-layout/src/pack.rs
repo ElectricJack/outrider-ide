@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use outrider_index::{SymbolId, SymbolNode, SymbolTree};
+use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
 /// An absolute world rectangle. World units are natural pixels: a leaf
 /// page at zoom 1.0 renders at exactly this size.
@@ -47,8 +47,9 @@ pub fn pack(tree: &SymbolTree, cfg: &PackConfig) -> PackLayout {
 }
 
 /// Bottom-up size pass: returns (w, h) and records each node's position
-/// relative to its parent's origin in `rel` (x, y, w, h). The root's
-/// relative position stays (0, 0).
+/// relative to its parent's origin in `rel` (x, y, w, h). Children fill
+/// columns top-to-bottom, wrapping right toward a square aspect (spec §5).
+/// The root's relative position stays (0, 0).
 fn size(
     node: &SymbolNode,
     cfg: &PackConfig,
@@ -61,28 +62,38 @@ fn size(
     }
     // Re-derive the ordering invariant locally; never trust input Vec order.
     let mut order: Vec<&SymbolNode> = node.children.iter().collect();
-    order.sort_by(|a, b| {
-        a.name.as_bytes().cmp(b.name.as_bytes()).then(a.id.ordinal.cmp(&b.id.ordinal))
-    });
+    if order.first().map(|c| c.id.kind) == Some(SymbolKind::Chunk) {
+        // Chunk children pack in source order, ignoring their heading labels.
+        order.sort_by(|a, b| {
+            let ka = a.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
+            let kb = b.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
+            ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
+        });
+    } else {
+        order.sort_by(|a, b| {
+            a.name.as_bytes().cmp(b.name.as_bytes()).then(a.id.ordinal.cmp(&b.id.ordinal))
+        });
+    }
     let sizes: Vec<(f64, f64)> = order.iter().map(|c| size(c, cfg, rel)).collect();
     let area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
-    let widest = sizes.iter().map(|&(w, _)| w).fold(0.0, f64::max);
-    let target_w = widest.max((area * cfg.aspect).sqrt());
-    let (mut x, mut y, mut shelf_h, mut content_w) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let tallest = sizes.iter().map(|&(_, h)| h).fold(0.0, f64::max);
+    // tallest.max(...) guarantees no child is ever forced to wrap alone.
+    let target_h = tallest.max((area / cfg.aspect).sqrt());
+    let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for (child, &(w, h)) in order.iter().zip(&sizes) {
-        if x > 0.0 && x + w > target_w {
-            x = 0.0;
-            y += shelf_h + cfg.gap;
-            shelf_h = 0.0;
+        if y > 0.0 && y + h > target_h {
+            x += col_w + cfg.gap;
+            y = 0.0;
+            col_w = 0.0;
         }
         let e = rel.get_mut(&child.id).expect("child sized above");
         e.0 = cfg.gap + x;
         e.1 = cfg.header + cfg.gap + y;
-        shelf_h = shelf_h.max(h);
-        content_w = content_w.max(x + w);
-        x += w + cfg.gap;
+        col_w = col_w.max(w);
+        content_h = content_h.max(y + h);
+        y += h + cfg.gap;
     }
-    let wh = (content_w + 2.0 * cfg.gap, cfg.header + y + shelf_h + 2.0 * cfg.gap);
+    let wh = (x + col_w + 2.0 * cfg.gap, cfg.header + content_h + 2.0 * cfg.gap);
     rel.insert(node.id.clone(), (0.0, 0.0, wh.0, wh.1));
     wh
 }
@@ -183,11 +194,11 @@ mod tests {
         assert_eq!(p.rects.len(), 5);
         // leaf pages: w = page_w, h = header + (1+measure)·line_step + bottom_pad
         assert_rect(rect(&p, "a.rs"), 8.0, 28.8, 480.0, 1602.4);
-        // b.rs: f and g don't fit one 480-wide shelf → two shelves
+        // b.rs: f fills the first column, g stacks under it (one column)
         assert_rect(rect(&p, "b.rs::f"), 504.0, 57.6, 480.0, 198.4);
         assert_rect(rect(&p, "b.rs::g"), 504.0, 264.0, 480.0, 58.0);
         assert_rect(rect(&p, "b.rs"), 496.0, 28.8, 496.0, 301.2);
-        // root: a.rs and b.rs share one shelf (984 ≤ target_w ≈ 1212.3)
+        // root: a.rs fills column 1 (tall), b.rs wraps to column 2
         assert_rect(rect(&p, ""), 0.0, 0.0, 1000.0, 1639.2);
     }
 
@@ -219,7 +230,8 @@ mod tests {
         // alpha is placed first: top-left of the content area
         close(a.x, 8.0);
         close(a.y, 28.8);
-        // zeta is placed second: same shelf (target_w ≈ 7744 fits both), right of alpha
+        // zeta is placed second: it wraps to the next column (alpha's column
+        // is full), landing at the same top — name order still decides first
         close(z.x, 496.0);
         close(z.y, 28.8);
     }
@@ -227,25 +239,27 @@ mod tests {
     #[test]
     fn sibling_subtree_stable_under_edit() {
         // Grow f (10 → 50 lines): b.rs reflows internally and root resizes,
-        // but a.rs — a sibling subtree — keeps its exact position, and g
-        // only shifts along y inside b.rs.
+        // but a.rs — a sibling subtree — keeps its exact position. Under
+        // column-first packing f fills the first column and g wraps to the
+        // second column of b.rs.
         let before = pack(&worked_example(), &cfg());
         let mut edited = worked_example();
         edited.root.children[1].children[0].measure = 50;
         let after = pack(&edited, &cfg());
         assert_eq!(rect(&before, "a.rs"), rect(&after, "a.rs"));
-        // f: 480 × 822.4 now; b.rs: 496 × 925.2; g slides down, same x
+        // f: 480 × 822.4; b.rs grows wide (two columns): 984 × 859.2
         assert_rect(rect(&after, "b.rs::f"), 504.0, 57.6, 480.0, 822.4);
-        assert_rect(rect(&after, "b.rs"), 496.0, 28.8, 496.0, 925.2);
+        assert_rect(rect(&after, "b.rs"), 496.0, 28.8, 984.0, 859.2);
+        // g wraps to b.rs's second column
         let g = rect(&after, "b.rs::g");
-        close(g.x, 504.0);
-        close(g.y, 888.0);
+        close(g.x, 992.0);
+        close(g.y, 57.6);
     }
 
     #[test]
     fn wide_child_sets_the_floor_for_target_width() {
-        // A container whose packed width exceeds √(area·aspect) still fits:
-        // target_w = max(widest child, …) — no child is ever split.
+        // A single child never wraps alone: target_h = max(tallest child,
+        // √(area/aspect)) floors the column height to fit it.
         let tree = SymbolTree {
             root: n(
                 SymbolKind::Folder,
@@ -260,5 +274,65 @@ mod tests {
         // single 480×58 child: content 480×58 → root 496 × 94.8
         assert_rect(rect(&p, "one.rs"), 8.0, 28.8, 480.0, 58.0);
         assert_rect(rect(&p, ""), 0.0, 0.0, 496.0, 94.8);
+    }
+
+    #[test]
+    fn columns_fill_down_then_wrap_right() {
+        // Four equal 480×120.4 pages, aspect 1.6 (test cfg): target_h ≈ 380
+        // holds three per column, the fourth wraps to a second column.
+        let files: Vec<SymbolNode> = (1..=4)
+            .map(|i| n(SymbolKind::File, &format!("c{i}.rs"), &format!("c{i}.rs"), 5, vec![]))
+            .collect();
+        let tree = SymbolTree {
+            root: n(SymbolKind::Folder, "", "", 0, files),
+            repo_root: "/x".into(),
+        };
+        let p = pack(&tree, &cfg());
+        assert_rect(rect(&p, "c1.rs"), 8.0, 28.8, 480.0, 120.4);
+        assert_rect(rect(&p, "c2.rs"), 8.0, 157.2, 480.0, 120.4);
+        assert_rect(rect(&p, "c3.rs"), 8.0, 285.6, 480.0, 120.4);
+        assert_rect(rect(&p, "c4.rs"), 496.0, 28.8, 480.0, 120.4);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 984.0, 414.0);
+    }
+
+    #[test]
+    fn chunk_children_pack_in_source_order_not_label_order() {
+        // Three chunks whose labels sort reverse to their byte order; the
+        // packer must order them by byte_range.start, not by name.
+        let chunk = |label: &str, start: usize, ord: u16| SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Chunk,
+                qualified_path: format!("f.rs#{ord}"),
+                ordinal: ord,
+            },
+            name: label.into(),
+            byte_range: Some(start..start + 10),
+            signature: None,
+            doc: None,
+            measure: 2,
+            churn: 0.0,
+            churn_count: 0,
+            children: vec![],
+        };
+        let mut file = n(
+            SymbolKind::File,
+            "f.rs",
+            "f.rs",
+            12,
+            vec![chunk("zzz", 0, 0_u16), chunk("mmm", 60, 1_u16), chunk("aaa", 120, 2_u16)],
+        );
+        file.byte_range = Some(0..200);
+        let tree = SymbolTree {
+            root: n(SymbolKind::Folder, "", "", 0, vec![file]),
+            repo_root: "/x".into(),
+        };
+        let p = pack(&tree, &cfg());
+        let z = rect(&p, "f.rs#0"); // "zzz", byte 0
+        let m = rect(&p, "f.rs#1"); // "mmm", byte 60
+        let a = rect(&p, "f.rs#2"); // "aaa", byte 120
+        // one column (same x); source order sets the vertical order
+        close(z.x, m.x);
+        close(m.x, a.x);
+        assert!(z.y < m.y && m.y < a.y, "chunks stack zzz(0) < mmm(60) < aaa(120)");
     }
 }
