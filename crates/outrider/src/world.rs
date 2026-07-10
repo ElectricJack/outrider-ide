@@ -66,7 +66,6 @@ pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
 
 /// Draw mode for a leaf page, chosen by on-screen box size (spec §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum LeafDraw {
     Dot,
     Label,

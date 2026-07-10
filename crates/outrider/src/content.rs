@@ -12,7 +12,6 @@ pub const BOTTOM_PAD: f64 = 6.0;
 
 /// Below this on-screen font size a leaf paints its minimap instead of live
 /// text (the text/minimap tier boundary).
-#[allow(dead_code)]
 pub const MIN_TEXT_FONT_PX: f64 = 7.0;
 
 /// A leaf page: has source bytes, no children, and is not a folder.
