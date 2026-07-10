@@ -297,7 +297,7 @@ pub fn frame_leaf(
     while z < z_end && column_table(z, vw, max_level)[level].w < CODE_MIN_W {
         z = (z * 1.25).min(z_end);
     }
-    Some(Camera { center_y: y + h / 2.0, zoom: z.clamp(min_zoom, max_zoom) })
+    Some(Camera { center_x: 0.0, center_y: y + h / 2.0, zoom: z.clamp(min_zoom, max_zoom) })
 }
 
 /// Visible node containing the point. Rects nest (ancestors extend over
@@ -509,7 +509,7 @@ mod tests {
         // extreme zoom on a 40px-wide viewport: gutters alone (24+24) exceed
         // the 38px budget, so depths 0/1 floor at 24 and x2 = 48 > 40 →
         // depth 2 pruned; a.rs is above the viewport (y-pruned)
-        let cam = Camera { center_y: 0.6875, zoom: 1e9 };
+        let cam = Camera { center_x: 0.0, center_y: 0.6875, zoom: 1e9 };
         let items = visible_nodes(&tree, &layout, &cam, 40.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "b.rs"]);
@@ -526,7 +526,7 @@ mod tests {
         // zoomed-past ancestors, clipped to the viewport. With the 4x
         // falloff they compress gradually: weights (7/1280)^⅔, (7/160)^⅔,
         // (7/20)^⅔ normalized to 760 → widths 36.19, 144.76, 579.05
-        let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
+        let cam = Camera { center_x: 0.0, center_y: 0.6875, zoom: 256000.0 / 7.0 };
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         // a.rs and f are entirely above the viewport (y-pruned)
@@ -624,7 +624,7 @@ mod tests {
         let layout = outrider_layout::layout(&tree);
         // the zoomed-past-ancestors scene: root [0,36.19), b.rs [36.19,180.95),
         // g [180.95,760) horizontally; g only spans y ∈ [300, 602]
-        let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
+        let cam = Camera { center_x: 0.0, center_y: 0.6875, zoom: 256000.0 / 7.0 };
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         assert_eq!(hit_test(&items, 10.0, 10.0).unwrap().node.name, "");
         assert_eq!(hit_test(&items, 100.0, 500.0).unwrap().node.name, "b.rs");
@@ -638,7 +638,7 @@ mod tests {
         let tree = worked_example();
         let layout = outrider_layout::layout(&tree);
         // zoomed-past scene: cols w = 36.19, 144.76, 579.05; stack right = 760
-        let cam = Camera { center_y: 0.6875, zoom: 256000.0 / 7.0 };
+        let cam = Camera { center_x: 0.0, center_y: 0.6875, zoom: 256000.0 / 7.0 };
         let items = visible_nodes(&tree, &layout, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "b.rs", "g"]);
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!((items[0].level, items[1].level, items[2].level), (0, 1, 2));
         // a parent whose children are all culled keeps its column edge:
         // the x-prune scene (40px viewport) draws root+b.rs only
-        let cam = Camera { center_y: 0.6875, zoom: 1e9 };
+        let cam = Camera { center_x: 0.0, center_y: 0.6875, zoom: 1e9 };
         let items = visible_nodes(&tree, &layout, &cam, 40.0, 600.0);
         assert!((items[1].px.w - 24.0).abs() < 1e-6); // b.rs: g x-pruned
         assert!((items[0].px.w - 54.0).abs() < 1e-6); // root: 24+24 + NEST_PAD

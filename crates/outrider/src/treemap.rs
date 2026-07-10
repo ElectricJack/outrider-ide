@@ -360,9 +360,10 @@ impl Render for TreemapView {
                 }
                 let Some(last) = this.drag_last else { return };
                 this.cancel_tween();
+                let dx = f64::from(e.position.x - last.x);
                 let dy = f64::from(e.position.y - last.y);
                 if let Some(cam) = this.camera.as_mut() {
-                    cam.pan(dy);
+                    cam.pan(dx, dy);
                 }
                 this.drag_last = Some(e.position);
                 cx.notify();
@@ -373,12 +374,21 @@ impl Render for TreemapView {
                     gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
                     gpui::ScrollDelta::Lines(l) => l.y as f64 * 40.0,
                 };
-                let vh = f64::from(w.viewport_size().height);
+                let vp = w.viewport_size();
+                let (vw, vh) = (f64::from(vp.width), f64::from(vp.height));
                 if let Some(cam) = this.camera.as_mut() {
                     // scroll up (positive dy) zooms in; flip the sign here if
                     // manual testing shows it inverted on this platform
                     let factor = (dy * 0.002).exp();
-                    cam.zoom_about(f64::from(e.position.y), vh, factor, min_zoom, max_zoom);
+                    cam.zoom_about(
+                        f64::from(e.position.x),
+                        f64::from(e.position.y),
+                        vw,
+                        vh,
+                        factor,
+                        min_zoom,
+                        max_zoom,
+                    );
                 }
                 cx.notify();
             }))
