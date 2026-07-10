@@ -1,5 +1,6 @@
 mod buffers;
 mod camera;
+mod chrome;
 mod content;
 mod focus;
 mod theme;
@@ -8,7 +9,9 @@ mod world;
 
 use std::path::PathBuf;
 
-use gpui::{px, size, App, AppContext as _, Bounds, WindowBounds, WindowOptions};
+use gpui::{
+    px, size, App, AppContext as _, Bounds, WindowBounds, WindowDecorations, WindowOptions,
+};
 use gpui_platform::application;
 
 use crate::treemap::TreemapView;
@@ -34,6 +37,10 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                window_decorations: Some(WindowDecorations::Client),
+                app_id: Some("outrider".into()),
+                window_min_size: Some(size(px(480.), px(320.))),
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| TreemapView::new(tree, layout, cx)),
