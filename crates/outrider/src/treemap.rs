@@ -11,7 +11,7 @@ use outrider_layout::{PackLayout, Rect};
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
-use crate::focus::{Focus, TreeIndex};
+use crate::focus::{self, Focus, TreeIndex};
 use crate::theme;
 use crate::world::{self, Rung};
 
@@ -441,7 +441,24 @@ impl Render for TreemapView {
                         this.home_zoom = c.zoom;
                         Some(c)
                     }
-                    // Arrows land in the spatial-step task; Tab stays disabled.
+                    "up" | "down" | "left" | "right" => {
+                        let dir = match e.keystroke.key.as_str() {
+                            "up" => focus::Dir::Up,
+                            "down" => focus::Dir::Down,
+                            "left" => focus::Dir::Left,
+                            _ => focus::Dir::Right,
+                        };
+                        let Some(next) =
+                            focus::spatial_step(&this.focus.current, dir, &this.layout, &index)
+                        else {
+                            return;
+                        };
+                        if !this.focus.set(next, &index) {
+                            return;
+                        }
+                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                    }
+                    // Tab stays disabled — no handler.
                     _ => return,
                 };
                 if let Some(to) = target {
