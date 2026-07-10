@@ -86,7 +86,7 @@ pub fn kind_counts(node: &SymbolNode) -> String {
         }
         return parts.join(" · ");
     }
-    fn count(node: &SymbolNode, c: &mut [usize; 6]) {
+    fn count(node: &SymbolNode, c: &mut [usize; 7]) {
         for k in &node.children {
             match k.id.kind {
                 SymbolKind::Fn => c[0] += 1,
@@ -95,14 +95,15 @@ pub fn kind_counts(node: &SymbolNode) -> String {
                 SymbolKind::Trait => c[3] += 1,
                 SymbolKind::Impl => c[4] += 1,
                 SymbolKind::Module => c[5] += 1,
+                SymbolKind::Chunk => c[6] += 1,
                 SymbolKind::File | SymbolKind::Folder => {}
             }
             count(k, c);
         }
     }
-    let mut c = [0usize; 6];
+    let mut c = [0usize; 7];
     count(node, &mut c);
-    let words = ["fn", "struct", "enum", "trait", "impl", "mod"];
+    let words = ["fn", "struct", "enum", "trait", "impl", "mod", "part"];
     c.iter()
         .zip(words)
         .filter(|(&n, _)| n > 0)
@@ -168,6 +169,7 @@ pub fn body_lines(node: &SymbolNode, rung: Rung) -> Vec<BodyLine> {
                     out
                 }
             }
+            SymbolKind::Chunk => vec![BodyLine::Dim(churn_readout(node))],
             _ => {
                 let mut out = Vec::new();
                 if let Some(sig) = &node.signature {
@@ -415,5 +417,27 @@ mod tests {
         assert!((code_scale(&three, 0.8 * n) - 0.8).abs() < 1e-9);
         // tiny box: exact 7/12 floor, after which the window clips
         assert_eq!(code_scale(&three, 10.0), 7.0 / 12.0);
+    }
+
+    #[test]
+    fn chunked_file_counts_parts_and_chunk_body_is_one_readout() {
+        use BodyLine::Dim;
+        // A File container whose children are Chunk nodes.
+        let mut file = node(SymbolKind::File, "README.md", 120, 0.2, 5, None, None, vec![
+            node(SymbolKind::Chunk, "README.md#0", 60, 0.2, 5, None, None, vec![]),
+            node(SymbolKind::Chunk, "README.md#1", 60, 0.2, 5, None, None, vec![]),
+        ]);
+        file.byte_range = Some(0..1000);
+        assert_eq!(kind_counts(&file), "2 parts");
+        assert_eq!(inventory(&file), "2 parts · 120L · 5 commits · p20");
+        // a single-part edge still pluralizes correctly
+        let one = node(SymbolKind::File, "x.txt", 60, 0.0, 0, None, None, vec![
+            node(SymbolKind::Chunk, "x.txt#0", 60, 0.0, 0, None, None, vec![]),
+        ]);
+        assert_eq!(kind_counts(&one), "1 part");
+        // a Chunk leaf's Full body is exactly its churn readout row
+        let chunk = &file.children[0];
+        assert_eq!(body_lines(chunk, Rung::Full), vec![Dim("60L · 5 commits · p20".into())]);
+        assert_eq!(body_lines(chunk, Rung::Detail), vec![Dim("60L · 5 commits · p20".into())]);
     }
 }

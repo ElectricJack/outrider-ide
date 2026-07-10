@@ -14,6 +14,7 @@ pub enum SymbolKind {
     Trait,
     Impl,
     Fn,
+    Chunk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
