@@ -277,10 +277,11 @@ impl TreemapView {
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            let is_code = item.rung == Rung::Full && content::is_leaf_item(item.node);
+            let is_leaf = content::is_leaf_item(item.node);
+            let is_code = item.rung == Rung::Full && is_leaf;
             let scale =
                 if is_code { content::code_scale(item.node, item.full_h) } else { 1.0 };
-            let fill = if is_code { theme::CODE_BG } else { theme::depth_fill(item.level) };
+            let fill = theme::box_fill(is_leaf, item.level);
             let body = build_body(
                 item.node,
                 item.rung,

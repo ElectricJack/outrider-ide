@@ -41,6 +41,17 @@ pub fn depth_fill(level: u8) -> u32 {
     lerp_rgb(DEPTH_FILL_0, DEPTH_FILL_8, level.min(8) as f32 / 8.0)
 }
 
+/// Box background: leaf pages (code or text) keep the editor background
+/// at every rung — zooming in never changes a leaf's background —
+/// containers use the depth ramp.
+pub fn box_fill(is_leaf_page: bool, level: u8) -> u32 {
+    if is_leaf_page {
+        CODE_BG
+    } else {
+        depth_fill(level)
+    }
+}
+
 /// Border: fill lightened 12% toward white.
 pub fn border_for(fill: u32) -> u32 {
     lerp_rgb(fill, 0xffffff, 0.12)
@@ -102,5 +113,13 @@ mod tests {
         assert_eq!(depth_fill(12), 0x3C3C46); // clamps at level 8
         // t = 0.5 per channel: r,g 23+18.5→42 (0x2a); b 27+21.5→49 (0x31)
         assert_eq!(depth_fill(4), 0x2a2a31);
+    }
+
+    #[test]
+    fn box_fill_leaf_pages_are_editor_black_at_every_depth() {
+        assert_eq!(box_fill(true, 0), CODE_BG);
+        assert_eq!(box_fill(true, 5), CODE_BG);
+        assert_eq!(box_fill(false, 0), depth_fill(0));
+        assert_eq!(box_fill(false, 5), depth_fill(5));
     }
 }
