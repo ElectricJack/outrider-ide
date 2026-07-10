@@ -10,6 +10,18 @@ pub const HEADER: f64 = 4.0 + FONT_PX * 1.4;
 /// Padding below the last body row inside a leaf box.
 pub const BOTTOM_PAD: f64 = 6.0;
 
+/// Floor for scaled code text (spec 4d §4).
+#[allow(dead_code)]
+pub const MIN_CODE_FONT_PX: f64 = 7.0;
+#[allow(dead_code)]
+pub const MIN_CODE_SCALE: f64 = MIN_CODE_FONT_PX / FONT_PX;
+
+/// Shortest leaf box that still shows code: header + three code rows at
+/// the floor font + bottom pad (≈ 54.1px). Below this a leaf drops to the
+/// container ladder (spec 4d §3).
+#[allow(dead_code)]
+pub const LEAF_CODE_MIN_PX: f64 = HEADER + 3.0 * LINE_STEP * MIN_CODE_SCALE + BOTTOM_PAD;
+
 /// A code-bearing leaf: has source bytes, no children, and is an item
 /// (not a file/folder). These are the boxes that render code at Full.
 pub fn is_leaf_item(node: &SymbolNode) -> bool {
@@ -22,6 +34,15 @@ pub fn is_leaf_item(node: &SymbolNode) -> bool {
 /// one row per code line + bottom pad.
 pub fn natural_px(node: &SymbolNode) -> f64 {
     HEADER + (1.0 + node.measure as f64) * LINE_STEP + BOTTOM_PAD
+}
+
+/// Per-box text scale for a Full leaf: 1.0 when the box fits the whole
+/// method, shrinking with the box down to the floor, after which the
+/// window clips. `px_h` must be the UNCLIPPED box height — the clipped
+/// height would wrongly shrink zoomed-in giants (spec 4d §4).
+#[allow(dead_code)]
+pub fn code_scale(node: &SymbolNode, px_h: f64) -> f64 {
+    (px_h / natural_px(node)).clamp(MIN_CODE_SCALE, 1.0)
 }
 
 /// One rendered body line under a box's name row.
@@ -325,5 +346,29 @@ mod tests {
         let parent = node(SymbolKind::Impl, "a.rs::I", 3, 0.0, 0, None, None,
             vec![node(SymbolKind::Fn, "a.rs::I::m", 1, 0.0, 0, None, None, vec![])]);
         assert!(!is_leaf_item(&parent)); // has children
+    }
+
+    #[test]
+    fn leaf_code_min_px_value() {
+        // HEADER 20.8 + 3·15.6·(7/12) + BOTTOM_PAD 6 = 54.1
+        assert!((LEAF_CODE_MIN_PX - 54.1).abs() < 1e-9);
+        assert!((MIN_CODE_SCALE - 7.0 / 12.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn code_scale_clamps_between_floor_and_one() {
+        // measure 3 → natural 89.2 (see natural_px_arithmetic). Compare
+        // against natural_px itself, not a decimal literal: n/n is exactly
+        // 1.0, while a re-typed 89.2 can land one ulp under and miss the top
+        // of the clamp.
+        let three = node(SymbolKind::Fn, "a.rs::f", 3, 0.0, 0, Some("fn f()"), None, vec![]);
+        let n = natural_px(&three);
+        // box fits the whole method (and anything taller): exact 1.0
+        assert_eq!(code_scale(&three, n), 1.0);
+        assert_eq!(code_scale(&three, 500.0), 1.0);
+        // mid value: 80% of natural → 0.8
+        assert!((code_scale(&three, 0.8 * n) - 0.8).abs() < 1e-9);
+        // tiny box: exact 7/12 floor, after which the window clips
+        assert_eq!(code_scale(&three, 10.0), 7.0 / 12.0);
     }
 }
