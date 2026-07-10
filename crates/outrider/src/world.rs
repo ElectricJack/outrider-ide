@@ -70,6 +70,38 @@ pub fn rung_for(px_h: f64, px_w: f64, natural_px: Option<f64>) -> Option<Rung> {
     Some(if rung == Rung::Full && px_w < CODE_MIN_W { Rung::Detail } else { rung })
 }
 
+/// Draw mode for a leaf page, chosen by on-screen box size (spec §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum LeafDraw {
+    Dot,
+    Label,
+    Minimap,
+    Text,
+}
+
+/// Leaf LOD ladder. `None` => merged away (below MERGE_PX). First match wins:
+/// tiny → Dot, short → Label (pinned name), then Text once the font clears
+/// MIN_TEXT_FONT_PX and the column clears CODE_MIN_W, else Minimap.
+#[allow(dead_code)]
+pub fn leaf_draw(ph: f64, pw: f64, natural_px: f64) -> Option<LeafDraw> {
+    if ph < MERGE_PX {
+        return None;
+    }
+    if pw < LABEL_MIN_W || ph < LABEL_PX {
+        return Some(LeafDraw::Dot);
+    }
+    if ph < CARD_PX {
+        return Some(LeafDraw::Label);
+    }
+    let font = content::FONT_PX * ph / natural_px;
+    if font >= content::MIN_TEXT_FONT_PX && pw >= CODE_MIN_W {
+        Some(LeafDraw::Text)
+    } else {
+        Some(LeafDraw::Minimap)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PxRect {
     pub x: f64,
@@ -341,5 +373,46 @@ mod tests {
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "b.rs", "f", "g"]);
+    }
+
+    #[test]
+    fn leaf_draw_tiers_at_their_boundaries() {
+        use LeafDraw::*;
+        // merge
+        assert_eq!(leaf_draw(3.9, 400.0, 100.0), None);
+        // Dot: below LABEL_PX height, or below LABEL_MIN_W width
+        assert_eq!(leaf_draw(4.0, 400.0, 100.0), Some(Dot));
+        assert_eq!(leaf_draw(19.9, 400.0, 100.0), Some(Dot));
+        assert_eq!(leaf_draw(1000.0, 59.9, 100.0), Some(Dot));
+        // Label: [LABEL_PX, CARD_PX) height, wide enough
+        assert_eq!(leaf_draw(20.0, 400.0, 100.0), Some(Label));
+        assert_eq!(leaf_draw(79.9, 400.0, 100.0), Some(Label));
+        // Text: font ≥ 7 (ph/natural ≥ 7/12) AND pw ≥ CODE_MIN_W
+        assert_eq!(leaf_draw(80.0, 400.0, 100.0), Some(Text)); // font 9.6
+        // Minimap: tall page, font sub-7
+        assert_eq!(leaf_draw(80.0, 400.0, 200.0), Some(Minimap)); // font 4.8
+        // width gate forces Minimap even when font clears 7
+        assert_eq!(leaf_draw(80.0, 299.9, 100.0), Some(Minimap));
+    }
+
+    #[test]
+    fn tall_leaf_steps_minimap_then_text_as_it_grows() {
+        use LeafDraw::*;
+        let natural = 3000.0; // ~190-line page
+        // low zoom: box 200px tall → font 0.8 → Minimap
+        assert_eq!(leaf_draw(200.0, 400.0, natural), Some(Minimap));
+        // zoom until font ≥ 7 → ph ≥ 7/12·natural = 1750
+        assert_eq!(leaf_draw(1750.0, 400.0, natural), Some(Text));
+        assert_eq!(leaf_draw(1749.0, 400.0, natural), Some(Minimap));
+    }
+
+    #[test]
+    fn short_leaf_never_enters_minimap() {
+        use LeafDraw::*;
+        // natural ≤ ~137 → at CARD_PX height font already ≥ 7, so a short
+        // leaf steps Label → Text with no Minimap tier.
+        let natural = 100.0;
+        assert_eq!(leaf_draw(79.9, 400.0, natural), Some(Label));
+        assert_eq!(leaf_draw(80.0, 400.0, natural), Some(Text));
     }
 }

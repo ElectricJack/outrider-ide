@@ -10,6 +10,11 @@ pub const HEADER: f64 = 4.0 + FONT_PX * 1.4;
 /// Padding below the last body row inside a leaf box.
 pub const BOTTOM_PAD: f64 = 6.0;
 
+/// Below this on-screen font size a leaf paints its minimap instead of live
+/// text (the text/minimap tier boundary).
+#[allow(dead_code)]
+pub const MIN_TEXT_FONT_PX: f64 = 7.0;
+
 /// Floor for scaled code text (spec 4d §4).
 pub const MIN_CODE_FONT_PX: f64 = 7.0;
 pub const MIN_CODE_SCALE: f64 = MIN_CODE_FONT_PX / FONT_PX;
