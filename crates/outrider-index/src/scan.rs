@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use ignore::WalkBuilder;
 
+use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
 use crate::types::{finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
 /// Parsed per-file payload: item nodes plus the file's `//!` doc block.
@@ -88,7 +89,7 @@ pub fn build_tree(
             (comps, f)
         })
         .collect();
-    let root = build_folder(&root_name, "", &decomposed, rs_children);
+    let root = build_folder(repo_root, &root_name, "", &decomposed, rs_children);
     SymbolTree {
         root,
         repo_root: repo_root.to_path_buf(),
@@ -96,6 +97,7 @@ pub fn build_tree(
 }
 
 fn build_folder(
+    repo_root: &Path,
     name: &str,
     qualified: &str,
     entries: &[(Vec<String>, &ScannedFile)],
@@ -109,10 +111,10 @@ fn build_folder(
             [file_name] => {
                 let qual = join_path(qualified, file_name);
                 let parsed = rs_children.get(&file.rel_path).cloned().unwrap_or_default();
-                children.push(SymbolNode {
+                let mut node = SymbolNode {
                     id: SymbolId {
                         kind: SymbolKind::File,
-                        qualified_path: qual,
+                        qualified_path: qual.clone(),
                         ordinal: 0,
                     },
                     name: file_name.clone(),
@@ -123,7 +125,40 @@ fn build_folder(
                     churn: 0.0,
                     churn_count: 0,
                     children: parsed.items,
-                });
+                };
+                if node.children.is_empty() && file.lines > CHUNK_MAX_LINES as u64 {
+                    if let Ok(text) = std::fs::read_to_string(repo_root.join(&file.rel_path)) {
+                        let ext = file
+                            .rel_path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        let chunks = strategy_for(ext).chunks(&text);
+                        if chunks.len() > 1 {
+                            node.children = chunks
+                                .iter()
+                                .enumerate()
+                                .map(|(i, ch)| SymbolNode {
+                                    id: SymbolId {
+                                        kind: SymbolKind::Chunk,
+                                        qualified_path: format!("{qual}#{i}"),
+                                        ordinal: 0,
+                                    },
+                                    name: ch.label.clone(),
+                                    byte_range: Some(ch.start_byte..ch.end_byte),
+                                    signature: None,
+                                    doc: None,
+                                    measure: (ch.end_line - ch.start_line) as u64,
+                                    churn: 0.0,
+                                    churn_count: 0,
+                                    children: vec![],
+                                })
+                                .collect();
+                            finalize_children(&mut node.children);
+                        }
+                    }
+                }
+                children.push(node);
             }
             [folder, ..] => {
                 by_subfolder
@@ -137,7 +172,7 @@ fn build_folder(
 
     for (folder_name, sub_entries) in &by_subfolder {
         let qual = join_path(qualified, folder_name);
-        children.push(build_folder(folder_name, &qual, sub_entries, rs_children));
+        children.push(build_folder(repo_root, folder_name, &qual, sub_entries, rs_children));
     }
 
     finalize_children(&mut children);
@@ -164,5 +199,58 @@ fn join_path(parent: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{parent}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SymbolKind;
+
+    fn scan_tree(dir: &std::path::Path) -> SymbolTree {
+        let files = scan_files(dir).unwrap();
+        build_tree(dir, &files, &BTreeMap::new())
+    }
+
+    fn child<'a>(root: &'a SymbolNode, name: &str) -> &'a SymbolNode {
+        root.children.iter().find(|c| c.name == name).expect("child present")
+    }
+
+    #[test]
+    fn large_markdown_file_becomes_a_chunk_container() {
+        let dir = tempfile::tempdir().unwrap();
+        // 3 headed sections, each long enough to be its own chunk.
+        let mut text = String::new();
+        for h in ["Alpha", "Beta", "Gamma"] {
+            text.push_str(&format!("# {h}\n"));
+            for i in 0..25 {
+                text.push_str(&format!("line {i}\n"));
+            }
+        }
+        std::fs::write(dir.path().join("BIG.md"), &text).unwrap();
+        let tree = scan_tree(dir.path());
+        let f = child(&tree.root, "BIG.md");
+        assert_eq!(f.id.kind, SymbolKind::File);
+        assert_eq!(f.children.len(), 3);
+        assert!(f.children.iter().all(|c| c.id.kind == SymbolKind::Chunk));
+        // byte ranges are contiguous and cover the whole file, in source order
+        let mut sorted: Vec<&SymbolNode> = f.children.iter().collect();
+        sorted.sort_by_key(|c| c.byte_range.as_ref().unwrap().start);
+        assert_eq!(sorted[0].byte_range.as_ref().unwrap().start, 0);
+        assert_eq!(sorted.last().unwrap().byte_range.as_ref().unwrap().end, text.len());
+        for w in sorted.windows(2) {
+            assert_eq!(w[0].byte_range.as_ref().unwrap().end, w[1].byte_range.as_ref().unwrap().start);
+        }
+        // chunk qualified_path is "{file}#{i}"
+        assert!(f.children.iter().all(|c| c.id.qualified_path.starts_with("BIG.md#")));
+    }
+
+    #[test]
+    fn small_file_stays_a_single_page() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), "one\ntwo\nthree\n").unwrap();
+        let tree = scan_tree(dir.path());
+        let f = child(&tree.root, "small.txt");
+        assert!(f.children.is_empty(), "under threshold: not chunked");
     }
 }
