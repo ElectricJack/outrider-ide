@@ -193,6 +193,33 @@ pub fn js_item_name(node: Node, src: &[u8]) -> String {
     item_name_default(node, src)
 }
 
+fn ts_kind_fn(node_kind: &str, node: Node, src: &[u8]) -> Option<&'static str> {
+    match node_kind {
+        "interface_declaration" => Some("interface"),
+        "enum_declaration" => Some("enum"),
+        "type_alias_declaration" => Some("type"),
+        _ => js_kind_fn(node_kind, node, src),
+    }
+}
+
+pub fn parse_ts_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .context("loading tree-sitter-typescript grammar")?;
+    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    Ok(collect_items(tree.root_node(), source, &ts_kind_fn, &js_item_name))
+}
+
+pub fn parse_tsx_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+        .context("loading tree-sitter-tsx grammar")?;
+    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    Ok(collect_items(tree.root_node(), source, &ts_kind_fn, &js_item_name))
+}
+
 pub fn parse_js_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -287,7 +314,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::types::SymbolKind;
-    use super::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items};
+    use super::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items, parse_ts_items};
 
     const SRC: &str = r#"mod inner {
     pub fn helper() {
@@ -449,6 +476,50 @@ export function exported() {}
                 ("class", "Greeter", 2),
                 ("fn", "add", 0),
                 ("fn", "exported", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_ts_items() {
+        let src = br#"
+function greet(name: string): string {
+    return "hello " + name;
+}
+
+class Greeter {
+    greet(): string {
+        return "hello";
+    }
+}
+
+interface Printable {
+    print(): void;
+}
+
+enum Direction {
+    Up,
+    Down,
+}
+
+type UserId = string;
+
+const add = (a: number, b: number): number => a + b;
+"#;
+        let items = parse_ts_items(src).unwrap();
+        let summary: Vec<(&str, &str)> = items
+            .iter()
+            .map(|i| (i.kind.label(), i.name.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("fn", "greet"),
+                ("class", "Greeter"),
+                ("interface", "Printable"),
+                ("enum", "Direction"),
+                ("type", "UserId"),
+                ("fn", "add"),
             ]
         );
     }
