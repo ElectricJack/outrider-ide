@@ -20,14 +20,14 @@ check_cmd() {
 
 echo "==> Checking prerequisites..."
 
-if ! check_cmd clang; then
-    echo "    Installing clang..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq clang
-fi
+MISSING_PKGS=()
+check_cmd clang  || MISSING_PKGS+=(clang)
+check_cmd lld    || MISSING_PKGS+=(lld)
+check_cmd llvm-lib || MISSING_PKGS+=(llvm)
 
-if ! check_cmd lld; then
-    echo "    Installing lld..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq lld
+if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+    echo "    Installing ${MISSING_PKGS[*]}..."
+    sudo apt-get update -qq && sudo apt-get install -y -qq "${MISSING_PKGS[@]}"
 fi
 
 if ! rustup target list --installed | grep -q "$TARGET"; then
@@ -40,9 +40,15 @@ if ! check_cmd cargo-xwin; then
     cargo install cargo-xwin
 fi
 
+GPUI_SRC="$(find "$HOME/.cargo/git/checkouts" -maxdepth 4 -path '*/crates/gpui' -type d 2>/dev/null | head -1)"
+if [ -z "$GPUI_SRC" ]; then
+    echo "    Warning: could not locate gpui source checkout for INCLUDE path."
+    echo "    The build may fail on the Windows manifest resource."
+fi
+
 echo "==> Building for $TARGET..."
 cd "$PROJECT_ROOT"
-cargo xwin "${CARGO_XWIN_ARGS[@]}"
+INCLUDE="${GPUI_SRC:-}" cargo xwin "${CARGO_XWIN_ARGS[@]}"
 
 PROFILE="debug"
 for arg in "$@"; do
