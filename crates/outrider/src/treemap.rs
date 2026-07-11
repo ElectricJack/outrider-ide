@@ -826,31 +826,28 @@ impl Render for TreemapView {
                                 );
                             }
                         }
-                        // Pass 2b: header backgrounds (on top of leaf text).
-                        for item in &items {
-                            if item.header_bg_h > 0.0 {
-                                let hb = Bounds::new(
-                                    point(
-                                        origin.x + px(item.x + 1.0),
-                                        origin.y + px(item.header_bg_y + 1.0),
-                                    ),
-                                    size(px((item.w - 2.0).max(0.0)), px(item.header_bg_h)),
-                                );
-                                window.paint_quad(quad(
-                                    hb,
-                                    px(0.),
-                                    rgb(item.fill),
-                                    px(0.),
-                                    rgb(item.fill),
-                                    BorderStyle::default(),
-                                ));
-                            }
-                        }
-                        // Pass 2c: header text (on top of header backgrounds).
+                        // Pass 2b: headers, background + text interleaved per
+                        // item in DFS order, so a later (right/below) header's
+                        // opaque background covers earlier headers' text.
                         for item in &items {
                             if item.header_bg_h == 0.0 {
                                 continue;
                             }
+                            let hb = Bounds::new(
+                                point(
+                                    origin.x + px(item.x + 1.0),
+                                    origin.y + px(item.header_bg_y + 1.0),
+                                ),
+                                size(px((item.w - 2.0).max(0.0)), px(item.header_bg_h)),
+                            );
+                            window.paint_quad(quad(
+                                hb,
+                                px(0.),
+                                rgb(item.fill),
+                                px(0.),
+                                rgb(item.fill),
+                                BorderStyle::default(),
+                            ));
                             if let Some(n) = &item.name {
                                 let line = window.text_system().shape_line(
                                     n.text.clone().into(),
