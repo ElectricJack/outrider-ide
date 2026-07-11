@@ -200,8 +200,8 @@ mod tests {
                         "b.rs",
                         "b.rs",
                         vec![
-                            n(SymbolKind::Fn, "b.rs::f", "f", vec![]),
-                            n(SymbolKind::Fn, "b.rs::g", "g", vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", vec![]),
                         ],
                     ),
                 ],
@@ -230,7 +230,7 @@ mod tests {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
-        f.set(id(SymbolKind::Fn, "b.rs::f"), &idx);
+        f.set(id(SymbolKind::Item { label: "fn".into() }, "b.rs::f"), &idx);
         assert!(f.step_out(&idx));
         assert_eq!(f.current, id(SymbolKind::File, "b.rs"));
         assert!(f.step_out(&idx));
@@ -243,10 +243,10 @@ mod tests {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
-        f.set(id(SymbolKind::Fn, "b.rs::g"), &idx);
+        f.set(id(SymbolKind::Item { label: "fn".into() }, "b.rs::g"), &idx);
         f.step_out(&idx); // b.rs
         assert!(f.step_in(&idx));
-        assert_eq!(f.current, id(SymbolKind::Fn, "b.rs::g")); // last visited, not first
+        assert_eq!(f.current, id(SymbolKind::Item { label: "fn".into() }, "b.rs::g")); // last visited, not first
     }
 
     #[test]
@@ -293,15 +293,15 @@ mod tests {
                         SymbolKind::File,
                         "a.rs",
                         "a.rs",
-                        vec![n(SymbolKind::Fn, "a.rs::x", "x", vec![])],
+                        vec![n(SymbolKind::Item { label: "fn".into() }, "a.rs::x", "x", vec![])],
                     ),
                     n(
                         SymbolKind::File,
                         "b.rs",
                         "b.rs",
                         vec![
-                            n(SymbolKind::Fn, "b.rs::f", "f", vec![]),
-                            n(SymbolKind::Fn, "b.rs::g", "g", vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", vec![]),
                         ],
                     ),
                 ],
@@ -316,8 +316,8 @@ mod tests {
         let idx = TreeIndex::new(&t);
         assert_eq!(idx.depth(&t.root.id), Some(0));
         assert_eq!(idx.depth(&id(SymbolKind::File, "b.rs")), Some(1));
-        assert_eq!(idx.depth(&id(SymbolKind::Fn, "b.rs::g")), Some(2));
-        assert_eq!(idx.depth(&id(SymbolKind::Fn, "nope")), None);
+        assert_eq!(idx.depth(&id(SymbolKind::Item { label: "fn".into() }, "b.rs::g")), Some(2));
+        assert_eq!(idx.depth(&id(SymbolKind::Item { label: "fn".into() }, "nope")), None);
     }
 
     #[test]
@@ -327,9 +327,9 @@ mod tests {
         let p = outrider_layout::pack(&t, &cfg());
         // packed geometry: x (16, 57.6), f (16, 160.4), g (16, 226.4) —
         // one column of depth-2 pages spanning two files
-        let x = id(SymbolKind::Fn, "a.rs::x");
-        let f = id(SymbolKind::Fn, "b.rs::f");
-        let g = id(SymbolKind::Fn, "b.rs::g");
+        let x = id(SymbolKind::Item { label: "fn".into() }, "a.rs::x");
+        let f = id(SymbolKind::Item { label: "fn".into() }, "b.rs::f");
+        let g = id(SymbolKind::Item { label: "fn".into() }, "b.rs::g");
         assert_eq!(spatial_step(&x, Dir::Down, &p, &idx), Some(f.clone())); // into b.rs
         assert_eq!(spatial_step(&f, Dir::Up, &p, &idx), Some(x.clone())); // back into a.rs
         assert_eq!(spatial_step(&g, Dir::Up, &p, &idx), Some(f.clone())); // nearest, not x
@@ -356,9 +356,9 @@ mod tests {
                 "",
                 "",
                 vec![
-                    n(SymbolKind::Fn, "c", "c", vec![]),
-                    n(SymbolKind::Fn, "p", "p", vec![]),
-                    n(SymbolKind::Fn, "q", "q", vec![]),
+                    n(SymbolKind::Item { label: "fn".into() }, "c", "c", vec![]),
+                    n(SymbolKind::Item { label: "fn".into() }, "p", "p", vec![]),
+                    n(SymbolKind::Item { label: "fn".into() }, "q", "q", vec![]),
                 ],
             ),
             repo_root: std::path::PathBuf::from("/x"),
@@ -370,7 +370,7 @@ mod tests {
         let t = scoring_tree();
         let idx = TreeIndex::new(&t);
         let (c, p, q) =
-            (id(SymbolKind::Fn, "c"), id(SymbolKind::Fn, "p"), id(SymbolKind::Fn, "q"));
+            (id(SymbolKind::Item { label: "fn".into() }, "c"), id(SymbolKind::Item { label: "fn".into() }, "p"), id(SymbolKind::Item { label: "fn".into() }, "q"));
         // p: straight right, farther (primary 20, ortho 0 → 20);
         // q: nearer in x but 20 off-axis (primary 12, ortho 20 → 52)
         let lay = hand_layout(&[
@@ -416,7 +416,7 @@ mod tests {
                         SymbolKind::File,
                         "b.rs",
                         "b.rs",
-                        vec![leaf(SymbolKind::Fn, "b.rs::f", "f", vec![])],
+                        vec![leaf(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![])],
                     ),
                 ],
             ),
@@ -429,7 +429,7 @@ mod tests {
         let t = leaf_depth_tree();
         let idx = TreeIndex::new(&t);
         let a_md = id(SymbolKind::File, "a.md");
-        let f = id(SymbolKind::Fn, "b.rs::f");
+        let f = id(SymbolKind::Item { label: "fn".into() }, "b.rs::f");
         // Column top→bottom: a.md (leaf d1), dir (empty folder d1),
         // b.rs (container d1), f (leaf d2). Only a.md and f are leaf pages.
         let lay = hand_layout(&[

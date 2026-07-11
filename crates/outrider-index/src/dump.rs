@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use crate::types::{SymbolNode, SymbolTree};
+use crate::types::{SymbolKind, SymbolNode, SymbolTree};
 
 pub fn render(tree: &SymbolTree) -> String {
     let mut out = String::new();
@@ -8,12 +8,21 @@ pub fn render(tree: &SymbolTree) -> String {
     out
 }
 
+fn kind_label(kind: &SymbolKind) -> String {
+    match kind {
+        SymbolKind::Folder => "Folder".into(),
+        SymbolKind::File => "File".into(),
+        SymbolKind::Chunk => "Chunk".into(),
+        SymbolKind::Item { label } => label.clone(),
+    }
+}
+
 fn render_node(node: &SymbolNode, depth: usize, out: &mut String) {
     writeln!(
         out,
-        "{:indent$}{:?} {} [{} lines, churn {} · p{:.0}]",
+        "{:indent$}{} {} [{} lines, churn {} · p{:.0}]",
         "",
-        node.id.kind,
+        kind_label(&node.id.kind),
         node.name,
         node.measure,
         node.churn_count,

@@ -115,7 +115,7 @@ mod tests {
     }
 
     fn fn_id(qual: &str) -> SymbolId {
-        SymbolId { kind: SymbolKind::Fn, qualified_path: qual.into(), ordinal: 0 }
+        SymbolId { kind: SymbolKind::Item { label: "fn".into() }, qualified_path: qual.into(), ordinal: 0 }
     }
 
     #[test]
@@ -194,10 +194,10 @@ mod tests {
                     "a.rs",
                     Some(0..40),
                     vec![node(
-                        SymbolKind::Impl,
+                        SymbolKind::Item { label: "impl".into() },
                         "a.rs::T",
                         Some(0..30),
-                        vec![node(SymbolKind::Fn, "a.rs::T::m", Some(10..25), vec![])],
+                        vec![node(SymbolKind::Item { label: "fn".into() }, "a.rs::T::m", Some(10..25), vec![])],
                     )],
                 )],
             ),
@@ -209,11 +209,11 @@ mod tests {
             .get("a.rs")
             .unwrap()
             .iter()
-            .map(|(id, s)| (id.qualified_path.as_str(), id.kind, *s))
+            .map(|(id, s)| (id.qualified_path.as_str(), id.kind.clone(), *s))
             .collect();
         assert_eq!(
             got,
-            vec![("a.rs::T", SymbolKind::Impl, 0), ("a.rs::T::m", SymbolKind::Fn, 10)]
+            vec![("a.rs::T", SymbolKind::Item { label: "impl".into() }, 0), ("a.rs::T::m", SymbolKind::Item { label: "fn".into() }, 10)]
         );
     }
 
@@ -243,7 +243,7 @@ mod tests {
                         SymbolKind::File,
                         "a.rs",
                         Some(0..40),
-                        vec![node(SymbolKind::Fn, "a.rs::f", Some(5..30), vec![])],
+                        vec![node(SymbolKind::Item { label: "fn".into() }, "a.rs::f", Some(5..30), vec![])],
                     ),
                 ],
             ),

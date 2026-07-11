@@ -241,8 +241,8 @@ mod tests {
                         "b.rs",
                         10,
                         vec![
-                            n(SymbolKind::Fn, "b.rs::f", "f", 10, vec![]),
-                            n(SymbolKind::Fn, "b.rs::g", "g", 1, vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", 10, vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", 1, vec![]),
                         ],
                     ),
                 ],

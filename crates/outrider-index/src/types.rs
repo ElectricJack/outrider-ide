@@ -4,17 +4,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Folder,
     File,
-    Module,
-    Struct,
-    Enum,
-    Trait,
-    Impl,
-    Fn,
     Chunk,
+    Item { label: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -76,7 +71,7 @@ pub fn finalize_children(children: &mut [SymbolNode]) {
 pub fn dedupe_ids(root: &mut SymbolNode) {
     fn walk(node: &mut SymbolNode, seen: &mut BTreeMap<(SymbolKind, String), u16>) {
         let next = seen
-            .entry((node.id.kind, node.id.qualified_path.clone()))
+            .entry((node.id.kind.clone(), node.id.qualified_path.clone()))
             .or_insert(0);
         if node.id.ordinal < *next {
             node.id.ordinal = *next;
@@ -96,7 +91,7 @@ mod tests {
     fn mk(name: &str) -> SymbolNode {
         SymbolNode {
             id: SymbolId {
-                kind: SymbolKind::Impl,
+                kind: SymbolKind::Item { label: "impl".into() },
                 qualified_path: format!("f.rs::{name}"),
                 ordinal: 0,
             },
@@ -134,12 +129,37 @@ mod tests {
     }
 
     #[test]
+    fn item_kind_serde_roundtrip() {
+        let tree = SymbolTree {
+            root: SymbolNode {
+                id: SymbolId {
+                    kind: SymbolKind::Item { label: "fn".into() },
+                    qualified_path: "f.rs::main".into(),
+                    ordinal: 0,
+                },
+                name: "main".to_string(),
+                byte_range: None,
+                signature: None,
+                doc: None,
+                measure: 1,
+                churn: 0.0,
+                churn_count: 0,
+                children: vec![],
+            },
+            repo_root: std::path::PathBuf::from("/tmp/x"),
+        };
+        let json = serde_json::to_string(&tree).unwrap();
+        let back: SymbolTree = serde_json::from_str(&json).unwrap();
+        assert_eq!(tree, back);
+    }
+
+    #[test]
     fn dedupe_ids_disambiguates_cross_scope_duplicates() {
         // Simulates two cfg-gated `mod imp` blocks, each containing `fn connect`.
         let mk_mod = || {
             SymbolNode {
                 id: SymbolId {
-                    kind: SymbolKind::Module,
+                    kind: SymbolKind::Item { label: "module".into() },
                     qualified_path: "net.rs::imp".into(),
                     ordinal: 0,
                 },
@@ -152,7 +172,7 @@ mod tests {
                 churn_count: 0,
                 children: vec![SymbolNode {
                     id: SymbolId {
-                        kind: SymbolKind::Fn,
+                        kind: SymbolKind::Item { label: "fn".into() },
                         qualified_path: "net.rs::imp::connect".into(),
                         ordinal: 0,
                     },

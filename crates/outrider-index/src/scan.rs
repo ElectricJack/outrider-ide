@@ -66,12 +66,12 @@ fn count_lines(bytes: &[u8]) -> u64 {
     }
 }
 
-/// Build the folder/file skeleton. `rs_children` maps a file's rel_path to its
+/// Build the folder/file skeleton. `parsed_children` maps a file's rel_path to its
 /// parsed contents (item nodes plus the file's `//!` doc block).
 pub fn build_tree(
     repo_root: &Path,
     files: &[ScannedFile],
-    rs_children: &BTreeMap<PathBuf, ParsedFile>,
+    parsed_children: &BTreeMap<PathBuf, ParsedFile>,
 ) -> SymbolTree {
     let root_name = repo_root
         .file_name()
@@ -89,7 +89,7 @@ pub fn build_tree(
             (comps, f)
         })
         .collect();
-    let root = build_folder(repo_root, &root_name, "", &decomposed, rs_children);
+    let root = build_folder(repo_root, &root_name, "", &decomposed, parsed_children);
     SymbolTree {
         root,
         repo_root: repo_root.to_path_buf(),
@@ -101,7 +101,7 @@ fn build_folder(
     name: &str,
     qualified: &str,
     entries: &[(Vec<String>, &ScannedFile)],
-    rs_children: &BTreeMap<PathBuf, ParsedFile>,
+    parsed_children: &BTreeMap<PathBuf, ParsedFile>,
 ) -> SymbolNode {
     let mut children: Vec<SymbolNode> = Vec::new();
     let mut by_subfolder: BTreeMap<String, Vec<(Vec<String>, &ScannedFile)>> = BTreeMap::new();
@@ -110,7 +110,7 @@ fn build_folder(
         match comps.as_slice() {
             [file_name] => {
                 let qual = join_path(qualified, file_name);
-                let parsed = rs_children.get(&file.rel_path).cloned().unwrap_or_default();
+                let parsed = parsed_children.get(&file.rel_path).cloned().unwrap_or_default();
                 let mut node = SymbolNode {
                     id: SymbolId {
                         kind: SymbolKind::File,
@@ -172,7 +172,7 @@ fn build_folder(
 
     for (folder_name, sub_entries) in &by_subfolder {
         let qual = join_path(qualified, folder_name);
-        children.push(build_folder(repo_root, folder_name, &qual, sub_entries, rs_children));
+        children.push(build_folder(repo_root, folder_name, &qual, sub_entries, parsed_children));
     }
 
     finalize_children(&mut children);

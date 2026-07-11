@@ -73,28 +73,22 @@ pub fn kind_counts(node: &SymbolNode) -> String {
         }
         return parts.join(" · ");
     }
-    fn count(node: &SymbolNode, c: &mut [usize; 7]) {
+    fn count(node: &SymbolNode, counts: &mut std::collections::BTreeMap<String, usize>) {
         for k in &node.children {
-            match k.id.kind {
-                SymbolKind::Fn => c[0] += 1,
-                SymbolKind::Struct => c[1] += 1,
-                SymbolKind::Enum => c[2] += 1,
-                SymbolKind::Trait => c[3] += 1,
-                SymbolKind::Impl => c[4] += 1,
-                SymbolKind::Module => c[5] += 1,
-                SymbolKind::Chunk => c[6] += 1,
+            match &k.id.kind {
+                SymbolKind::Item { label } => *counts.entry(label.clone()).or_insert(0) += 1,
+                SymbolKind::Chunk => *counts.entry("part".to_string()).or_insert(0) += 1,
                 SymbolKind::File | SymbolKind::Folder => {}
             }
-            count(k, c);
+            count(k, counts);
         }
     }
-    let mut c = [0usize; 7];
-    count(node, &mut c);
-    let words = ["fn", "struct", "enum", "trait", "impl", "mod", "part"];
-    c.iter()
-        .zip(words)
-        .filter(|(&n, _)| n > 0)
-        .map(|(&n, w)| plural(n, w))
+    let mut counts = std::collections::BTreeMap::new();
+    count(node, &mut counts);
+    counts
+        .iter()
+        .filter(|(_, &n)| n > 0)
+        .map(|(w, &n)| plural(n, w))
         .collect::<Vec<_>>()
         .join(" · ")
 }
@@ -157,7 +151,7 @@ pub fn body_lines(node: &SymbolNode, rung: Rung) -> Vec<BodyLine> {
                 }
             }
             SymbolKind::Chunk => vec![BodyLine::Dim(churn_readout(node))],
-            _ => {
+            SymbolKind::Item { .. } => {
                 let mut out = Vec::new();
                 if let Some(sig) = &node.signature {
                     out.push(BodyLine::Plain(sig.clone()));
@@ -212,9 +206,9 @@ mod tests {
             None,
             Some("Doc first.\nDoc second."),
             vec![
-                node(SymbolKind::Struct, "m.rs::Point", 4, 0.5, 3, Some("struct Point"), None, vec![]),
+                node(SymbolKind::Item { label: "struct".into() }, "m.rs::Point", 4, 0.5, 3, Some("struct Point"), None, vec![]),
                 node(
-                    SymbolKind::Impl,
+                    SymbolKind::Item { label: "impl".into() },
                     "m.rs::Point",
                     9,
                     0.5,
@@ -222,11 +216,11 @@ mod tests {
                     Some("impl Point"),
                     None,
                     vec![
-                        node(SymbolKind::Fn, "m.rs::Point::new", 3, 0.5, 3, Some("fn new() -> Self"), None, vec![]),
-                        node(SymbolKind::Fn, "m.rs::Point::norm", 3, 0.5, 3, Some("fn norm(&self) -> f64"), None, vec![]),
+                        node(SymbolKind::Item { label: "fn".into() }, "m.rs::Point::new", 3, 0.5, 3, Some("fn new() -> Self"), None, vec![]),
+                        node(SymbolKind::Item { label: "fn".into() }, "m.rs::Point::norm", 3, 0.5, 3, Some("fn norm(&self) -> f64"), None, vec![]),
                     ],
                 ),
-                node(SymbolKind::Fn, "m.rs::free", 3, 0.5, 3, Some("fn free()"), None, vec![]),
+                node(SymbolKind::Item { label: "fn".into() }, "m.rs::free", 3, 0.5, 3, Some("fn free()"), None, vec![]),
             ],
         )
     }
@@ -252,8 +246,8 @@ mod tests {
     fn inventory_strings_are_exact() {
         let f = file();
         assert_eq!(churn_readout(&f), "480L · 47 commits · p96");
-        assert_eq!(kind_counts(&f), "3 fns · 1 struct · 1 impl");
-        assert_eq!(inventory(&f), "3 fns · 1 struct · 1 impl · 480L · 47 commits · p96");
+        assert_eq!(kind_counts(&f), "3 fns · 1 impl · 1 struct");
+        assert_eq!(inventory(&f), "3 fns · 1 impl · 1 struct · 480L · 47 commits · p96");
         let d = folder();
         assert_eq!(kind_counts(&d), "2 files · 1 folder");
         assert_eq!(inventory(&d), "2 files · 1 folder · 812L · 12 commits · p40");
@@ -288,7 +282,7 @@ mod tests {
             vec![
                 Dim("480L · 47 commits · p96".into()),
                 Plain("Doc first.".into()),
-                Dim("3 fns · 1 struct · 1 impl".into()),
+                Dim("3 fns · 1 impl · 1 struct".into()),
             ]
         );
         // file Full: whole doc block + inventory
@@ -343,15 +337,15 @@ mod tests {
     #[test]
     fn natural_px_arithmetic() {
         // HEADER 20.8 + (1 + measure)·15.6 + BOTTOM_PAD 6
-        let three = node(SymbolKind::Fn, "a.rs::f", 3, 0.0, 0, Some("fn f()"), None, vec![]);
+        let three = node(SymbolKind::Item { label: "fn".into() }, "a.rs::f", 3, 0.0, 0, Some("fn f()"), None, vec![]);
         assert!((natural_px(&three) - 89.2).abs() < 1e-9);
-        let long = node(SymbolKind::Fn, "a.rs::g", 200, 0.0, 0, Some("fn g()"), None, vec![]);
+        let long = node(SymbolKind::Item { label: "fn".into() }, "a.rs::g", 200, 0.0, 0, Some("fn g()"), None, vec![]);
         assert!((natural_px(&long) - 3162.4).abs() < 1e-9);
     }
 
     #[test]
     fn leaf_item_predicate() {
-        let mut f = node(SymbolKind::Fn, "a.rs::f", 3, 0.0, 0, None, None, vec![]);
+        let mut f = node(SymbolKind::Item { label: "fn".into() }, "a.rs::f", 3, 0.0, 0, None, None, vec![]);
         assert!(!is_leaf_item(&f)); // no byte_range
         f.byte_range = Some(0..10);
         assert!(is_leaf_item(&f));
@@ -369,7 +363,7 @@ mod tests {
             0,
             None,
             None,
-            vec![node(SymbolKind::Fn, "a.rs::f", 1, 0.0, 0, None, None, vec![])],
+            vec![node(SymbolKind::Item { label: "fn".into() }, "a.rs::f", 1, 0.0, 0, None, None, vec![])],
         );
         parent_file.byte_range = Some(0..10);
         assert!(!is_leaf_item(&parent_file));
@@ -377,8 +371,8 @@ mod tests {
         let mut folder = node(SymbolKind::Folder, "src", 3, 0.0, 0, None, None, vec![]);
         folder.byte_range = Some(0..10);
         assert!(!is_leaf_item(&folder));
-        let parent = node(SymbolKind::Impl, "a.rs::I", 3, 0.0, 0, None, None,
-            vec![node(SymbolKind::Fn, "a.rs::I::m", 1, 0.0, 0, None, None, vec![])]);
+        let parent = node(SymbolKind::Item { label: "impl".into() }, "a.rs::I", 3, 0.0, 0, None, None,
+            vec![node(SymbolKind::Item { label: "fn".into() }, "a.rs::I::m", 1, 0.0, 0, None, None, vec![])]);
         assert!(!is_leaf_item(&parent)); // has children
     }
 

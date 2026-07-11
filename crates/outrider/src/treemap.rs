@@ -829,7 +829,7 @@ mod tests {
     fn leaf_text_body_paints_signature_and_code_at_scale_one() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
-        let leaf = node(SymbolKind::Fn, "a.rs::two", Some(12..23), 1, Some("fn two()"), None);
+        let leaf = node(SymbolKind::Item { label: "fn".into() }, "a.rs::two", Some(12..23), 1, Some("fn two()"), None);
         let mut mgr = BufferManager::new(dir.path().to_path_buf());
         let mut file_symbols = BTreeMap::new();
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
@@ -852,7 +852,7 @@ mod tests {
     fn leaf_text_body_scales_uniformly_past_one() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
-        let leaf = node(SymbolKind::Fn, "a.rs::two", Some(12..23), 1, Some("fn two()"), None);
+        let leaf = node(SymbolKind::Item { label: "fn".into() }, "a.rs::two", Some(12..23), 1, Some("fn two()"), None);
         let mut mgr = BufferManager::new(dir.path().to_path_buf());
         let mut file_symbols = BTreeMap::new();
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);

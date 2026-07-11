@@ -48,12 +48,12 @@ fn collect_items(node: Node, src: &[u8]) -> Vec<RawItem> {
 
 fn item_kind(node_kind: &str) -> Option<SymbolKind> {
     match node_kind {
-        "mod_item" => Some(SymbolKind::Module),
-        "struct_item" => Some(SymbolKind::Struct),
-        "enum_item" => Some(SymbolKind::Enum),
-        "trait_item" => Some(SymbolKind::Trait),
-        "impl_item" => Some(SymbolKind::Impl),
-        "function_item" => Some(SymbolKind::Fn),
+        "mod_item" => Some(SymbolKind::Item { label: "module".into() }),
+        "struct_item" => Some(SymbolKind::Item { label: "struct".into() }),
+        "enum_item" => Some(SymbolKind::Item { label: "enum".into() }),
+        "trait_item" => Some(SymbolKind::Item { label: "trait".into() }),
+        "impl_item" => Some(SymbolKind::Item { label: "impl".into() }),
+        "function_item" => Some(SymbolKind::Item { label: "fn".into() }),
         _ => None,
     }
 }
@@ -145,21 +145,21 @@ fn free() {
         let items = parse_rust_items(SRC.as_bytes()).unwrap();
         let summary: Vec<(SymbolKind, &str, usize)> = items
             .iter()
-            .map(|i| (i.kind, i.name.as_str(), i.children.len()))
+            .map(|i| (i.kind.clone(), i.name.as_str(), i.children.len()))
             .collect();
         assert_eq!(
             summary,
             vec![
-                (SymbolKind::Module, "inner", 1),
-                (SymbolKind::Struct, "Point", 0),
-                (SymbolKind::Impl, "Point", 2),
-                (SymbolKind::Fn, "free", 0),
+                (SymbolKind::Item { label: "module".into() }, "inner", 1),
+                (SymbolKind::Item { label: "struct".into() }, "Point", 0),
+                (SymbolKind::Item { label: "impl".into() }, "Point", 2),
+                (SymbolKind::Item { label: "fn".into() }, "free", 0),
             ]
         );
 
         // nested fn inside mod
         assert_eq!(items[0].children[0].name, "helper");
-        assert_eq!(items[0].children[0].kind, SymbolKind::Fn);
+        assert_eq!(items[0].children[0].kind, SymbolKind::Item { label: "fn".into() });
 
         // methods inside impl, in source order at this stage
         let methods: Vec<&str> = items[2].children.iter().map(|c| c.name.as_str()).collect();
@@ -175,9 +175,9 @@ fn free() {
     fn trait_impl_name_includes_trait() {
         let src = b"trait Show {}\nimpl Show for i32 {}\n";
         let items = parse_rust_items(src).unwrap();
-        assert_eq!(items[0].kind, SymbolKind::Trait);
+        assert_eq!(items[0].kind, SymbolKind::Item { label: "trait".into() });
         assert_eq!(items[0].name, "Show");
-        assert_eq!(items[1].kind, SymbolKind::Impl);
+        assert_eq!(items[1].kind, SymbolKind::Item { label: "impl".into() });
         assert_eq!(items[1].name, "Show for i32");
     }
 

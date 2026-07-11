@@ -23,25 +23,25 @@ fn index_repo_parses_rust_files_into_items() {
     let kids: Vec<(&str, SymbolKind, u16)> = lib
         .children
         .iter()
-        .map(|c| (c.name.as_str(), c.id.kind, c.id.ordinal))
+        .map(|c| (c.name.as_str(), c.id.kind.clone(), c.id.ordinal))
         .collect();
     assert_eq!(
         kids,
         vec![
-            ("Point", SymbolKind::Struct, 0), // struct appears before impl in source
-            ("Point", SymbolKind::Impl, 1),
-            ("free", SymbolKind::Fn, 0),
-            ("inner", SymbolKind::Module, 0),
+            ("Point", SymbolKind::Item { label: "struct".into() }, 0), // struct appears before impl in source
+            ("Point", SymbolKind::Item { label: "impl".into() }, 1),
+            ("free", SymbolKind::Item { label: "fn".into() }, 0),
+            ("inner", SymbolKind::Item { label: "module".into() }, 0),
         ]
     );
 
     // nesting + qualified paths
     let helper = find(&tree.root, "src/lib.rs::inner::helper").expect("nested fn");
-    assert_eq!(helper.id.kind, SymbolKind::Fn);
+    assert_eq!(helper.id.kind, SymbolKind::Item { label: "fn".into() });
     assert!(helper.byte_range.is_some());
 
     let norm = find(&tree.root, "src/lib.rs::Point::norm").expect("method");
-    assert_eq!(norm.id.kind, SymbolKind::Fn);
+    assert_eq!(norm.id.kind, SymbolKind::Item { label: "fn".into() });
     assert_eq!(norm.measure, 3); // 3-line method body span
 
     // Phase 4b metadata: signature + doc (spec §3.1)

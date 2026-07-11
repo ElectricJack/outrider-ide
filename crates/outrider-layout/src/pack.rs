@@ -62,7 +62,7 @@ fn size(
     }
     // Re-derive the ordering invariant locally; never trust input Vec order.
     let mut order: Vec<&SymbolNode> = node.children.iter().collect();
-    if order.first().map(|c| c.id.kind) == Some(SymbolKind::Chunk) {
+    if order.first().map(|c| c.id.kind.clone()) == Some(SymbolKind::Chunk) {
         // Chunk children pack in source order, ignoring their heading labels.
         order.sort_by(|a, b| {
             let ka = a.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
@@ -163,8 +163,8 @@ mod tests {
                         "b.rs",
                         40,
                         vec![
-                            n(SymbolKind::Fn, "b.rs::f", "f", 10, vec![]),
-                            n(SymbolKind::Fn, "b.rs::g", "g", 1, vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", 10, vec![]),
+                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", 1, vec![]),
                         ],
                     ),
                 ],
