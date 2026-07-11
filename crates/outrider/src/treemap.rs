@@ -151,7 +151,6 @@ fn container_body(
     node: &SymbolNode,
     rung: Rung,
     px: &world::PxRect,
-    left: f64,
     label_w: f64,
     vh: f64,
     pin_y: f64,
@@ -173,7 +172,7 @@ fn container_body(
         if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
             let len = shown.len();
             out.push(BodyText {
-                x: (left + BODY_PAD) as f32,
+                x: (px.x + BODY_PAD) as f32,
                 y: y as f32,
                 text: shown,
                 runs: vec![(len, color)],
@@ -485,7 +484,7 @@ impl TreemapView {
                         name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
                     }
                     body = container_body(
-                        item.node, rung, &item.px, item.left, item.label_w, vh, pin_y,
+                        item.node, rung, &item.px, item.label_w, vh, pin_y,
                     );
                     if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
                         header_bg_h = (HEADER + body.len() as f64 * LINE_STEP) as f32;
@@ -949,7 +948,7 @@ mod tests {
     fn container_body_positions_detail_lines() {
         let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
-        let body = container_body(&f, Rung::Detail, &px, 0.0, 400.0, 600.0, px.y);
+        let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y);
         // churn readout + doc first line (no items → no kind-counts line)
         assert_eq!(body.len(), 2);
         assert_eq!(body[1].text, "Doc line.");
