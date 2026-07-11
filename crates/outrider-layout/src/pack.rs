@@ -64,6 +64,67 @@ fn kind_rank(kind: &SymbolKind) -> u8 {
     }
 }
 
+/// Documentation file extensions: these sink below source siblings when
+/// packing a folder.
+fn is_doc_ext(ext: &str) -> bool {
+    matches!(ext, "md" | "markdown" | "txt" | "rst")
+}
+
+/// Extensions whose files read top-to-bottom: prose plus declare-before-
+/// use languages (C/C++). Their children pack in source order at every
+/// nesting level instead of kind/size order.
+fn is_source_ordered_ext(ext: &str) -> bool {
+    is_doc_ext(ext)
+        || matches!(ext, "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" | "inl")
+}
+
+/// Extension of the file part of a qualified path: everything before the
+/// first `::` (and before any `#` chunk suffix), then after the last `.`.
+fn file_ext(qualified_path: &str) -> Option<&str> {
+    let file = qualified_path.split("::").next().unwrap_or(qualified_path);
+    let file = file.split('#').next().unwrap_or(file);
+    file.rfind('.').map(|dot| &file[dot + 1..])
+}
+
+fn name_is_doc(name: &str) -> bool {
+    name.rfind('.').is_some_and(|dot| is_doc_ext(&name[dot + 1..]))
+}
+
+/// (doc files, total files) under a folder, recursively. Symbol items
+/// inside files are not files and don't count.
+fn doc_stats(node: &SymbolNode) -> (u64, u64) {
+    let (mut doc, mut total) = (0, 0);
+    for c in &node.children {
+        match c.id.kind {
+            SymbolKind::File => {
+                total += 1;
+                doc += name_is_doc(&c.name) as u64;
+            }
+            SymbolKind::Folder => {
+                let (d, t) = doc_stats(c);
+                doc += d;
+                total += t;
+            }
+            _ => {}
+        }
+    }
+    (doc, total)
+}
+
+/// 1 if this folder child is documentation — a doc file, or a folder
+/// whose files are more than 70% doc — else 0. Doc children pack after
+/// source children so source never competes with docs purely by size.
+fn doc_rank(node: &SymbolNode) -> u8 {
+    match node.id.kind {
+        SymbolKind::File => name_is_doc(&node.name) as u8,
+        SymbolKind::Folder => {
+            let (doc, total) = doc_stats(node);
+            (doc * 10 > total * 7) as u8
+        }
+        _ => 0,
+    }
+}
+
 /// Bottom-up size pass: returns (w, h) and records each node's position
 /// relative to its parent's origin in `rel` (x, y, w, h). Children fill
 /// columns top-to-bottom, wrapping right toward a square aspect (spec §5).
@@ -417,5 +478,58 @@ mod tests {
         // files/folders have no kind grouping: all rank 0
         assert_eq!(kind_rank(&SymbolKind::File), 0);
         assert_eq!(kind_rank(&SymbolKind::Folder), 0);
+    }
+
+    #[test]
+    fn file_ext_takes_file_part_of_qualified_path() {
+        assert_eq!(file_ext("src/m.c"), Some("c"));
+        assert_eq!(file_ext("src/m.c::s::field"), Some("c"));
+        assert_eq!(file_ext("BIG.md#3"), Some("md"));
+        assert_eq!(file_ext("README.markdown"), Some("markdown"));
+        assert_eq!(file_ext("Makefile"), None);
+    }
+
+    #[test]
+    fn source_ordered_exts_cover_docs_and_c_family() {
+        for e in ["md", "markdown", "txt", "rst"] {
+            assert!(is_doc_ext(e), "{e} is doc");
+            assert!(is_source_ordered_ext(e), "{e} is source-ordered");
+        }
+        for e in ["c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"] {
+            assert!(!is_doc_ext(e), "{e} is not doc");
+            assert!(is_source_ordered_ext(e), "{e} is source-ordered");
+        }
+        for e in ["rs", "py", "ts"] {
+            assert!(!is_doc_ext(e), "{e} is not doc");
+            assert!(!is_source_ordered_ext(e), "{e} reorganizes");
+        }
+    }
+
+    #[test]
+    fn doc_rank_files_by_name_folders_by_recursive_share() {
+        let f = |name: &str| n(SymbolKind::File, name, name, 1, vec![]);
+        assert_eq!(doc_rank(&f("README.md")), 1);
+        assert_eq!(doc_rank(&f("main.rs")), 0);
+        // 3 of 4 files doc (75% > 70%) — doc, counted through a subfolder
+        let d75 = n(
+            SymbolKind::Folder,
+            "d",
+            "d",
+            0,
+            vec![
+                n(SymbolKind::Folder, "d/sub", "sub", 0, vec![f("a.md"), f("b.md")]),
+                f("c.md"),
+                f("x.rs"),
+            ],
+        );
+        assert_eq!(doc_rank(&d75), 1);
+        // 1 of 2 (50%, not > 70%) — not doc
+        let mixed = n(SymbolKind::Folder, "m", "m", 0, vec![f("a.md"), f("x.rs")]);
+        assert_eq!(doc_rank(&mixed), 0);
+        // empty folder — not doc
+        assert_eq!(doc_rank(&n(SymbolKind::Folder, "e", "e", 0, vec![])), 0);
+        // non-file/folder kinds never rank
+        let it = n(SymbolKind::Item { label: "fn".into() }, "a.md::x", "x", 1, vec![]);
+        assert_eq!(doc_rank(&it), 0);
     }
 }
