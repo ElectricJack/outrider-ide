@@ -27,6 +27,7 @@ pub fn pack_config() -> outrider_layout::PackConfig {
         page_w: PAGE_W,
         line_step: content::LINE_STEP,
         header: content::HEADER,
+        container_header: content::HEADER + 2.0 * content::LINE_STEP,
         bottom_pad: content::BOTTOM_PAD,
         gap: PACK_GAP,
         aspect: PACK_ASPECT,
@@ -280,6 +281,7 @@ mod tests {
             page_w: 480.0,
             line_step: 15.6,
             header: 20.8,
+            container_header: 52.0,
             bottom_pad: 6.0,
             gap: 8.0,
             aspect: 1.6,
@@ -303,8 +305,8 @@ mod tests {
     #[test]
     fn packed_walk_zoom_one_clips_and_keeps_unclipped_fields() {
         let (tree, p) = packed_example();
-        // zoom 1.0 centered on g's page center (744, 293)
-        let cam = Camera { center_x: 744.0, center_y: 293.0, zoom: 1.0 };
+        // zoom 1.0 centered on g's page center (744, 355.4)
+        let cam = Camera { center_x: 744.0, center_y: 355.4, zoom: 1.0 };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
@@ -313,9 +315,9 @@ mod tests {
         assert_eq!(
             draws,
             vec![
-                Draw::Container(Rung::Full),   // root 1639px
+                Draw::Container(Rung::Full),   // root 1670px
                 Draw::Container(Rung::Full),   // a.rs 1602px (no byte_range → container)
-                Draw::Container(Rung::Detail), // b.rs 301px
+                Draw::Container(Rung::Detail), // b.rs 332px
                 Draw::Leaf(Text),              // f: 198.4px page, font 12, wide
                 Draw::Leaf(Label),             // g: 58px page (< CARD_PX)
             ]
@@ -327,15 +329,15 @@ mod tests {
         // a.rs hangs off the left edge: clipped x/w, unclipped left/full_h
         let a = &items[1];
         close(a.px.x, -2.0);
-        close(a.left, -336.0); // 8 − 744 + 400
-        close(a.px.w, 146.0); // right edge 144, clipped left −2
-        close(a.px.y, 35.8);
-        close(a.top, 35.8); // on-screen top: clipped == unclipped
-        close(a.px.h, 566.2); // bottom clipped to 602
+        close(a.left, -336.0);
+        close(a.px.w, 146.0);
+        close(a.px.y, 4.6);
+        close(a.top, 4.6);
+        close(a.px.h, 597.4);
         close(a.full_h, 1602.4);
-        assert!((a.label_w - 480.0).abs() < 1e-9); // truncation uses the box width
+        assert!((a.label_w - 480.0).abs() < 1e-9);
         // root's top is above the viewport: top unclipped, px.y clipped
-        close(items[0].top, 7.0); // 0 − 293 + 300
+        close(items[0].top, -55.4);
         close(items[0].left, -344.0);
         close(items[0].px.x, -2.0);
         // g fully on-screen: nothing clipped

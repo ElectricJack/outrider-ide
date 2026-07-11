@@ -274,9 +274,10 @@ mod tests {
             page_w: 480.0,
             line_step: 15.6,
             header: 20.8,
+            container_header: 52.0,
             bottom_pad: 6.0,
             gap: 8.0,
-            aspect: 1.6,
+            aspect: 1.0,
         }
     }
 
@@ -325,7 +326,7 @@ mod tests {
         let t = two_files();
         let idx = TreeIndex::new(&t);
         let p = outrider_layout::pack(&t, &cfg());
-        // packed geometry: x (16, 57.6), f (16, 160.4), g (16, 226.4) —
+        // packed geometry: x (16, 120), f (16, 254), g (16, 320) —
         // one column of depth-2 pages spanning two files
         let x = id(SymbolKind::Item { label: "fn".into() }, "a.rs::x");
         let f = id(SymbolKind::Item { label: "fn".into() }, "b.rs::f");

@@ -20,8 +20,11 @@ pub struct PackConfig {
     pub page_w: f64,
     /// Per-code-line height; leaf h = header + (1+measure)·line_step + bottom_pad.
     pub line_step: f64,
-    /// Name-row strip height, reserved at the top of every container too.
+    /// Name-row strip height at the top of a leaf page.
     pub header: f64,
+    /// Reserved height at the top of a container for the name row plus body
+    /// text (inventory, kind counts, etc.). Children are placed below this.
+    pub container_header: f64,
     pub bottom_pad: f64,
     /// Space between siblings, both axes; also the container's inner margin.
     pub gap: f64,
@@ -88,12 +91,12 @@ fn size(
         }
         let e = rel.get_mut(&child.id).expect("child sized above");
         e.0 = cfg.gap + x;
-        e.1 = cfg.header + cfg.gap + y;
+        e.1 = cfg.container_header + cfg.gap + y;
         col_w = col_w.max(w);
         content_h = content_h.max(y + h);
         y += h + cfg.gap;
     }
-    let wh = (x + col_w + 2.0 * cfg.gap, cfg.header + content_h + 2.0 * cfg.gap);
+    let wh = (x + col_w + 2.0 * cfg.gap, cfg.container_header + content_h + 2.0 * cfg.gap);
     rel.insert(node.id.clone(), (0.0, 0.0, wh.0, wh.1));
     wh
 }
@@ -127,6 +130,7 @@ mod tests {
             page_w: 480.0,
             line_step: 15.6,
             header: 20.8,
+            container_header: 52.0,
             bottom_pad: 6.0,
             gap: 8.0,
             aspect: 1.6,
@@ -193,13 +197,13 @@ mod tests {
         let p = pack(&worked_example(), &cfg());
         assert_eq!(p.rects.len(), 5);
         // leaf pages: w = page_w, h = header + (1+measure)·line_step + bottom_pad
-        assert_rect(rect(&p, "a.rs"), 8.0, 28.8, 480.0, 1602.4);
+        assert_rect(rect(&p, "a.rs"), 8.0, 60.0, 480.0, 1602.4);
         // b.rs: f fills the first column, g stacks under it (one column)
-        assert_rect(rect(&p, "b.rs::f"), 504.0, 57.6, 480.0, 198.4);
-        assert_rect(rect(&p, "b.rs::g"), 504.0, 264.0, 480.0, 58.0);
-        assert_rect(rect(&p, "b.rs"), 496.0, 28.8, 496.0, 301.2);
+        assert_rect(rect(&p, "b.rs::f"), 504.0, 120.0, 480.0, 198.4);
+        assert_rect(rect(&p, "b.rs::g"), 504.0, 326.4, 480.0, 58.0);
+        assert_rect(rect(&p, "b.rs"), 496.0, 60.0, 496.0, 332.4);
         // root: a.rs fills column 1 (tall), b.rs wraps to column 2
-        assert_rect(rect(&p, ""), 0.0, 0.0, 1000.0, 1639.2);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 1000.0, 1670.4);
     }
 
     #[test]
@@ -229,11 +233,11 @@ mod tests {
         let (a, z) = (rect(&p, "alpha.rs"), rect(&p, "zeta.rs"));
         // alpha is placed first: top-left of the content area
         close(a.x, 8.0);
-        close(a.y, 28.8);
+        close(a.y, 60.0);
         // zeta is placed second: it wraps to the next column (alpha's column
         // is full), landing at the same top — name order still decides first
         close(z.x, 496.0);
-        close(z.y, 28.8);
+        close(z.y, 60.0);
     }
 
     #[test]
@@ -247,13 +251,13 @@ mod tests {
         edited.root.children[1].children[0].measure = 50;
         let after = pack(&edited, &cfg());
         assert_eq!(rect(&before, "a.rs"), rect(&after, "a.rs"));
-        // f: 480 × 822.4; b.rs grows wide (two columns): 984 × 859.2
-        assert_rect(rect(&after, "b.rs::f"), 504.0, 57.6, 480.0, 822.4);
-        assert_rect(rect(&after, "b.rs"), 496.0, 28.8, 984.0, 859.2);
+        // f: 480 × 822.4; b.rs grows wide (two columns): 984 × 890.4
+        assert_rect(rect(&after, "b.rs::f"), 504.0, 120.0, 480.0, 822.4);
+        assert_rect(rect(&after, "b.rs"), 496.0, 60.0, 984.0, 890.4);
         // g wraps to b.rs's second column
         let g = rect(&after, "b.rs::g");
         close(g.x, 992.0);
-        close(g.y, 57.6);
+        close(g.y, 120.0);
     }
 
     #[test]
@@ -271,9 +275,9 @@ mod tests {
             repo_root: "/x".into(),
         };
         let p = pack(&tree, &cfg());
-        // single 480×58 child: content 480×58 → root 496 × 94.8
-        assert_rect(rect(&p, "one.rs"), 8.0, 28.8, 480.0, 58.0);
-        assert_rect(rect(&p, ""), 0.0, 0.0, 496.0, 94.8);
+        // single 480×58 child: content 480×58 → root 496 × 126.0
+        assert_rect(rect(&p, "one.rs"), 8.0, 60.0, 480.0, 58.0);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 496.0, 126.0);
     }
 
     #[test]
@@ -288,11 +292,11 @@ mod tests {
             repo_root: "/x".into(),
         };
         let p = pack(&tree, &cfg());
-        assert_rect(rect(&p, "c1.rs"), 8.0, 28.8, 480.0, 120.4);
-        assert_rect(rect(&p, "c2.rs"), 8.0, 157.2, 480.0, 120.4);
-        assert_rect(rect(&p, "c3.rs"), 8.0, 285.6, 480.0, 120.4);
-        assert_rect(rect(&p, "c4.rs"), 496.0, 28.8, 480.0, 120.4);
-        assert_rect(rect(&p, ""), 0.0, 0.0, 984.0, 414.0);
+        assert_rect(rect(&p, "c1.rs"), 8.0, 60.0, 480.0, 120.4);
+        assert_rect(rect(&p, "c2.rs"), 8.0, 188.4, 480.0, 120.4);
+        assert_rect(rect(&p, "c3.rs"), 8.0, 316.8, 480.0, 120.4);
+        assert_rect(rect(&p, "c4.rs"), 496.0, 60.0, 480.0, 120.4);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 984.0, 445.2);
     }
 
     #[test]
