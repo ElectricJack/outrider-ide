@@ -97,6 +97,9 @@ struct PaintItem {
     /// Height of an opaque header-background band painted behind container
     /// name + body text so children's boxes don't occlude the header.
     header_bg_h: f32,
+    /// Y coordinate for the header background (may differ from `y` when
+    /// nested pinned headers are stacked).
+    header_bg_y: f32,
     name: Option<NameRow>,
     body: Vec<BodyText>,
     bars: Vec<MinimapBar>,
@@ -142,8 +145,8 @@ fn code_line(
     Some((shown, runs))
 }
 
-/// Content-table rows for a container, pinned at 12px to the CLIPPED top so
-/// the header stays readable when the box is scrolled part-off (spec §2).
+/// Content-table rows for a container, pinned to `pin_y` (which may be
+/// stacked below ancestor headers when multiple containers are pinned).
 fn container_body(
     node: &SymbolNode,
     rung: Rung,
@@ -151,6 +154,7 @@ fn container_body(
     left: f64,
     label_w: f64,
     vh: f64,
+    pin_y: f64,
 ) -> Vec<BodyText> {
     if rung == Rung::Dot || rung == Rung::Label {
         return Vec::new();
@@ -158,7 +162,7 @@ fn container_body(
     let font = FONT_PX as f32;
     let mut out = Vec::new();
     for (k, line) in content::body_lines(node, rung).into_iter().enumerate() {
-        let y = px.y + HEADER + k as f64 * LINE_STEP;
+        let y = pin_y + HEADER + k as f64 * LINE_STEP;
         if y + LINE_STEP > px.y + px.h || y > vh {
             break;
         }
@@ -199,8 +203,29 @@ fn leaf_text_body(
     let step = LINE_STEP * scale;
     let x = (left + BODY_PAD * scale) as f32;
     let mut out = Vec::new();
+    let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
+    let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
+    if let Some(m) = buffers.get(&rel, syms) {
+        if let Some(start) = m.symbol_start_line(&node.id) {
+            let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
+            for j in 0..count {
+                let y = top + (HEADER + j as f64 * LINE_STEP) * scale;
+                if y > vh {
+                    break;
+                }
+                if y + step < 0.0 {
+                    continue;
+                }
+                if let Some((text, spans)) = m.buffer.line(start + j) {
+                    if let Some((shown, runs)) = code_line(&text, spans, label_w as f32, font) {
+                        out.push(BodyText { x, y: y as f32, text: shown, runs });
+                    }
+                }
+            }
+            return out;
+        }
+    }
     let lines = content::body_lines(node, Rung::Full);
-    let rows = lines.len();
     for (k, line) in lines.into_iter().enumerate() {
         let y = top + (HEADER + k as f64 * LINE_STEP) * scale;
         if y > vh {
@@ -216,27 +241,6 @@ fn leaf_text_body(
         if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
             let len = shown.len();
             out.push(BodyText { x, y: y as f32, text: shown, runs: vec![(len, color)] });
-        }
-    }
-    let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
-    let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
-    if let Some(m) = buffers.get(&rel, syms) {
-        if let Some(start) = m.symbol_start_line(&node.id) {
-            let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
-            for j in 0..count {
-                let y = top + (HEADER + (rows + j) as f64 * LINE_STEP) * scale;
-                if y > vh {
-                    break;
-                }
-                if y + step < 0.0 {
-                    continue;
-                }
-                if let Some((text, spans)) = m.buffer.line(start + j) {
-                    if let Some((shown, runs)) = code_line(&text, spans, label_w as f32, font) {
-                        out.push(BodyText { x, y: y as f32, text: shown, runs });
-                    }
-                }
-            }
         }
     }
     out
@@ -404,14 +408,15 @@ impl TreemapView {
     }
 
     /// A name pinned at 12px to the clipped box corner; `center` vertically
-    /// centers it in the box (the Label tier). None when it doesn't fit.
-    fn pinned_name(item: &world::DrawItem, center: bool) -> Option<NameRow> {
+    /// centers it in the box (the Label tier). `pin_y` is the stacked header
+    /// y for containers with pinned headers.
+    fn pinned_name(item: &world::DrawItem, center: bool, pin_y: f64) -> Option<NameRow> {
         let font = FONT_PX as f32;
         let text = truncate_to_width(&item.node.name, item.label_w as f32, font)?;
         let y = if center {
             item.px.y + (item.px.h - f64::from(font) * 1.3) / 2.0
         } else {
-            item.px.y + 4.0
+            pin_y + 4.0
         };
         Some(NameRow { x: (item.px.x + BODY_PAD) as f32, y: y as f32, font_px: font, text })
     }
@@ -446,29 +451,53 @@ impl TreemapView {
         let focus_id = self.focus.current.clone();
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
         let mut out = Vec::with_capacity(items.len());
+        let mut header_stack: Vec<(u8, f64)> = Vec::new();
         for item in items {
+            while let Some(&(lvl, _)) = header_stack.last() {
+                if lvl >= item.level {
+                    header_stack.pop();
+                } else {
+                    break;
+                }
+            }
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
             let tint = classify_tint(item.node);
             let fill = theme::box_fill(is_leaf, item.level, tint);
             let mut body_font_px = FONT_PX as f32;
             let mut header_bg_h = 0.0f32;
+            let mut header_bg_y = item.px.y as f32;
             let mut name = None;
             let mut body = Vec::new();
             let mut bars = Vec::new();
             match item.draw {
                 Draw::Container(rung) => {
+                    let is_pinned = item.top < item.px.y;
+                    let pin_y = if is_pinned {
+                        let stack_bottom =
+                            header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
+                        item.px.y.max(stack_bottom)
+                    } else {
+                        item.px.y
+                    };
                     if rung != Rung::Dot && item.px.h >= 14.0 {
-                        name = Self::pinned_name(&item, rung == Rung::Label);
+                        name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
                     }
-                    body = container_body(item.node, rung, &item.px, item.left, item.label_w, vh);
+                    body = container_body(
+                        item.node, rung, &item.px, item.left, item.label_w, vh, pin_y,
+                    );
                     if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
                         header_bg_h = (HEADER + body.len() as f64 * LINE_STEP) as f32;
+                        header_bg_y = pin_y as f32;
+                        if is_pinned {
+                            header_stack
+                                .push((item.level, pin_y + header_bg_h as f64));
+                        }
                     }
                 }
                 Draw::Leaf(LeafDraw::Dot) => {}
                 Draw::Leaf(LeafDraw::Label) => {
                     if item.px.h >= 14.0 {
-                        name = Self::pinned_name(&item, true);
+                        name = Self::pinned_name(&item, true, item.px.y);
                     }
                 }
                 Draw::Leaf(LeafDraw::Minimap) => {
@@ -509,6 +538,7 @@ impl TreemapView {
                 focused: item.node.id == focus_id,
                 body_font_px,
                 header_bg_h,
+                header_bg_y,
                 name,
                 body,
                 bars,
@@ -733,7 +763,10 @@ impl Render for TreemapView {
                         for item in &items {
                             if item.header_bg_h > 0.0 {
                                 let hb = Bounds::new(
-                                    point(origin.x + px(item.x + 1.0), origin.y + px(item.y + 1.0)),
+                                    point(
+                                        origin.x + px(item.x + 1.0),
+                                        origin.y + px(item.header_bg_y + 1.0),
+                                    ),
                                     size(px((item.w - 2.0).max(0.0)), px(item.header_bg_h)),
                                 );
                                 window.paint_quad(quad(
@@ -865,7 +898,7 @@ mod tests {
     fn container_body_positions_detail_lines() {
         let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
-        let body = container_body(&f, Rung::Detail, &px, 0.0, 400.0, 600.0);
+        let body = container_body(&f, Rung::Detail, &px, 0.0, 400.0, 600.0, px.y);
         // churn readout + doc first line (no items → no kind-counts line)
         assert_eq!(body.len(), 2);
         assert_eq!(body[1].text, "Doc line.");
@@ -874,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_text_body_paints_signature_and_code_at_scale_one() {
+    fn leaf_text_body_paints_code_without_duplicate_signature() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
         let leaf = node(SymbolKind::Item { label: "fn".into() }, "a.rs::two", Some(12..23), 1, Some("fn two()"), None);
@@ -885,15 +918,13 @@ mod tests {
         // scale 1.0: full_h == natural
         let body =
             leaf_text_body(&leaf, 0.0, 0.0, natural, 480.0, 600.0, &mut mgr, &file_symbols);
-        // signature row + the symbol's one code line — no window, no clip
-        assert_eq!(body.len(), 2);
-        assert_eq!(body[0].text, "fn two()");
-        assert_eq!(body[1].text, "fn two() {}");
-        assert!(body[1].runs.len() > 1, "code rows carry colored runs");
-        assert_eq!(body[1].runs.iter().map(|r| r.0).sum::<usize>(), body[1].text.len());
-        // row 0 (signature) at natural-y HEADER; code row at HEADER + LINE_STEP
+        // code only — no separate signature row (the code line IS the signature)
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0].text, "fn two() {}");
+        assert!(body[0].runs.len() > 1, "code rows carry colored runs");
+        assert_eq!(body[0].runs.iter().map(|r| r.0).sum::<usize>(), body[0].text.len());
+        // code row 0 at natural-y HEADER
         assert!((f64::from(body[0].y) - HEADER).abs() < 1e-3);
-        assert!((f64::from(body[1].y) - (HEADER + LINE_STEP)).abs() < 1e-3);
     }
 
     #[test]
@@ -905,13 +936,12 @@ mod tests {
         let mut file_symbols = BTreeMap::new();
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let natural = crate::content::natural_px(&leaf);
-        // zoom 2× (full_h = 2·natural): every row's y doubles, still no clip
+        // zoom 2× (full_h = 2·natural): code row y doubles, still no clip
         let body = leaf_text_body(
             &leaf, 0.0, 0.0, 2.0 * natural, 960.0, 100_000.0, &mut mgr, &file_symbols,
         );
-        assert_eq!(body.len(), 2);
+        assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - 2.0 * HEADER).abs() < 1e-3);
-        assert!((f64::from(body[1].y) - 2.0 * (HEADER + LINE_STEP)).abs() < 1e-3);
         // buffer unavailable → signature only, no code
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
         let body =
