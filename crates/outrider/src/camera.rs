@@ -1,16 +1,24 @@
+//! Camera model: world↔screen coordinate transforms, zoom-about-point,
+//! animated tweens, and framing helpers (fit, frame_rect, frame_page).
+//! All state is pure data — no GPUI handles; the render path clones as needed.
+
 use outrider_layout::Rect;
 
+/// Viewport state: center point in world space and zoom (pixels per world unit).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     /// World point at the viewport center. World units are natural pixels
     /// (zoom 1.0 = code at natural size).
     pub center_x: f64,
+    /// World Y coordinate of the viewport center.
     pub center_y: f64,
     /// Pixels per world unit.
     pub zoom: f64,
 }
 
+/// Core camera methods: coordinate mapping, pan, zoom, and home framing.
 impl Camera {
+    /// Map a world point to screen pixels given the viewport dimensions.
     pub fn world_to_screen(&self, wx: f64, wy: f64, vw: f64, vh: f64) -> (f64, f64) {
         (
             (wx - self.center_x) * self.zoom + vw / 2.0,
@@ -18,6 +26,7 @@ impl Camera {
         )
     }
 
+    /// Map a screen pixel to world coordinates — inverse of `world_to_screen`.
     pub fn screen_to_world(&self, sx: f64, sy: f64, vw: f64, vh: f64) -> (f64, f64) {
         (
             (sx - vw / 2.0) / self.zoom + self.center_x,
@@ -101,6 +110,7 @@ pub fn frame_page(rect: Rect, vw: f64, vh: f64, min_zoom: f64, max_zoom: f64) ->
     }
 }
 
+/// Smooth cubic easing: accelerates then decelerates symmetrically over [0, 1].
 fn ease_in_out_cubic(t: f64) -> f64 {
     if t < 0.5 {
         4.0 * t * t * t
@@ -119,11 +129,14 @@ pub struct CameraTween {
     pub duration: f64,
 }
 
+/// Tween construction, sampling, and retargeting.
 impl CameraTween {
+    /// Construct a tween with the default `TWEEN_SECS` duration.
     pub fn new(from: Camera, to: Camera) -> Self {
         CameraTween { from, to, duration: TWEEN_SECS }
     }
 
+    /// Interpolated camera at elapsed time `t` (seconds); clamped to `to` once done.
     pub fn sample(&self, t: f64) -> Camera {
         if t >= self.duration {
             return self.to;
@@ -136,6 +149,7 @@ impl CameraTween {
         }
     }
 
+    /// True once the tween has reached or passed its endpoint.
     pub fn done(&self, t: f64) -> bool {
         t >= self.duration
     }

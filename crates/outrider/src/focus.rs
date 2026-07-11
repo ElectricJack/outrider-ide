@@ -1,3 +1,8 @@
+//! Keyboard focus and spatial navigation: Enter/Esc tree traversal, last-child
+//! memory, and arrow-key beam-cast stepping over packed layout rects.
+//! `Focus` is persistent view state; `TreeIndex` is a per-use lookup built
+//! over the immutable symbol tree.
+
 use std::collections::BTreeMap;
 
 use outrider_index::{SymbolId, SymbolNode, SymbolTree};
@@ -9,7 +14,9 @@ pub struct TreeIndex<'a> {
     parents: BTreeMap<&'a SymbolId, &'a SymbolId>,
 }
 
+/// Build and query the two-way lookup maps over a borrowed SymbolTree.
 impl<'a> TreeIndex<'a> {
+    /// Walk the whole tree once and populate node and parent maps.
     pub fn new(tree: &'a SymbolTree) -> Self {
         fn walk<'a>(node: &'a SymbolNode, idx: &mut TreeIndex<'a>) {
             idx.nodes.insert(&node.id, node);
@@ -23,10 +30,12 @@ impl<'a> TreeIndex<'a> {
         idx
     }
 
+    /// Borrow the node for `id`, or None if not in this tree.
     pub fn node(&self, id: &SymbolId) -> Option<&'a SymbolNode> {
         self.nodes.get(id).copied()
     }
 
+    /// Structural parent of `id`, or None for the root.
     pub fn parent(&self, id: &SymbolId) -> Option<&'a SymbolId> {
         self.parents.get(id).copied()
     }
@@ -53,7 +62,9 @@ pub struct Focus {
     last_child: BTreeMap<SymbolId, SymbolId>,
 }
 
+/// Enter/Esc navigation and direct-set operations on the focus cursor.
 impl Focus {
+    /// Create focus starting at `root`; last-child memory is empty.
     pub fn new(root: SymbolId) -> Self {
         Focus { current: root, last_child: BTreeMap::new() }
     }
@@ -69,6 +80,7 @@ impl Focus {
         true
     }
 
+    /// Update `last_child` for the current node's parent after a move.
     fn record_visit(&mut self, index: &TreeIndex) {
         if let Some(p) = index.parent(&self.current) {
             self.last_child.insert(p.clone(), self.current.clone());
@@ -102,6 +114,7 @@ impl Focus {
     }
 }
 
+/// Cardinal direction for a spatial arrow-key step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     Left,

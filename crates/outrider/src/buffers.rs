@@ -1,9 +1,14 @@
+//! Source-file materialization layer: loads files from disk into rope-backed
+//! `FileBuffer` objects with syntax highlighting, attaches per-symbol anchors
+//! for stable line lookup, and caches up to `MAX_BUFFERS` entries LRU-style.
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use outrider_index::buffer::{AnchorId, FileBuffer};
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
+/// Maximum simultaneously-cached materialized files; LRU-evicts beyond this.
 pub const MAX_BUFFERS: usize = 64;
 
 /// A materialized file: rope-backed buffer plus one anchor per symbol,
@@ -13,6 +18,7 @@ pub struct Materialized {
     anchors: BTreeMap<SymbolId, AnchorId>,
 }
 
+/// Stable line-index access for a loaded file's symbols.
 impl Materialized {
     /// Rope line index of the symbol's start, via its anchor — the Full
     /// render never reads raw `byte_range` offsets.
@@ -29,7 +35,9 @@ pub struct BufferManager {
     entries: Vec<(String, Materialized)>,
 }
 
+/// Disk I/O, anchor creation, LRU management, and path helpers.
 impl BufferManager {
+    /// Create a manager rooted at `repo_root`; no files are read yet.
     pub fn new(repo_root: PathBuf) -> Self {
         Self { repo_root, entries: Vec::new() }
     }

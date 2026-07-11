@@ -15,6 +15,7 @@ pub struct Chunk {
     pub label: String,
 }
 
+/// Splits a file's text into ordered, contiguous, covering `Chunk`s.
 pub trait ChunkStrategy {
     /// Ordered, contiguous, covering chunks. Returns a single whole-file
     /// chunk when the file is under threshold; the caller treats `len == 1`
@@ -63,12 +64,15 @@ fn chunk_of(spans: &[(usize, usize)], a: usize, b: usize, label: String) -> Chun
     }
 }
 
+/// Human-readable 1-based inclusive line range label (e.g. "1–60").
 fn range_label(a: usize, b: usize) -> String {
     format!("{}–{}", a + 1, b) // 1-based inclusive, en dash
 }
 
+/// Fixed-size line-slice strategy: slices at every `CHUNK_MAX_LINES` boundary.
 pub struct LineChunker;
 
+/// Uniform line-slice chunking for non-Markdown files.
 impl ChunkStrategy for LineChunker {
     fn chunks(&self, text: &str) -> Vec<Chunk> {
         let spans = line_spans(text);
@@ -90,6 +94,8 @@ impl ChunkStrategy for LineChunker {
     }
 }
 
+/// Heading-aware strategy: splits at ATX headings, with blank-line fallback
+/// for oversized heading-less sections.
 pub struct MarkdownChunker;
 
 /// `^\s{0,3}#{1,6}\s` — up to 3 leading spaces, 1–6 `#`, then a space/tab.
@@ -111,6 +117,7 @@ fn heading_label(line: &str) -> String {
     line.trim_start_matches(' ').trim_start_matches('#').trim().to_string()
 }
 
+/// Semantic Markdown chunking: heading splits with preamble-merge and oversized-section fallback.
 impl ChunkStrategy for MarkdownChunker {
     fn chunks(&self, text: &str) -> Vec<Chunk> {
         let spans = line_spans(text);

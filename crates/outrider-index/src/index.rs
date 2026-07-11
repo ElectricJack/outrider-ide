@@ -1,3 +1,7 @@
+//! Top-level indexing pipeline: scans, parses (in parallel), assembles the
+//! symbol tree, deduplicates IDs, and annotates with git churn.
+//! Entry point is `index_repo`, re-exported from the crate root.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +12,7 @@ use crate::parse::{parse_rust_items, parse_c_items, parse_python_items, parse_js
 use crate::scan::{build_tree, scan_files, ParsedFile, ScannedFile};
 use crate::types::{dedupe_ids, finalize_children, SymbolId, SymbolNode, SymbolTree};
 
+/// Full indexing pipeline: scan → parse → assemble → dedupe → churn annotate.
 pub fn index_repo(repo_root: &Path) -> anyhow::Result<SymbolTree> {
     let files = scan_files(repo_root)?;
     let parsed_children = parse_all(repo_root, &files)?;
@@ -61,6 +66,8 @@ fn parse_all(
         .collect()
 }
 
+/// Converts a `RawItem` (tree-sitter output) into a `SymbolNode`, recursively
+/// processing children and finalizing their ordinals.
 fn to_symbol_node(item: RawItem, parent_qual: &str) -> SymbolNode {
     let qual = format!("{parent_qual}::{}", item.name);
     let mut children: Vec<SymbolNode> = item

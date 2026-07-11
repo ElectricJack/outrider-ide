@@ -1,3 +1,7 @@
+//! Tree-sitter-based source parsers for Rust, Python, C, JS/TS/TSX, and C#.
+//! Each `parse_*_items` function returns a nested `RawItem` tree that mirrors
+//! the language's structural hierarchy. `file_doc` extracts `//!` module docs.
+
 use std::ops::Range;
 
 use anyhow::Context;
@@ -5,6 +9,8 @@ use tree_sitter::Node;
 
 use crate::types::SymbolKind;
 
+/// Raw output of a single tree-sitter parse pass: one structural item with its
+/// metadata and nested children, before `SymbolId` assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawItem {
     pub kind: SymbolKind,
@@ -154,6 +160,7 @@ fn c_item_name(node: Node, src: &[u8]) -> String {
     }
 }
 
+/// Classifies a JS/JSX syntax node into a symbol kind label, handling arrow functions.
 pub fn js_kind_fn(node_kind: &str, node: Node, _src: &[u8]) -> Option<&'static str> {
     match node_kind {
         "function_declaration" | "generator_function_declaration" => Some("fn"),
@@ -178,6 +185,7 @@ pub fn js_kind_fn(node_kind: &str, node: Node, _src: &[u8]) -> Option<&'static s
     }
 }
 
+/// Extracts the display name for a JS item, unwrapping `const foo = ...` declarators.
 pub fn js_item_name(node: Node, src: &[u8]) -> String {
     if node.kind() == "lexical_declaration" || node.kind() == "variable_declaration" {
         let mut cursor = node.walk();
@@ -193,6 +201,7 @@ pub fn js_item_name(node: Node, src: &[u8]) -> String {
     item_name_default(node, src)
 }
 
+/// Extends `js_kind_fn` with TypeScript-only node kinds (interface, enum, type alias).
 fn ts_kind_fn(node_kind: &str, node: Node, src: &[u8]) -> Option<&'static str> {
     match node_kind {
         "interface_declaration" => Some("interface"),
@@ -202,6 +211,7 @@ fn ts_kind_fn(node_kind: &str, node: Node, src: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Extract TypeScript items using the TS grammar (class/fn/interface/enum/type).
 pub fn parse_ts_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -211,6 +221,7 @@ pub fn parse_ts_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     Ok(collect_items(tree.root_node(), source, &ts_kind_fn, &js_item_name))
 }
 
+/// Extract TypeScript/JSX items using the TSX grammar for `.tsx` files.
 pub fn parse_tsx_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -220,6 +231,7 @@ pub fn parse_tsx_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     Ok(collect_items(tree.root_node(), source, &ts_kind_fn, &js_item_name))
 }
 
+/// Extract JavaScript items (function/class/arrow-fn declarations).
 pub fn parse_js_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -229,6 +241,7 @@ pub fn parse_js_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     Ok(collect_items(tree.root_node(), source, &js_kind_fn, &js_item_name))
 }
 
+/// Extract C# items (namespace/class/record/interface/struct/enum/method).
 pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -249,6 +262,8 @@ pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     Ok(collect_items(tree.root_node(), source, &kind_fn, &item_name_default))
 }
 
+/// Recursively walks a syntax tree, collecting nodes accepted by `kind_fn` into
+/// `RawItem`s; unrecognized nodes are transparent (children are still visited).
 fn collect_items(
     node: Node,
     src: &[u8],
@@ -274,6 +289,7 @@ fn collect_items(
     items
 }
 
+/// Returns the source slice for a tree-sitter node as a UTF-8 string.
 fn node_text(node: Node, src: &[u8]) -> String {
     String::from_utf8_lossy(&src[node.byte_range()]).into_owned()
 }

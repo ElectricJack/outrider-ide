@@ -1,18 +1,29 @@
+//! Core data types for the symbol tree: `SymbolKind`, `SymbolId`, `SymbolNode`,
+//! and `SymbolTree`, plus the helpers that sort, ordinate, and deduplicate nodes.
+//! All types are serde-serializable so the tree can be cached to disk.
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// The structural role of a node: hierarchy level or a language-level item kind.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
+    /// A directory in the repo tree.
     Folder,
+    /// A source file.
     File,
+    /// A line-range slice of a large unparsed file.
     Chunk,
+    /// A language-level symbol (e.g. `"fn"`, `"struct"`, `"class"`).
     Item { label: String },
 }
 
+/// Stable identity methods shared by all `SymbolKind` variants.
 impl SymbolKind {
+    /// Returns the short display label used by the renderer and layout keys.
     pub fn label(&self) -> &str {
         match self {
             SymbolKind::Folder => "folder",
@@ -23,13 +34,17 @@ impl SymbolKind {
     }
 }
 
+/// Stable, layout-keyed identity for a single node (spec §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId {
     pub kind: SymbolKind,
+    /// `/`-separated path from repo root; `::` separates items within a file.
     pub qualified_path: String,
+    /// Disambiguates same-name siblings; 0 for unique names.
     pub ordinal: u16,
 }
 
+/// A single node in the symbol tree: folder, file, chunk, or language item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SymbolNode {
     pub id: SymbolId,
@@ -49,6 +64,7 @@ pub struct SymbolNode {
     pub children: Vec<SymbolNode>,
 }
 
+/// The complete indexed representation of a repository.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SymbolTree {
     pub root: SymbolNode,

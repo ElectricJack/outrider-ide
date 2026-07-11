@@ -1,3 +1,7 @@
+//! Client-side window chrome: titlebar with controls and invisible resize strips.
+//! Provides `titlebar` and `resize_rim` for use by the root render function;
+//! both are no-ops when the OS manages decorations or the window is maximized.
+
 use gpui::{
     div, prelude::*, px, rgb, App, CursorStyle, MouseButton, ResizeEdge, SharedString, Window,
 };
@@ -7,11 +11,11 @@ use crate::theme;
 /// Height of the client-side titlebar, in pixels.
 pub const TITLEBAR_H: f64 = 32.0;
 
-/// Thickness of the invisible window-resize rim along each edge.
+/// Thickness of the invisible window-resize rim along each edge, in pixels.
 const RIM: f64 = 6.0;
-/// Square size of each corner resize hit-zone.
+/// Square size of each corner resize hit-zone, in pixels.
 const CORNER: f64 = 12.0;
-/// Width of each window-control button.
+/// Width of each window-control button, in pixels.
 const BTN_W: f64 = 46.0;
 
 const TITLE_FG: u32 = 0x9a9aa4;
@@ -105,6 +109,7 @@ pub fn resize_rim(window: &Window) -> Option<impl IntoElement> {
     )
 }
 
+/// One of the eight resize zones around the window perimeter.
 #[derive(Clone, Copy)]
 enum Edge {
     Top,
@@ -117,7 +122,9 @@ enum Edge {
     BottomRight,
 }
 
+/// Maps `Edge` variants to GPUI resize/cursor types.
 impl Edge {
+    /// Returns the GPUI `ResizeEdge` that triggers a compositor resize drag.
     fn resize(self) -> ResizeEdge {
         match self {
             Edge::Top => ResizeEdge::Top,
@@ -131,6 +138,7 @@ impl Edge {
         }
     }
 
+    /// Returns the directional cursor shown when the pointer enters this zone.
     fn cursor(self) -> CursorStyle {
         match self {
             Edge::Top | Edge::Bottom => CursorStyle::ResizeUpDown,
@@ -141,6 +149,7 @@ impl Edge {
     }
 }
 
+/// Builds a single absolutely-positioned hit strip for one resize edge or corner.
 fn strip(edge: Edge) -> gpui::Div {
     let base = div()
         .absolute()

@@ -30,6 +30,7 @@ pub struct LeafTexture {
     pub bytes: usize,
 }
 
+/// Mip-level selection and empty-check helpers.
 impl LeafTexture {
     /// The level to paint at `screen_h` on-screen pixels, or None if empty.
     pub fn level_for(&self, screen_h: f32) -> Option<&Arc<RenderImage>> {
@@ -107,12 +108,16 @@ fn blend(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     dst[3] = oa as u8;
 }
 
+/// CPU rasterizer: holds a `cosmic-text` font system and glyph cache,
+/// reused across bake calls to avoid per-frame font loading overhead.
 pub struct Rasterizer {
     font_system: FontSystem,
     swash: SwashCache,
 }
 
+/// Construction and the `bake` pipeline.
 impl Rasterizer {
+    /// Create a rasterizer with a fresh font system; loads system fonts lazily.
     pub fn new() -> Self {
         Self { font_system: FontSystem::new(), swash: SwashCache::new() }
     }
@@ -232,6 +237,7 @@ pub const BAKES_PER_FRAME: usize = 4;
 /// Total texture budget across all levels of all cached leaves.
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Single cache slot: baked texture plus a logical clock tick for LRU ordering.
 struct Entry {
     tex: LeafTexture,
     last_used: u64,
@@ -249,7 +255,9 @@ pub struct TextureCache {
     retired: Vec<Arc<RenderImage>>,
 }
 
+/// LRU cache management, miss queuing, and frame-gated baking.
 impl TextureCache {
+    /// Create a cache with `max_bytes` total budget across all mip levels.
     pub fn new(max_bytes: usize) -> Self {
         Self {
             raster: Rasterizer::new(),
@@ -276,6 +284,7 @@ impl TextureCache {
         }
     }
 
+    /// True when at least one miss is queued and `bake_queued` should be called.
     pub fn has_queued(&self) -> bool {
         !self.queue.is_empty()
     }

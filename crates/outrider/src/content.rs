@@ -1,9 +1,14 @@
+//! Content model: text metrics, body-line generation, and inventory strings
+//! for each symbol kind × rung combination (spec §§3–4.4).
+//! Pure functions — no rendering; shared by the layout and paint paths.
+
 use outrider_index::{SymbolKind, SymbolNode};
 
 use crate::world::Rung;
 
 /// Monospace body font size (px); shared by content math and the paint path.
 pub const FONT_PX: f64 = 12.0;
+/// Vertical distance between baselines (130% leading).
 pub const LINE_STEP: f64 = FONT_PX * 1.3;
 /// Name-row height: text top padding (4) plus one meta-line offset.
 pub const HEADER: f64 = 4.0 + FONT_PX * 1.4;
@@ -16,7 +21,9 @@ pub const MIN_TEXT_FONT_PX: f64 = 7.0;
 
 /// Font-size range for the Texture↔Text crossfade: text fades in from
 /// FADE_LO to FADE_HI while the baked texture fades out over the same range.
+/// Lower bound of the Text↔Texture crossfade (on-screen font px).
 pub const TEXT_FADE_LO: f64 = 5.0;
+/// Upper bound of the Text↔Texture crossfade; above this text is fully opaque.
 pub const TEXT_FADE_HI: f64 = 9.0;
 
 /// A leaf page: has source bytes, no children, and is not a folder.
@@ -54,6 +61,7 @@ pub fn churn_readout(node: &SymbolNode) -> String {
     format!("{}L · {} commits · p{:.0}", node.measure, node.churn_count, node.churn * 100.0)
 }
 
+/// Pluralize `word` with a count prefix: "1 fn" or "3 fns".
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("1 {word}")

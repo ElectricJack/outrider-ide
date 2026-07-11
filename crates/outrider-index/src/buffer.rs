@@ -1,3 +1,8 @@
+//! Source-file representation: parse, syntax-highlight, and minimap summary.
+//! Wraps a ropey `Rope` with per-line `HighlightSpan` lists (built once via
+//! tree-sitter) and a compact `MinimapRow` array used by the far-zoom renderer.
+//! Anchors track byte offsets through edits (Phase 6 incremental re-parse).
+
 use std::ops::Range;
 
 use anyhow::Context;
@@ -15,17 +20,21 @@ pub struct Edit {
     pub new_len: usize,
 }
 
+/// Growable list of tracked byte positions; each slot is a stable `AnchorId`.
 #[derive(Debug, Default)]
 pub struct AnchorList {
     positions: Vec<usize>,
 }
 
+/// Anchor creation, resolution, and edit-survival remapping.
 impl AnchorList {
+    /// Append a new anchor at `offset` and return its stable handle.
     pub fn create(&mut self, offset: usize) -> AnchorId {
         self.positions.push(offset);
         AnchorId(self.positions.len() - 1)
     }
 
+    /// Return the current byte offset for the given anchor.
     pub fn resolve(&self, id: AnchorId) -> usize {
         self.positions[id.0]
     }
@@ -46,6 +55,8 @@ impl AnchorList {
     }
 }
 
+/// Semantic token category used to color text in the source view and tint
+/// minimap bars. Mapped from tree-sitter capture names via `kind_for`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HighlightKind {
     Keyword,
@@ -75,6 +86,8 @@ pub struct MinimapRow {
     pub kind: HighlightKind,
 }
 
+/// Parsed, highlighted, in-memory view of a single source file.
+/// Created by `FileBuffer::new`; read by the renderer for source and minimap display.
 pub struct FileBuffer {
     rope: Rope,
     /// Held for Phase 6 incremental re-parse; unused until then. `None`
@@ -87,6 +100,7 @@ pub struct FileBuffer {
     anchors: AnchorList,
 }
 
+/// Leaf-node-only highlight query for TOML, overriding the bundled grammar query.
 /// Leaf-only TOML captures. The crate's shipped HIGHLIGHTS_QUERY has a
 /// `(pair (bare_key)) @property` pattern that captures the whole pair
 /// node; outermost-first overlap resolution would keep that whole-line
@@ -101,6 +115,7 @@ const TOML_HIGHLIGHTS: &str = r#"
 [(offset_date_time) (local_date_time) (local_date) (local_time)] @string.special
 "#;
 
+/// Construction, line/span access, minimap queries, and anchor management.
 impl FileBuffer {
     /// `ext` is the bare lowercase file extension (no dot). Known
     /// extensions parse and highlight; anything else is plain mode —
@@ -153,14 +168,17 @@ impl FileBuffer {
         Some((text, spans.as_slice()))
     }
 
+    /// Convert a byte offset to its 0-based line index, clamped to file length.
     pub fn byte_to_line(&self, byte: usize) -> usize {
         self.rope.byte_to_line(byte.min(self.rope.len_bytes()))
     }
 
+    /// Register a tracked byte position; survives future edits via `AnchorList::remap`.
     pub fn create_anchor(&mut self, offset: usize) -> AnchorId {
         self.anchors.create(offset)
     }
 
+    /// Return the current byte offset of a previously registered anchor.
     pub fn resolve_anchor(&self, id: AnchorId) -> usize {
         self.anchors.resolve(id)
     }

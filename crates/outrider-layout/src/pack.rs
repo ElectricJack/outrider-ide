@@ -1,3 +1,8 @@
+//! Shelf-pack algorithm: bottom-up sizing pass followed by a top-down
+//! absolute-position pass. Children are sorted by kind group and height
+//! (or by source order for prose / C-family files) then placed column-first
+//! toward a configurable aspect ratio, producing stable, deterministic layouts.
+
 use std::collections::BTreeMap;
 
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
@@ -32,6 +37,7 @@ pub struct PackConfig {
     pub aspect: f64,
 }
 
+/// Output of a full layout pass: world-space rectangles for every symbol.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackLayout {
     /// Absolute rects for every node; the root sits at (0, 0).
@@ -86,6 +92,7 @@ fn file_ext(qualified_path: &str) -> Option<&str> {
     file.rfind('.').map(|dot| &file[dot + 1..])
 }
 
+/// True if the plain file name (no path) has a documentation extension.
 fn name_is_doc(name: &str) -> bool {
     name.rfind('.').is_some_and(|dot| is_doc_ext(&name[dot + 1..]))
 }
@@ -194,6 +201,8 @@ fn size(
     wh
 }
 
+/// Top-down pass: converts relative positions from `size` into absolute
+/// world-space `Rect`s by accumulating parent offsets recursively.
 fn absolute(
     node: &SymbolNode,
     ox: f64,

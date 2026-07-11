@@ -1,3 +1,7 @@
+//! Git churn analysis: commit-frequency per file, normalized to percentiles,
+//! annotated onto the `SymbolTree`. Results are cached in `.outrider/churn-cache.json`
+//! keyed by HEAD so repeated opens skip the `git log` invocation (spec §5.4).
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -41,6 +45,7 @@ pub fn percentiles(values: &[u64]) -> Vec<f32> {
         .collect()
 }
 
+/// On-disk cache record: HEAD SHA plus the full commit-count map.
 #[derive(Serialize, Deserialize)]
 struct ChurnCache {
     head: String,
@@ -78,6 +83,7 @@ pub fn churn_counts(repo_root: &Path) -> anyhow::Result<BTreeMap<String, u64>> {
     Ok(counts)
 }
 
+/// Run a git subcommand in `repo_root` and return its UTF-8 stdout, or error on non-zero exit.
 fn git_stdout(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -106,7 +112,7 @@ pub fn annotate(tree: &mut SymbolTree, counts: &BTreeMap<String, u64>) {
     set_percentiles(&mut tree.root, &file_pcts, &folder_pcts);
 }
 
-/// Post-order: files read the counts map, folders sum descendants.
+/// Post-order traversal: assign raw commit counts to file nodes and sum them up to folder nodes.
 fn set_counts(node: &mut SymbolNode, counts: &BTreeMap<String, u64>) -> u64 {
     match node.id.kind {
         SymbolKind::File => {
@@ -129,6 +135,7 @@ fn set_counts(node: &mut SymbolNode, counts: &BTreeMap<String, u64>) -> u64 {
     node.churn_count
 }
 
+/// Collect raw counts into separate file and folder slices for percentile computation.
 fn collect_counts(node: &SymbolNode, files: &mut Vec<u64>, folders: &mut Vec<u64>) {
     match node.id.kind {
         SymbolKind::File => files.push(node.churn_count),
@@ -148,6 +155,7 @@ fn zip_pct(counts: &[u64]) -> BTreeMap<u64, f32> {
     counts.iter().copied().zip(pcts).collect()
 }
 
+/// Write percentile values onto the tree; file nodes also push their values down to child items.
 fn set_percentiles(
     node: &mut SymbolNode,
     file_pcts: &BTreeMap<u64, f32>,
@@ -170,6 +178,7 @@ fn set_percentiles(
     }
 }
 
+/// Recursively propagate a file's churn values to all its descendant item nodes.
 fn inherit(children: &mut [SymbolNode], pct: f32, count: u64) {
     for child in children {
         child.churn = pct;

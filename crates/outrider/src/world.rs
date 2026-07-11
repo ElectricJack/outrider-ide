@@ -1,12 +1,21 @@
+//! World model: zoom-rung thresholds, draw-mode classification, and the
+//! visible-node walk that projects the packed layout into per-frame DrawItems.
+//! Entry points are `visible_nodes` (paint) and `hit_test` (pointer events).
+
 use outrider_index::{SymbolNode, SymbolTree};
 
 use crate::camera::Camera;
 use crate::content;
 
+/// Minimum on-screen box height (px) before a node merges into its parent.
 pub const MERGE_PX: f64 = 4.0;
+/// Minimum height (px) for a Label-rung box; below this it falls back to Dot.
 pub const LABEL_PX: f64 = 20.0;
+/// Minimum height (px) for Card rung; below this Label is used.
 pub const CARD_PX: f64 = 80.0;
+/// Minimum height (px) for Detail rung; below this Card is used.
 pub const DETAIL_PX: f64 = 250.0;
+/// Minimum height (px) for Full rung; below this Detail is used.
 pub const FULL_PX: f64 = 700.0;
 /// Full is useless in a sliver column; below this width it downgrades to Detail.
 pub const CODE_MIN_W: f64 = 300.0;
@@ -34,12 +43,18 @@ pub fn pack_config() -> outrider_layout::PackConfig {
     }
 }
 
+/// Level-of-detail ladder for container boxes, driven by on-screen pixel height.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rung {
+    /// Solid fill only — box too small for any text.
     Dot,
+    /// Pinned name row only.
     Label,
+    /// Name + one meta line (churn/size).
     Card,
+    /// Name + multi-line summary (doc, kind counts).
     Detail,
+    /// Full content: doc, inventory, and code for leaf items.
     Full,
 }
 
@@ -103,6 +118,7 @@ pub enum Draw {
     Leaf(LeafDraw),
 }
 
+/// Screen-space rectangle in f64 pixels (may be clipped to the viewport).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PxRect {
     pub x: f64,
@@ -111,6 +127,7 @@ pub struct PxRect {
     pub h: f64,
 }
 
+/// One visible node ready for painting: screen geometry, LOD mode, and source node.
 #[derive(Debug)]
 pub struct DrawItem<'a> {
     pub node: &'a SymbolNode,
@@ -118,6 +135,7 @@ pub struct DrawItem<'a> {
     pub px: PxRect,
     /// The node's own box width — text lives in this strip.
     pub label_w: f64,
+    /// Nesting depth from the root (0 = root).
     pub level: u8,
     pub draw: Draw,
     /// UNclipped screen-x of the box left (`px.x` is clipped to the viewport).
@@ -144,6 +162,7 @@ pub fn visible_nodes<'a>(
     out
 }
 
+/// Recursive DFS helper for `visible_nodes`: project, cull, classify, clip.
 fn walk<'a>(
     node: &'a SymbolNode,
     pack: &outrider_layout::PackLayout,

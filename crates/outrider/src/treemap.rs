@@ -1,3 +1,8 @@
+//! Main GPUI view for the outrider treemap — drives the render loop, handles
+//! all input (mouse drag/zoom/click, keyboard navigation), and translates the
+//! world-space layout from `outrider-layout` into per-frame paint instructions
+//! (quads, text runs, and baked texture quads) via a static canvas closure.
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -41,6 +46,8 @@ fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
 /// Left text inset shared by name rows and body rows.
 pub(crate) const BODY_PAD: f64 = 6.0;
 
+/// Root GPUI view: owns the symbol tree, pack layout, camera state, buffer
+/// cache, and texture cache; produces a full-screen canvas each frame.
 pub struct TreemapView {
     tree: SymbolTree,
     layout: PackLayout,
@@ -336,7 +343,10 @@ fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     }
 }
 
+/// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
+    /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
+    /// camera is deferred until the first render supplies a viewport.
     pub fn new(tree: SymbolTree, layout: PackLayout, cx: &mut Context<Self>) -> Self {
         let root_id = tree.root.id.clone();
         let file_symbols = collect_file_symbols(&tree);
@@ -359,6 +369,7 @@ impl TreemapView {
         }
     }
 
+    /// World-space rect of the root node, used for Home framing.
     fn root_rect(&self) -> Rect {
         self.layout
             .rects
@@ -466,6 +477,8 @@ impl TreemapView {
         Some(NameRow { x: (item.px.x + BODY_PAD) as f32, y: y as f32, font_px: font, text })
     }
 
+    /// Advance the tween, materialize buffers/textures, and build the
+    /// `PaintItem` list for the current frame; also kicks off queued bakes.
     fn paint_items(&mut self, vw: f64, vh: f64) -> Vec<PaintItem> {
         if let Some((tw, started)) = self.tween {
             let t = started.elapsed().as_secs_f64();
@@ -633,6 +646,8 @@ impl TreemapView {
     }
 }
 
+/// GPUI render entry point: wires input handlers onto the map canvas and
+/// composes the titlebar + canvas into the window element tree.
 impl Render for TreemapView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.focus_handle.is_focused(window) {

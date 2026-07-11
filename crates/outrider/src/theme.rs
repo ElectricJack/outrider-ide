@@ -1,9 +1,18 @@
+//! Visual design tokens and color-derivation functions for the treemap renderer.
+//! All colors are 24-bit sRGB (`0xRRGGBB`) unless noted; higher-level modules
+//! call the functions here rather than hard-coding palette values.
+
 use outrider_index::buffer::HighlightKind;
 
+/// Window and panel background color.
 pub const BG: u32 = 0x1a1a1c;
+/// Churn-stripe base (neutral, zero activity).
 pub const FILL_COLD: u32 = 0x2a2a2e;
+/// Churn-stripe top (saturated red, maximum activity).
 pub const FILL_HOT: u32 = 0xb03030;
+/// Primary label and code text color.
 pub const TEXT_PRIMARY: u32 = 0xd8d8d8;
+/// Dimmed text for secondary labels, button glyphs, and hints.
 pub const TEXT_SECONDARY: u32 = 0x9a9a9a;
 /// Focused-node border accent (clearly distinct from churn fills/borders).
 pub const FOCUS_BORDER: u32 = 0x4da6ff;
@@ -31,9 +40,13 @@ const FILE_BLEND: f32 = 0.25;
 /// Semantic category for box background tinting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoxTint {
+    /// No tint; use the base depth/kind fill unchanged.
     Normal,
+    /// Type-definition items (struct, enum, trait, interface, type alias).
     TypeDef,
+    /// Folder whose contents are predominantly documentation files.
     DocsFolder,
+    /// Folder whose contents are predominantly test files.
     TestFolder,
 }
 /// Churn heat stripe width at the box's left edge.
@@ -41,10 +54,12 @@ pub const STRIPE_W: f32 = 3.0;
 /// Corner radius for all box quads.
 pub const CORNER_RADIUS: f32 = 4.0;
 
+/// Linear interpolation between two 8-bit channel values.
 fn lerp_channel(a: u32, b: u32, t: f32) -> u32 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u32 & 0xff
 }
 
+/// Per-channel linear blend between two packed `0xRRGGBB` colors.
 fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
     let r = lerp_channel((a >> 16) & 0xff, (b >> 16) & 0xff, t);
     let g = lerp_channel((a >> 8) & 0xff, (b >> 8) & 0xff, t);
@@ -66,8 +81,11 @@ pub fn depth_fill(level: u8) -> u32 {
 /// Whether a box is a leaf page, a file/item container, or a folder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoxKind {
+    /// A leaf symbol page that renders source code lines.
     Leaf,
+    /// A file or item container; uses the warm depth ramp.
     File,
+    /// A folder container; uses the cool depth ramp.
     Folder,
 }
 

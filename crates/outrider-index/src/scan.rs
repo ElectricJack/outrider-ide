@@ -1,3 +1,7 @@
+//! Filesystem scanner and symbol-tree assembler.
+//! `scan_files` discovers repo source files (respecting .gitignore); `build_tree`
+//! wires them together with parsed items into the folder/file/item `SymbolTree`.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +18,7 @@ pub struct ParsedFile {
     pub doc: Option<String>,
 }
 
+/// A discovered source file: its repo-relative path and raw size metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedFile {
     pub rel_path: PathBuf,
@@ -54,6 +59,7 @@ pub fn scan_files(repo_root: &Path) -> anyhow::Result<Vec<ScannedFile>> {
     Ok(files)
 }
 
+/// Counts lines in a byte slice, treating a trailing newline as part of the last line.
 fn count_lines(bytes: &[u8]) -> u64 {
     if bytes.is_empty() {
         return 0;
@@ -96,6 +102,8 @@ pub fn build_tree(
     }
 }
 
+/// Recursively constructs a `Folder` node from a pre-decomposed file list,
+/// injecting parsed items and chunk-splitting large unparsed files.
 fn build_folder(
     repo_root: &Path,
     name: &str,
@@ -194,6 +202,7 @@ fn build_folder(
     }
 }
 
+/// Joins a parent qualified path and a child name with `/`, or returns `name` if parent is empty.
 fn join_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_string()

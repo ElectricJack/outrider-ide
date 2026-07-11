@@ -1,3 +1,7 @@
+//! Application entry point for the outrider treemap visualizer.
+//! Indexes the target repository, runs the shelf-pack layout pass, then
+//! opens a GPUI window hosting `TreemapView` with client-side decorations.
+
 mod buffers;
 mod camera;
 mod chrome;
@@ -17,6 +21,8 @@ use gpui_platform::application;
 
 use crate::treemap::TreemapView;
 
+/// Index the repo passed as `argv[1]` (or cwd), pack the layout, and open
+/// the main treemap window.
 fn main() {
     let repo = std::env::args()
         .nth(1)
