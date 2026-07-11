@@ -151,6 +151,8 @@ fn code_line(
 
 /// Content-table rows for a container, pinned to `pin_y` (which may be
 /// stacked below ancestor headers when multiple containers are pinned).
+/// `max_h` caps body text to the zoomed container-header area so it
+/// never bleeds into the children zone.
 fn container_body(
     node: &SymbolNode,
     rung: Rung,
@@ -158,6 +160,7 @@ fn container_body(
     label_w: f64,
     vh: f64,
     pin_y: f64,
+    max_h: f64,
 ) -> Vec<BodyText> {
     if rung == Rung::Dot || rung == Rung::Label {
         return Vec::new();
@@ -166,7 +169,7 @@ fn container_body(
     let mut out = Vec::new();
     for (k, line) in content::body_lines(node, rung).into_iter().enumerate() {
         let y = pin_y + HEADER + k as f64 * LINE_STEP;
-        if y + LINE_STEP > px.y + px.h || y > vh {
+        if y + LINE_STEP > pin_y + max_h || y + LINE_STEP > px.y + px.h || y > vh {
             break;
         }
         let (text, color) = match line {
@@ -472,14 +475,17 @@ impl TreemapView {
                     let stack_bottom =
                         header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
                     let pin_y = item.px.y.max(stack_bottom);
+                    let ch_px =
+                        (HEADER + 2.0 * LINE_STEP) * camera.zoom;
                     if rung != Rung::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
                     }
                     body = container_body(
-                        item.node, rung, &item.px, item.label_w, vh, pin_y,
+                        item.node, rung, &item.px, item.label_w, vh, pin_y, ch_px,
                     );
                     if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
-                        header_bg_h = (HEADER + body.len() as f64 * LINE_STEP) as f32;
+                        header_bg_h = (HEADER + body.len() as f64 * LINE_STEP)
+                            .min(ch_px) as f32;
                         header_bg_y = pin_y as f32;
                         header_stack
                             .push((item.level, pin_y + header_bg_h as f64));
@@ -963,7 +969,7 @@ mod tests {
     fn container_body_positions_detail_lines() {
         let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
-        let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y);
+        let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0);
         // churn readout + doc first line (no items → no kind-counts line)
         assert_eq!(body.len(), 2);
         assert_eq!(body[1].text, "Doc line.");
