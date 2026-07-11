@@ -94,6 +94,9 @@ struct PaintItem {
     focused: bool,
     /// Font size for body rows: FONT_PX·scale for a Text leaf, else 12.0.
     body_font_px: f32,
+    /// Height of an opaque header-background band painted behind container
+    /// name + body text so children's boxes don't occlude the header.
+    header_bg_h: f32,
     name: Option<NameRow>,
     body: Vec<BodyText>,
     bars: Vec<MinimapBar>,
@@ -426,6 +429,7 @@ impl TreemapView {
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
             let fill = theme::box_fill(is_leaf, item.level);
             let mut body_font_px = FONT_PX as f32;
+            let mut header_bg_h = 0.0f32;
             let mut name = None;
             let mut body = Vec::new();
             let mut bars = Vec::new();
@@ -435,6 +439,9 @@ impl TreemapView {
                         name = Self::pinned_name(&item, rung == Rung::Label);
                     }
                     body = container_body(item.node, rung, &item.px, item.left, item.label_w, vh);
+                    if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
+                        header_bg_h = (HEADER + body.len() as f64 * LINE_STEP) as f32;
+                    }
                 }
                 Draw::Leaf(LeafDraw::Dot) => {}
                 Draw::Leaf(LeafDraw::Label) => {
@@ -479,6 +486,7 @@ impl TreemapView {
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
                 focused: item.node.id == focus_id,
                 body_font_px,
+                header_bg_h,
                 name,
                 body,
                 bars,
@@ -699,8 +707,22 @@ impl Render for TreemapView {
                                 ));
                             }
                         }
-                        // Pass 2: text (names + body) on top of all quads.
+                        // Pass 2: header backgrounds + text on top of all quads.
                         for item in &items {
+                            if item.header_bg_h > 0.0 {
+                                let hb = Bounds::new(
+                                    point(origin.x + px(item.x + 1.0), origin.y + px(item.y + 1.0)),
+                                    size(px((item.w - 2.0).max(0.0)), px(item.header_bg_h)),
+                                );
+                                window.paint_quad(quad(
+                                    hb,
+                                    px(0.),
+                                    rgb(item.fill),
+                                    px(0.),
+                                    rgb(item.fill),
+                                    BorderStyle::default(),
+                                ));
+                            }
                             if let Some(n) = &item.name {
                                 let line = window.text_system().shape_line(
                                     n.text.clone().into(),
