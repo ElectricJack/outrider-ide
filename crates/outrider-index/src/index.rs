@@ -85,7 +85,7 @@ fn to_symbol_node(item: RawItem, parent_qual: &str) -> SymbolNode {
         name: item.name,
         byte_range: Some(item.byte_range),
         signature: Some(item.signature),
-        doc: None,
+        doc: item.doc,
         measure: item.line_count,
         churn: 0.0,
         churn_count: 0,

@@ -1,6 +1,7 @@
 //! Tree-sitter-based source parsers for Rust, Python, C, JS/TS/TSX, and C#.
 //! Each `parse_*_items` function returns a nested `RawItem` tree that mirrors
-//! the language's structural hierarchy. `file_doc` extracts `//!` module docs.
+//! the language's structural hierarchy. `file_doc` extracts `//!` module docs;
+//! each item carries the `///` block found directly above it.
 
 use std::ops::Range;
 
@@ -16,6 +17,8 @@ pub struct RawItem {
     pub kind: SymbolKind,
     pub name: String,
     pub signature: String,
+    /// `///` block directly above the item, marker stripped; None without one.
+    pub doc: Option<String>,
     pub byte_range: Range<usize>,
     pub line_count: u64,
     pub children: Vec<RawItem>,
@@ -278,6 +281,7 @@ fn collect_items(
                 kind: SymbolKind::Item { label: label.into() },
                 name: name_fn(child, src),
                 signature: item_signature(child, src),
+                doc: item_doc(src, child.byte_range().start),
                 byte_range: child.byte_range(),
                 line_count: (child.end_position().row - child.start_position().row + 1) as u64,
                 children: collect_items(child, src, kind_fn, name_fn),
@@ -322,6 +326,45 @@ fn item_signature(node: Node, src: &[u8]) -> String {
     let text = node_text(node, src);
     let end = text.find(['{', ';']).unwrap_or(text.len());
     text[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Consecutive `///` lines directly above an item, scanned backwards from
+/// its start: the marker plus one following space is stripped and lines are
+/// joined like `file_doc`. Attribute/decorator lines (`#[…]`, `[…]`, `@…`)
+/// and blanks between the block and the item are skipped; `////` separators
+/// and any other content stop the scan. None when there is no block.
+fn item_doc(src: &[u8], item_start: usize) -> Option<String> {
+    let mut collected: Vec<String> = Vec::new();
+    let mut end = item_start;
+    loop {
+        let start = src[..end].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let line = String::from_utf8_lossy(&src[start..end]);
+        let t = line.trim();
+        match t.strip_prefix("///") {
+            Some(rest) if !rest.starts_with('/') => {
+                collected.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            }
+            _ => {
+                let gap = t.is_empty()
+                    || t.starts_with("#[")
+                    || t.starts_with('[')
+                    || t.starts_with('@');
+                if !collected.is_empty() || !gap {
+                    break;
+                }
+            }
+        }
+        if start == 0 {
+            break;
+        }
+        end = start - 1;
+    }
+    if collected.is_empty() {
+        None
+    } else {
+        collected.reverse();
+        Some(collected.join("\n"))
+    }
 }
 
 /// Leading `//!` block: skip blank lines, collect consecutive `//!` lines,
@@ -444,6 +487,27 @@ fn free() {
         assert_eq!(file_doc(b"\n\n//! After blanks.\nfn x() {}\n"), Some("After blanks.".to_string()));
         assert_eq!(file_doc(b"fn x() {}\n"), None);
         assert_eq!(file_doc(b"// plain comment\n//! not leading\n"), None);
+    }
+
+    #[test]
+    fn item_docs_attach_to_rust_items() {
+        let src = b"/// Adds numbers.\n/// Second line.\n#[inline]\npub fn add() {}\n\nfn bare() {}\n\n/// Struct doc.\n#[derive(Debug)]\nstruct S { x: i32 }\n\n//// separator, not a doc\nfn sep() {}\n";
+        let items = super::parse_rust_items(src).unwrap();
+        assert_eq!(items[0].doc.as_deref(), Some("Adds numbers.\nSecond line."));
+        assert_eq!(items[1].doc, None);
+        assert_eq!(items[2].doc.as_deref(), Some("Struct doc."));
+        assert_eq!(items[3].doc, None);
+    }
+
+    #[test]
+    fn item_docs_attach_to_nested_methods_and_ignore_file_docs() {
+        let src = b"//! File doc.\n\nstruct P;\n\nimpl P {\n    /// Frobs the P.\n    fn frob(&self) {}\n\n    fn plain(&self) {}\n}\n";
+        let items = super::parse_rust_items(src).unwrap();
+        // the leading //! block must not attach to the first item
+        assert_eq!(items[0].doc, None);
+        let imp = &items[1];
+        assert_eq!(imp.children[0].doc.as_deref(), Some("Frobs the P."));
+        assert_eq!(imp.children[1].doc, None);
     }
 
     #[test]
