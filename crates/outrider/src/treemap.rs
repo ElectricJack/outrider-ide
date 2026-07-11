@@ -471,14 +471,9 @@ impl TreemapView {
             let mut bars = Vec::new();
             match item.draw {
                 Draw::Container(rung) => {
-                    let is_pinned = item.top < item.px.y;
-                    let pin_y = if is_pinned {
-                        let stack_bottom =
-                            header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
-                        item.px.y.max(stack_bottom)
-                    } else {
-                        item.px.y
-                    };
+                    let stack_bottom =
+                        header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
+                    let pin_y = item.px.y.max(stack_bottom);
                     if rung != Rung::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
                     }
@@ -488,10 +483,8 @@ impl TreemapView {
                     if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
                         header_bg_h = (HEADER + body.len() as f64 * LINE_STEP) as f32;
                         header_bg_y = pin_y as f32;
-                        if is_pinned {
-                            header_stack
-                                .push((item.level, pin_y + header_bg_h as f64));
-                        }
+                        header_stack
+                            .push((item.level, pin_y + header_bg_h as f64));
                     }
                 }
                 Draw::Leaf(LeafDraw::Dot) => {}
@@ -759,7 +752,52 @@ impl Render for TreemapView {
                                 ));
                             }
                         }
-                        // Pass 2: header backgrounds + text on top of all quads.
+                        // Pass 2a: leaf / non-header text (rendered under
+                        // pinned headers so code doesn't bleed through).
+                        for item in &items {
+                            if item.header_bg_h > 0.0 {
+                                continue;
+                            }
+                            if let Some(n) = &item.name {
+                                let line = window.text_system().shape_line(
+                                    n.text.clone().into(),
+                                    px(n.font_px),
+                                    &[run(n.text.len(), theme::TEXT_PRIMARY)],
+                                    None,
+                                );
+                                let _ = line.paint(
+                                    point(origin.x + px(n.x), origin.y + px(n.y)),
+                                    px(n.font_px * 1.3),
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    _cx,
+                                );
+                            }
+                            let body_line_height = px(item.body_font_px * 1.3);
+                            for bt in &item.body {
+                                if bt.text.is_empty() {
+                                    continue;
+                                }
+                                let runs: Vec<TextRun> =
+                                    bt.runs.iter().map(|&(len, color)| run(len, color)).collect();
+                                let line = window.text_system().shape_line(
+                                    bt.text.clone().into(),
+                                    px(item.body_font_px),
+                                    &runs,
+                                    None,
+                                );
+                                let _ = line.paint(
+                                    point(origin.x + px(bt.x), origin.y + px(bt.y)),
+                                    body_line_height,
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    _cx,
+                                );
+                            }
+                        }
+                        // Pass 2b: header backgrounds (on top of leaf text).
                         for item in &items {
                             if item.header_bg_h > 0.0 {
                                 let hb = Bounds::new(
@@ -777,6 +815,12 @@ impl Render for TreemapView {
                                     rgb(item.fill),
                                     BorderStyle::default(),
                                 ));
+                            }
+                        }
+                        // Pass 2c: header text (on top of header backgrounds).
+                        for item in &items {
+                            if item.header_bg_h == 0.0 {
+                                continue;
                             }
                             if let Some(n) = &item.name {
                                 let line = window.text_system().shape_line(
