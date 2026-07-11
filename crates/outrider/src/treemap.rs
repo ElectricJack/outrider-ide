@@ -55,6 +55,9 @@ pub struct TreemapView {
     file_symbols: BTreeMap<String, Vec<(SymbolId, usize)>>,
     textures: TextureCache,
     bake_pending: bool,
+    /// The four beam-cast arrow targets of the focused node (Left, Right,
+    /// Up, Down), cached because layout is immutable per session.
+    neighbors: Option<(SymbolId, [Option<SymbolId>; 4])>,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -94,6 +97,8 @@ struct PaintItem {
     border: u32,
     stripe: Option<u32>,
     focused: bool,
+    /// One of the four arrow-key targets — painted with a dimmed focus border.
+    neighbor: bool,
     /// Font size for body rows: FONT_PX·scale for a Text leaf, else 12.0.
     body_font_px: f32,
     /// Height of an opaque header-background band painted behind container
@@ -309,6 +314,7 @@ impl TreemapView {
             file_symbols,
             textures: TextureCache::new(rasterize::MAX_BYTES),
             bake_pending: false,
+            neighbors: None,
         }
     }
 
@@ -410,6 +416,13 @@ impl TreemapView {
         }
         let camera = *self.camera.as_ref().unwrap();
         let focus_id = self.focus.current.clone();
+        let stale = !matches!(&self.neighbors, Some((k, _)) if k == &focus_id);
+        if stale {
+            let index = TreeIndex::new(&self.tree);
+            self.neighbors =
+                Some((focus_id.clone(), focus::neighbors(&focus_id, &self.layout, &index)));
+        }
+        let (_, neighbor_ids) = self.neighbors.clone().unwrap();
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
         let mut out = Vec::with_capacity(items.len());
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
@@ -516,6 +529,8 @@ impl TreemapView {
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
                 focused: item.node.id == focus_id,
+                neighbor: item.node.id != focus_id
+                    && neighbor_ids.iter().flatten().any(|n| *n == item.node.id),
                 body_font_px,
                 header_bg_h,
                 header_bg_y,
@@ -727,6 +742,8 @@ impl Render for TreemapView {
                             );
                             let (bw, bc) = if item.focused {
                                 (2.0, theme::FOCUS_BORDER)
+                            } else if item.neighbor {
+                                (1.0, theme::neighbor_border(item.border))
                             } else {
                                 (1.0, item.border)
                             };
