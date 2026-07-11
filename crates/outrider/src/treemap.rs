@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, quad, rgb, size, App, Bounds, BorderStyle, Context,
-    Corners, FocusHandle, Pixels, RenderImage, TextAlign, TextRun, Window,
+    canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, Bounds,
+    BorderStyle, Context, Corners, FocusHandle, Pixels, RenderImage, TextAlign, TextRun, Window,
 };
 use outrider_index::buffer::HighlightSpan;
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
@@ -740,19 +740,12 @@ impl Render for TreemapView {
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
                                 size(px(item.w), px(item.h)),
                             );
-                            let (bw, bc) = if item.focused {
-                                (2.0, theme::FOCUS_BORDER)
-                            } else if item.neighbor {
-                                (1.0, theme::neighbor_border(item.border))
-                            } else {
-                                (1.0, item.border)
-                            };
                             window.paint_quad(quad(
                                 b,
                                 px(theme::CORNER_RADIUS),
                                 rgb(item.fill),
-                                px(bw),
-                                rgb(bc),
+                                px(1.0),
+                                rgb(item.border),
                                 BorderStyle::default(),
                             ));
                             if let Some(heat) = item.stripe {
@@ -907,6 +900,30 @@ impl Render for TreemapView {
                                     _cx,
                                 );
                             }
+                        }
+                        // Pass 3: focus + neighbor rings on top of everything,
+                        // so child boxes, text, and headers never occlude them.
+                        for item in &items {
+                            if !item.focused && !item.neighbor {
+                                continue;
+                            }
+                            let b = Bounds::new(
+                                point(origin.x + px(item.x), origin.y + px(item.y)),
+                                size(px(item.w), px(item.h)),
+                            );
+                            let (bw, bc) = if item.focused {
+                                (2.0, rgb(theme::FOCUS_BORDER))
+                            } else {
+                                (1.0, rgba(theme::NEIGHBOR_BORDER))
+                            };
+                            window.paint_quad(quad(
+                                b,
+                                px(theme::CORNER_RADIUS),
+                                transparent_black(),
+                                px(bw),
+                                bc,
+                                BorderStyle::default(),
+                            ));
                         }
                     },
                 )

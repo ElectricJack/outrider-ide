@@ -99,11 +99,9 @@ pub fn border_for(fill: u32) -> u32 {
     lerp_rgb(fill, 0xffffff, 0.12)
 }
 
-/// Border for the four arrow-key neighbor targets: the focus color
-/// blended halfway toward the item's normal border.
-pub fn neighbor_border(border: u32) -> u32 {
-    lerp_rgb(FOCUS_BORDER, border, 0.5)
-}
+/// Ring around the four arrow-key neighbor targets, painted on top of all
+/// content: translucent white (0xRRGGBBAA, use with `gpui::rgba`).
+pub const NEIGHBOR_BORDER: u32 = 0xffffff80;
 
 /// Syntax palette for Full-rung code: one color per HighlightKind,
 /// legible on BG (0x1a1a1c). Default falls back to TEXT_PRIMARY.
@@ -146,14 +144,6 @@ mod tests {
         assert!((b >> 8) & 0xff >= (f >> 8) & 0xff);
         assert!(b & 0xff >= f & 0xff);
         assert_ne!(b, f);
-    }
-
-    #[test]
-    fn neighbor_border_is_a_genuine_blend() {
-        let base = border_for(box_fill(BoxKind::Leaf, 0, BoxTint::Normal));
-        let nb = neighbor_border(base);
-        assert_ne!(nb, FOCUS_BORDER, "must be dimmer than the focus border");
-        assert_ne!(nb, base, "must be visibly different from the normal border");
     }
 
     #[test]
