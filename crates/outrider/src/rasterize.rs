@@ -32,7 +32,6 @@ pub struct LeafTexture {
 
 impl LeafTexture {
     /// The level to paint at `screen_h` on-screen pixels, or None if empty.
-    #[allow(dead_code)]
     pub fn level_for(&self, screen_h: f32) -> Option<&Arc<RenderImage>> {
         if self.levels.is_empty() {
             return None;
@@ -45,7 +44,6 @@ impl LeafTexture {
 
 /// Index of the smallest level (heights ordered largest→smallest) whose
 /// height still covers `screen_h`; clamps to the last level below that.
-#[allow(dead_code)]
 pub fn pick_level(heights: &[u32], screen_h: f32) -> usize {
     let mut best = 0;
     for (i, &lh) in heights.iter().enumerate() {
@@ -232,7 +230,6 @@ use outrider_index::SymbolId;
 /// Bakes per frame; keeps zoom-out pop-in bounded without stalling a frame.
 pub const BAKES_PER_FRAME: usize = 4;
 /// Total texture budget across all levels of all cached leaves.
-#[allow(dead_code)]
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 
 struct Entry {
@@ -242,7 +239,6 @@ struct Entry {
 
 /// Per-leaf texture cache: misses queue during the item pass, then
 /// `bake_queued` bakes the largest few and LRU-evicts past the budget.
-#[allow(dead_code)]
 pub struct TextureCache {
     raster: Rasterizer,
     entries: HashMap<SymbolId, Entry>,
@@ -253,7 +249,6 @@ pub struct TextureCache {
     retired: Vec<Arc<RenderImage>>,
 }
 
-#[allow(dead_code)]
 impl TextureCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {

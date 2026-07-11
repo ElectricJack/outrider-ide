@@ -114,12 +114,6 @@ pub fn syntax_color(kind: HighlightKind) -> u32 {
     }
 }
 
-/// Minimap bar color: the syntax color dimmed toward the page background so
-/// the far-zoom minimap reads as texture rather than full-brightness code.
-pub fn minimap_color(kind: HighlightKind) -> u32 {
-    lerp_rgb(syntax_color(kind), CODE_BG, 0.50)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,16 +204,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn minimap_color_dims_syntax_toward_code_bg() {
-        use outrider_index::buffer::HighlightKind;
-        let kw = syntax_color(HighlightKind::Keyword);
-        assert_eq!(minimap_color(HighlightKind::Keyword), lerp_rgb(kw, CODE_BG, 0.50));
-        assert_eq!(
-            minimap_color(HighlightKind::Default),
-            lerp_rgb(TEXT_PRIMARY, CODE_BG, 0.50)
-        );
-        // dimming moves the color: never equal to the full-brightness syntax color
-        assert_ne!(minimap_color(HighlightKind::Keyword), kw);
-    }
 }

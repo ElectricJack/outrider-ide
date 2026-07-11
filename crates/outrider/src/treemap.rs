@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, size, App, Bounds, BorderStyle, Context,
-    FocusHandle, Pixels, TextAlign, TextRun, Window,
+    Corners, FocusHandle, Pixels, RenderImage, TextAlign, TextRun, Window,
 };
 use outrider_index::buffer::HighlightSpan;
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
@@ -13,6 +14,7 @@ use crate::camera::{self, Camera, CameraTween};
 use crate::chrome;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
+use crate::rasterize::{self, TextureCache};
 use crate::theme;
 use crate::world::{self, Draw, LeafDraw, Rung};
 
@@ -35,9 +37,7 @@ fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
     }
 }
 
-/// Monospace advance width used by the minimap bars (spec §3): 0.6·FONT_PX.
-const CHAR_ADV: f64 = 0.6 * content::FONT_PX;
-/// Left text inset shared by name rows, body rows, and minimap bars.
+/// Left text inset shared by name rows and body rows.
 pub(crate) const BODY_PAD: f64 = 6.0;
 
 pub struct TreemapView {
@@ -53,6 +53,8 @@ pub struct TreemapView {
     focus_handle: FocusHandle,
     buffers: BufferManager,
     file_symbols: BTreeMap<String, Vec<(SymbolId, usize)>>,
+    textures: TextureCache,
+    bake_pending: bool,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -72,13 +74,13 @@ struct NameRow {
     text: String,
 }
 
-/// One minimap bar: a source line drawn as a single colored quad.
-struct MinimapBar {
+/// One baked-texture quad for a far-zoom leaf (replaces minimap bars).
+struct TexQuad {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
-    color: u32,
+    image: Arc<RenderImage>,
 }
 
 /// Owned, GPUI-free paint instruction — built in render (which may borrow
@@ -100,13 +102,13 @@ struct PaintItem {
     /// Y coordinate for the header background (may differ from `y` when
     /// nested pinned headers are stacked).
     header_bg_y: f32,
-    /// Opacity for body text (0..1); used for the Minimap→Text fade.
+    /// Opacity for body text (0..1); used for the Texture→Text fade.
     body_opacity: f32,
-    /// Opacity for minimap bars (0..1); inverse of body_opacity in the fade zone.
-    bar_opacity: f32,
+    /// Opacity for the baked texture quad (0..1); inverse of body_opacity in the fade zone.
+    tex_opacity: f32,
     name: Option<NameRow>,
     body: Vec<BodyText>,
-    bars: Vec<MinimapBar>,
+    tex: Option<TexQuad>,
 }
 
 /// Full-coverage colored runs for the first `len` bytes of a line from its
@@ -253,58 +255,18 @@ fn leaf_text_body(
     out
 }
 
-/// Minimap bars for a far-zoom leaf (spec §3): one colored quad per source
-/// line, pixel-aligned to the rows the glyphs occupy at the Text tier, so
-/// the Minimap→Text switch is seamless.
-fn leaf_minimap(
-    node: &SymbolNode,
-    left: f64,
-    top: f64,
-    full_h: f64,
-    vh: f64,
-    buffers: &mut BufferManager,
-    file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
-) -> Vec<MinimapBar> {
+/// Unclipped screen rect of a leaf's line area: full page width, rows
+/// starting under the header band — the same rows leaf_text_body fills,
+/// so the Text↔Texture crossfade is seamless.
+fn leaf_tex_rect(node: &SymbolNode, left: f64, top: f64, full_h: f64) -> (f64, f64, f64, f64) {
     let scale = full_h / content::natural_px(node);
-    let step = LINE_STEP * scale;
-    // At far zoom rows go sub-pixel; stride to ~one bar per screen pixel
-    // (thicker to keep coverage) instead of stacking thousands of quads.
-    let stride = ((1.0 / step).ceil() as usize).max(1);
-    let bar_h = (step * stride as f64 * 0.7) as f32;
     let content_y0 = HEADER.max(HEADER * scale);
-    let mut bars = Vec::new();
-    let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
-    let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
-    if let Some(m) = buffers.get(&rel, syms) {
-        if let Some(start) = m.symbol_start_line(&node.id) {
-            let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
-            for r in (0..count).step_by(stride) {
-                let row_y = top + content_y0 + r as f64 * LINE_STEP * scale;
-                if row_y > vh {
-                    break;
-                }
-                if row_y + step < 0.0 {
-                    continue;
-                }
-                let mr = m.buffer.minimap_row(start + r);
-                if mr.len == 0 {
-                    continue;
-                }
-                let indent = mr.indent as f64;
-                let x = left + (BODY_PAD + indent * CHAR_ADV) * scale;
-                let avail = (world::PAGE_W - BODY_PAD - indent * CHAR_ADV).max(0.0);
-                let w = (mr.len as f64 * CHAR_ADV).min(avail) * scale;
-                bars.push(MinimapBar {
-                    x: x as f32,
-                    y: (row_y + step * 0.15) as f32,
-                    w: w as f32,
-                    h: bar_h,
-                    color: theme::minimap_color(mr.kind),
-                });
-            }
-        }
-    }
-    bars
+    (
+        left,
+        top + content_y0,
+        world::PAGE_W * scale,
+        node.measure as f64 * LINE_STEP * scale,
+    )
 }
 
 /// Map a symbol node to the semantic tint for its box background.
@@ -345,6 +307,8 @@ impl TreemapView {
             focus_handle: cx.focus_handle(),
             buffers,
             file_symbols,
+            textures: TextureCache::new(rasterize::MAX_BYTES),
+            bake_pending: false,
         }
     }
 
@@ -471,10 +435,10 @@ impl TreemapView {
             let mut header_bg_h = 0.0f32;
             let mut header_bg_y = item.px.y as f32;
             let mut body_opacity = 1.0f32;
-            let mut bar_opacity = 1.0f32;
+            let mut tex_opacity = 1.0f32;
             let mut name = None;
             let mut body = Vec::new();
-            let mut bars = Vec::new();
+            let mut tex: Option<TexQuad> = None;
             match item.draw {
                 Draw::Container(rung) => {
                     let stack_bottom =
@@ -503,22 +467,22 @@ impl TreemapView {
                     if tier != LeafDraw::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, false, item.px.y);
                     }
-                    let bar_w_fade = ((item.label_w - content::BAR_FADE_W_LO)
-                        / (content::BAR_FADE_W_HI - content::BAR_FADE_W_LO))
-                        .clamp(0.0, 1.0) as f32;
-                    if bar_w_fade > 0.0 && font < content::TEXT_FADE_HI {
-                        bars = leaf_minimap(
-                            item.node,
-                            item.left,
-                            item.top,
-                            item.full_h,
-                            vh,
-                            &mut self.buffers,
-                            &self.file_symbols,
-                        );
-                        bar_opacity = bar_w_fade;
+                    if font < content::TEXT_FADE_HI {
+                        let (tx, ty, tw, th) =
+                            leaf_tex_rect(item.node, item.left, item.top, item.full_h);
+                        if tw >= 1.0 && th >= 1.0 && ty < vh && ty + th > 0.0 {
+                            if let Some(t) = self.textures.get(&item.node.id, tw * th) {
+                                tex = t.level_for(th as f32).map(|img| TexQuad {
+                                    x: tx as f32,
+                                    y: ty as f32,
+                                    w: tw as f32,
+                                    h: th as f32,
+                                    image: img.clone(),
+                                });
+                            }
+                        }
                         if font > content::TEXT_FADE_LO {
-                            bar_opacity *= 1.0
+                            tex_opacity = 1.0
                                 - ((font - content::TEXT_FADE_LO)
                                     / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
                                     as f32;
@@ -556,12 +520,35 @@ impl TreemapView {
                 header_bg_h,
                 header_bg_y,
                 body_opacity,
-                bar_opacity,
+                tex_opacity,
                 name,
                 body,
-                bars,
+                tex,
             });
         }
+        self.bake_pending = if self.textures.has_queued() {
+            let index = TreeIndex::new(&self.tree);
+            let buffers = &mut self.buffers;
+            let file_symbols = &self.file_symbols;
+            self.textures.bake_queued(|id| {
+                let node = index.node(id)?;
+                let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
+                let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
+                let m = buffers.get(&rel, syms)?;
+                let start = m.symbol_start_line(id)?;
+                let count =
+                    (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
+                let mut lines: Vec<rasterize::Line> = Vec::with_capacity(count);
+                for j in 0..count {
+                    let (text, spans) = m.buffer.line(start + j)?;
+                    let runs = runs_from_spans(text.len(), spans);
+                    lines.push((text, runs));
+                }
+                (!lines.is_empty()).then_some(lines)
+            })
+        } else {
+            false
+        };
         out
     }
 }
@@ -575,7 +562,10 @@ impl Render for TreemapView {
         let (vw, vh) = Self::map_viewport(window);
         let items = self.paint_items(vw, vh);
 
-        if self.tween.is_some() {
+        for img in self.textures.take_retired() {
+            let _ = window.drop_image(img);
+        }
+        if self.tween.is_some() || self.bake_pending {
             window.request_animation_frame();
         }
 
@@ -729,7 +719,7 @@ impl Render for TreemapView {
                             underline: None,
                             strikethrough: None,
                         };
-                        // Pass 1: quads, stripes, minimap bars (back to front).
+                        // Pass 1: quads, stripes, texture quads (back to front).
                         for item in &items {
                             let b = Bounds::new(
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
@@ -762,20 +752,32 @@ impl Render for TreemapView {
                                     BorderStyle::default(),
                                 ));
                             }
-                            for bar in &item.bars {
-                                let bb = Bounds::new(
-                                    point(origin.x + px(bar.x), origin.y + px(bar.y)),
-                                    size(px(bar.w), px(bar.h)),
+                            if let Some(t) = &item.tex {
+                                let tb = Bounds::new(
+                                    point(origin.x + px(t.x), origin.y + px(t.y)),
+                                    size(px(t.w), px(t.h)),
                                 );
-                                let bc = rgb(bar.color).opacity(item.bar_opacity);
-                                window.paint_quad(quad(
-                                    bb,
-                                    px(0.),
-                                    bc,
-                                    px(0.),
-                                    bc,
-                                    BorderStyle::default(),
-                                ));
+                                let _ = window.paint_image(
+                                    tb,
+                                    Corners::default(),
+                                    t.image.clone(),
+                                    0,
+                                    false,
+                                );
+                                // Fade out the texture as text fades in by
+                                // overlaying a semi-transparent bg-colored quad.
+                                if item.tex_opacity < 1.0 {
+                                    let fade = 1.0 - item.tex_opacity;
+                                    let oc = rgb(theme::CODE_BG).opacity(fade);
+                                    window.paint_quad(quad(
+                                        tb,
+                                        px(0.),
+                                        oc,
+                                        px(0.),
+                                        oc,
+                                        BorderStyle::default(),
+                                    ));
+                                }
                             }
                         }
                         // Pass 2a: leaf / non-header text (rendered under
@@ -913,11 +915,11 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, leaf_minimap, leaf_text_body, runs_from_spans,
+        code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
         truncate_to_width, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
-    use crate::world::{PxRect, Rung};
+    use crate::world::{self, PxRect, Rung};
 
     #[test]
     fn truncation() {
@@ -1083,21 +1085,17 @@ mod tests {
     }
 
     #[test]
-    fn leaf_minimap_bars_align_to_code_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn one() {}\n    let x = 1;\n").unwrap();
-        let leaf = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, None);
-        let mut mgr = BufferManager::new(dir.path().to_path_buf());
-        let mut file_symbols = BTreeMap::new();
-        file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 0)]);
+    fn leaf_tex_rect_covers_the_line_area() {
+        // 10-line leaf drawn at half its natural height.
+        let leaf = node(SymbolKind::Item { label: "fn".into() }, "a.rs::f", Some(0..100), 10, Some("fn f()"), None);
         let natural = crate::content::natural_px(&leaf);
-        let bars = leaf_minimap(&leaf, 0.0, 0.0, natural, 600.0, &mut mgr, &file_symbols);
-        // two non-blank source lines → two bars
-        assert_eq!(bars.len(), 2);
-        // bar 0 sits centered in the first code row (HEADER)
-        let row_y0 = HEADER;
-        assert!((f64::from(bars[0].y) - (row_y0 + LINE_STEP * 0.15)).abs() < 1e-3);
-        // second line is indented 4 spaces → its bar starts further right
-        assert!(bars[1].x > bars[0].x);
+        let full_h = natural * 0.5;
+        let (x, y, w, h) = leaf_tex_rect(&leaf, 100.0, 50.0, full_h);
+        assert!((x - 100.0).abs() < 1e-9);
+        // Scale < 1 → the content starts below the unscaled header band,
+        // exactly where leaf_text_body puts row 0.
+        assert!((y - (50.0 + HEADER)).abs() < 1e-9);
+        assert!((w - world::PAGE_W * 0.5).abs() < 1e-9);
+        assert!((h - 10.0 * LINE_STEP * 0.5).abs() < 1e-9);
     }
 }

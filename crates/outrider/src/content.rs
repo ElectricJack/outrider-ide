@@ -10,20 +10,14 @@ pub const HEADER: f64 = 4.0 + FONT_PX * 1.4;
 /// Padding below the last body row inside a leaf box.
 pub const BOTTOM_PAD: f64 = 6.0;
 
-/// Below this on-screen font size a leaf paints its minimap instead of live
-/// text (the text/minimap tier boundary).
+/// Below this on-screen font size a leaf paints its texture instead of live
+/// text (the text/texture tier boundary).
 pub const MIN_TEXT_FONT_PX: f64 = 7.0;
 
-/// Font-size range for the Minimap↔Text crossfade: text fades in from
-/// FADE_LO to FADE_HI while minimap bars fade out over the same range.
+/// Font-size range for the Texture↔Text crossfade: text fades in from
+/// FADE_LO to FADE_HI while the baked texture fades out over the same range.
 pub const TEXT_FADE_LO: f64 = 5.0;
 pub const TEXT_FADE_HI: f64 = 9.0;
-
-/// Box-width range (screen px) for the far-zoom bar fade: bars stay
-/// visible at every leaf tier (even after names disappear) and gently
-/// fade out as the box narrows, fully gone below BAR_FADE_W_LO.
-pub const BAR_FADE_W_LO: f64 = 10.0;
-pub const BAR_FADE_W_HI: f64 = 60.0;
 
 /// A leaf page: has source bytes, no children, and is not a folder.
 /// Items are code pages; childless files (markdown, TOML, plain text,
