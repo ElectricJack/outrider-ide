@@ -197,12 +197,10 @@ struct PaintItem {
     /// Opacity for the baked texture quad (0..1); inverse of body_opacity in the fade zone.
     tex_opacity: f32,
     /// Crisp 12px doc-description rows overlaid on a texture-tier leaf.
-    #[allow(dead_code)]
-    doc_rows: Vec<BodyText>, // read in the paint pass (next task)
+    doc_rows: Vec<BodyText>,
     /// Height of the translucent backdrop panel behind name + doc rows
     /// (0.0 = no overlay).
-    #[allow(dead_code)]
-    doc_panel_h: f32, // read in the paint pass (next task)
+    doc_panel_h: f32,
     name: Option<NameRow>,
     body: Vec<BodyText>,
     tex: Option<TexQuad>,
@@ -971,6 +969,58 @@ impl Render for TreemapView {
                                         }
                                     },
                                 );
+                            }
+                            // Doc overlay: translucent panel + crisp 12px doc
+                            // rows over the blurred texture. Fades out with
+                            // tex_opacity as real code text fades in. Painted
+                            // in Pass 1 so pinned headers and focus rings
+                            // (later passes) stay on top; the name row paints
+                            // over the panel in Pass 2a.
+                            if !item.doc_rows.is_empty() {
+                                let pc = rgb(theme::CODE_BG).opacity(0.85 * item.tex_opacity);
+                                let pb = Bounds::new(
+                                    point(
+                                        origin.x + px(item.x + 1.0),
+                                        origin.y + px(item.y + 1.0),
+                                    ),
+                                    size(
+                                        px((item.w - 2.0).max(0.0)),
+                                        px((item.doc_panel_h - 1.0).max(0.0)),
+                                    ),
+                                );
+                                window.paint_quad(quad(
+                                    pb,
+                                    px(0.),
+                                    pc,
+                                    px(0.),
+                                    pc,
+                                    BorderStyle::default(),
+                                ));
+                                for bt in &item.doc_rows {
+                                    let runs: Vec<TextRun> = bt
+                                        .runs
+                                        .iter()
+                                        .map(|&(len, color)| {
+                                            let mut r = run(len, color);
+                                            r.color = r.color.opacity(item.tex_opacity);
+                                            r
+                                        })
+                                        .collect();
+                                    let line = window.text_system().shape_line(
+                                        bt.text.clone().into(),
+                                        px(FONT_PX as f32),
+                                        &runs,
+                                        None,
+                                    );
+                                    let _ = line.paint(
+                                        point(origin.x + px(bt.x), origin.y + px(bt.y)),
+                                        px(FONT_PX as f32 * 1.3),
+                                        TextAlign::Left,
+                                        None,
+                                        window,
+                                        _cx,
+                                    );
+                                }
                             }
                         }
                         // Pass 2a: leaf / non-header text (rendered under
