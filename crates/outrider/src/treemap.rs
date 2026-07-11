@@ -43,6 +43,64 @@ fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
     }
 }
 
+/// Reflow a `///` doc block for the texture-tier overlay: source lines are
+/// joined into paragraphs (a blank line is a paragraph break), then each
+/// paragraph is greedy word-wrapped to the same char budget as
+/// `truncate_to_width`. Words longer than the budget are hard-split.
+#[allow(dead_code)]
+fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
+    let budget = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
+    if budget < 2 {
+        return Vec::new();
+    }
+    let budget = budget as usize;
+    let mut rows = Vec::new();
+    for para in text.split("\n\n") {
+        let joined = para.split_whitespace().collect::<Vec<_>>().join(" ");
+        if joined.is_empty() {
+            continue;
+        }
+        let mut line = String::new();
+        let mut line_len = 0usize;
+        for word in joined.split(' ') {
+            let mut word = word;
+            let mut wlen = word.chars().count();
+            while wlen > budget {
+                if line_len > 0 {
+                    rows.push(std::mem::take(&mut line));
+                    line_len = 0;
+                }
+                let cut = word
+                    .char_indices()
+                    .nth(budget)
+                    .map_or(word.len(), |(i, _)| i);
+                rows.push(word[..cut].to_string());
+                word = &word[cut..];
+                wlen = word.chars().count();
+            }
+            if wlen == 0 {
+                continue;
+            }
+            let need = if line_len == 0 { wlen } else { line_len + 1 + wlen };
+            if need > budget {
+                rows.push(std::mem::take(&mut line));
+                line.push_str(word);
+                line_len = wlen;
+            } else {
+                if line_len > 0 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                line_len = need;
+            }
+        }
+        if line_len > 0 {
+            rows.push(line);
+        }
+    }
+    rows
+}
+
 /// Left text inset shared by name rows and body rows.
 pub(crate) const BODY_PAD: f64 = 6.0;
 
@@ -1042,7 +1100,7 @@ mod tests {
 
     use super::{
         code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
-        truncate_to_width, HEADER, LINE_STEP,
+        truncate_to_width, wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -1303,5 +1361,52 @@ mod tests {
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, vh);
         let hdr = HEADER + 2.0 * LINE_STEP;
         assert!((h - (150.0 + hdr)).abs() < 1e-9);
+    }
+
+    /// w_px giving exactly `budget` chars: budget = (w - 12) / (0.62 * 12).
+    fn wrap_w(budget: usize) -> f64 {
+        12.0 + budget as f64 * 0.62 * 12.0
+    }
+
+    #[test]
+    fn wrap_doc_fits_short_text_on_one_row() {
+        assert_eq!(wrap_doc("hello world", wrap_w(11), 12.0), vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_doc_greedy_wraps_at_word_boundaries() {
+        assert_eq!(
+            wrap_doc("alpha beta gamma", wrap_w(10), 12.0),
+            vec!["alpha beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn wrap_doc_hard_splits_over_budget_words() {
+        assert_eq!(
+            wrap_doc("abcdefghijklmnopqrstuvwxy", wrap_w(10), 12.0),
+            vec!["abcdefghij", "klmnopqrst", "uvwxy"]
+        );
+    }
+
+    #[test]
+    fn wrap_doc_joins_lines_within_a_paragraph() {
+        assert_eq!(
+            wrap_doc("first line\nsecond line", wrap_w(40), 12.0),
+            vec!["first line second line"]
+        );
+    }
+
+    #[test]
+    fn wrap_doc_breaks_paragraphs_on_blank_lines() {
+        assert_eq!(
+            wrap_doc("para one\n\npara two", wrap_w(40), 12.0),
+            vec!["para one", "para two"]
+        );
+    }
+
+    #[test]
+    fn wrap_doc_returns_nothing_when_no_room() {
+        assert!(wrap_doc("anything", 13.0, 12.0).is_empty());
     }
 }
