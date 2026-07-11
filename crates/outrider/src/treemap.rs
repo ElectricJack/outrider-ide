@@ -486,19 +486,17 @@ impl TreemapView {
                     }
                 }
                 Draw::Leaf(LeafDraw::Dot) => {}
-                Draw::Leaf(LeafDraw::Label) => {
-                    if item.px.h >= 14.0 {
-                        name = Self::pinned_name(&item, false, item.px.y);
-                    }
-                }
-                Draw::Leaf(LeafDraw::Minimap | LeafDraw::Text) => {
+                Draw::Leaf(LeafDraw::Label | LeafDraw::Minimap | LeafDraw::Text) => {
                     let scale = item.full_h / content::natural_px(item.node);
                     let font = FONT_PX * scale;
                     body_font_px = (FONT_PX * scale) as f32;
                     if item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, false, item.px.y);
                     }
-                    if font < content::TEXT_FADE_HI {
+                    let bar_h_fade = ((item.full_h - content::BAR_FADE_LO)
+                        / (content::BAR_FADE_HI - content::BAR_FADE_LO))
+                        .clamp(0.0, 1.0) as f32;
+                    if bar_h_fade > 0.0 && font < content::TEXT_FADE_HI {
                         bars = leaf_minimap(
                             item.node,
                             item.left,
@@ -508,13 +506,13 @@ impl TreemapView {
                             &mut self.buffers,
                             &self.file_symbols,
                         );
-                        bar_opacity = if font > content::TEXT_FADE_LO {
-                            1.0 - ((font - content::TEXT_FADE_LO)
-                                / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
-                                as f32
-                        } else {
-                            1.0
-                        };
+                        bar_opacity = bar_h_fade;
+                        if font > content::TEXT_FADE_LO {
+                            bar_opacity *= 1.0
+                                - ((font - content::TEXT_FADE_LO)
+                                    / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
+                                    as f32;
+                        }
                     }
                     if font >= content::TEXT_FADE_LO
                         && item.label_w >= world::CODE_MIN_W

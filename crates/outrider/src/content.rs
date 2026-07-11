@@ -19,6 +19,11 @@ pub const MIN_TEXT_FONT_PX: f64 = 7.0;
 pub const TEXT_FADE_LO: f64 = 5.0;
 pub const TEXT_FADE_HI: f64 = 9.0;
 
+/// Box-height range (screen px) for the Label↔Minimap crossfade: bars
+/// fade in as the box grows past BAR_FADE_LO toward BAR_FADE_HI.
+pub const BAR_FADE_LO: f64 = 40.0;
+pub const BAR_FADE_HI: f64 = 80.0;
+
 /// A leaf page: has source bytes, no children, and is not a folder.
 /// Items are code pages; childless files (markdown, TOML, plain text,
 /// unparsed .rs) are text pages. These boxes render their content at
