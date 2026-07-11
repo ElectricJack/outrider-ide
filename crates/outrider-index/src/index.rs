@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use rayon::prelude::*;
 
-use crate::parse::{parse_rust_items, parse_c_items, RawItem};
+use crate::parse::{parse_rust_items, parse_c_items, parse_python_items, RawItem};
 use crate::scan::{build_tree, scan_files, ParsedFile, ScannedFile};
 use crate::types::{dedupe_ids, finalize_children, SymbolId, SymbolNode, SymbolTree};
 
@@ -31,6 +31,7 @@ fn parse_all(
             let parser: fn(&[u8]) -> anyhow::Result<Vec<RawItem>> = match ext {
                 "rs" => parse_rust_items,
                 "c" | "h" => parse_c_items,
+                "py" => parse_python_items,
                 _ => return None,
             };
             Some((f, parser))

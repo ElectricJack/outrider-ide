@@ -37,6 +37,61 @@ pub fn parse_rust_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     Ok(collect_items(tree.root_node(), source, &kind_fn, &rust_item_name))
 }
 
+/// Extract class/fn items from Python source, including decorated definitions.
+pub fn parse_python_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("loading tree-sitter-python grammar")?;
+    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let kind_fn = |node_kind: &str, node: Node, _src: &[u8]| -> Option<&'static str> {
+        match node_kind {
+            "function_definition" => {
+                // Skip inner definition when it is directly owned by a decorated_definition;
+                // the decorated_definition node itself will be the top-level item.
+                if node.parent().is_some_and(|p| p.kind() == "decorated_definition") {
+                    None
+                } else {
+                    Some("fn")
+                }
+            }
+            "class_definition" => {
+                if node.parent().is_some_and(|p| p.kind() == "decorated_definition") {
+                    None
+                } else {
+                    Some("class")
+                }
+            }
+            "decorated_definition" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "function_definition" => return Some("fn"),
+                        "class_definition" => return Some("class"),
+                        _ => {}
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    };
+    Ok(collect_items(tree.root_node(), source, &kind_fn, &python_item_name))
+}
+
+/// Python-specific name extraction: unwraps decorated_definition to find the inner name.
+fn python_item_name(node: Node, src: &[u8]) -> String {
+    if node.kind() == "decorated_definition" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "function_definition" || child.kind() == "class_definition" {
+                return item_name_default(child, src);
+            }
+        }
+    }
+    item_name_default(node, src)
+}
+
 /// Extract struct/enum/typedef/fn items from C source.
 pub fn parse_c_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let mut parser = tree_sitter::Parser::new();
@@ -184,7 +239,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::types::SymbolKind;
-    use super::{parse_rust_items, parse_c_items};
+    use super::{parse_rust_items, parse_c_items, parse_python_items};
 
     const SRC: &str = r#"mod inner {
     pub fn helper() {
@@ -278,6 +333,40 @@ fn free() {
         assert_eq!(file_doc(b"\n\n//! After blanks.\nfn x() {}\n"), Some("After blanks.".to_string()));
         assert_eq!(file_doc(b"fn x() {}\n"), None);
         assert_eq!(file_doc(b"// plain comment\n//! not leading\n"), None);
+    }
+
+    #[test]
+    fn extracts_python_items() {
+        let src = br#"
+class Animal:
+    def speak(self):
+        pass
+
+    def eat(self):
+        pass
+
+def standalone():
+    pass
+
+@staticmethod
+def decorated():
+    pass
+"#;
+        let items = parse_python_items(src).unwrap();
+        let summary: Vec<(&str, &str, usize)> = items
+            .iter()
+            .map(|i| (i.kind.label(), i.name.as_str(), i.children.len()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("class", "Animal", 2),
+                ("fn", "standalone", 0),
+                ("fn", "decorated", 0),
+            ]
+        );
+        assert_eq!(items[0].children[0].name, "speak");
+        assert_eq!(items[0].children[1].name, "eat");
     }
 
     #[test]
