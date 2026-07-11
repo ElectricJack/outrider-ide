@@ -7,7 +7,9 @@ pub const TEXT_PRIMARY: u32 = 0xd8d8d8;
 pub const TEXT_SECONDARY: u32 = 0x9a9a9a;
 /// Focused-node border accent (clearly distinct from churn fills/borders).
 pub const FOCUS_BORDER: u32 = 0x4da6ff;
-/// Adjust if this family is absent under WSLg (`fc-list | grep -i mono`).
+#[cfg(target_os = "windows")]
+pub const FONT_FAMILY: &str = "Consolas";
+#[cfg(not(target_os = "windows"))]
 pub const FONT_FAMILY: &str = "DejaVu Sans Mono";
 /// Depth-shaded box fill: darker outside, lighter inside, clamped at 8.
 const DEPTH_FILL_0: u32 = 0x17171B;
@@ -75,7 +77,7 @@ pub fn syntax_color(kind: HighlightKind) -> u32 {
 /// Minimap bar color: the syntax color dimmed toward the page background so
 /// the far-zoom minimap reads as texture rather than full-brightness code.
 pub fn minimap_color(kind: HighlightKind) -> u32 {
-    lerp_rgb(syntax_color(kind), CODE_BG, 0.15)
+    lerp_rgb(syntax_color(kind), CODE_BG, 0.50)
 }
 
 #[cfg(test)]
@@ -133,10 +135,10 @@ mod tests {
     fn minimap_color_dims_syntax_toward_code_bg() {
         use outrider_index::buffer::HighlightKind;
         let kw = syntax_color(HighlightKind::Keyword);
-        assert_eq!(minimap_color(HighlightKind::Keyword), lerp_rgb(kw, CODE_BG, 0.15));
+        assert_eq!(minimap_color(HighlightKind::Keyword), lerp_rgb(kw, CODE_BG, 0.50));
         assert_eq!(
             minimap_color(HighlightKind::Default),
-            lerp_rgb(TEXT_PRIMARY, CODE_BG, 0.15)
+            lerp_rgb(TEXT_PRIMARY, CODE_BG, 0.50)
         );
         // dimming moves the color: never equal to the full-brightness syntax color
         assert_ne!(minimap_color(HighlightKind::Keyword), kw);

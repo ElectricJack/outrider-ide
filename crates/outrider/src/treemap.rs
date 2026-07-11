@@ -651,6 +651,7 @@ impl Render for TreemapView {
                             underline: None,
                             strikethrough: None,
                         };
+                        // Pass 1: quads, stripes, minimap bars (back to front).
                         for item in &items {
                             let b = Bounds::new(
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
@@ -697,6 +698,9 @@ impl Render for TreemapView {
                                     BorderStyle::default(),
                                 ));
                             }
+                        }
+                        // Pass 2: text (names + body) on top of all quads.
+                        for item in &items {
                             if let Some(n) = &item.name {
                                 let line = window.text_system().shape_line(
                                     n.text.clone().into(),

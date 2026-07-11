@@ -37,7 +37,8 @@ impl BufferManager {
     /// The file-path portion of a qualified_path: everything before the
     /// first `::` (the whole path when there is none, as on File nodes).
     pub fn file_path_of(qualified_path: &str) -> &str {
-        qualified_path.split("::").next().unwrap_or(qualified_path)
+        let s = qualified_path.split("::").next().unwrap_or(qualified_path);
+        s.split('#').next().unwrap_or(s)
     }
 
     /// Materialize from disk on first access, creating one anchor per
@@ -122,6 +123,8 @@ mod tests {
     fn file_path_of_splits_at_first_colons() {
         assert_eq!(BufferManager::file_path_of("src/lib.rs::Point::norm"), "src/lib.rs");
         assert_eq!(BufferManager::file_path_of("src/lib.rs"), "src/lib.rs");
+        assert_eq!(BufferManager::file_path_of("BIG.md#0"), "BIG.md");
+        assert_eq!(BufferManager::file_path_of("dir/f.rs#2"), "dir/f.rs");
     }
 
     #[test]
