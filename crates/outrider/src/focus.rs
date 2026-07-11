@@ -281,8 +281,14 @@ mod tests {
         }
     }
 
-    /// root { a.rs { x }, b.rs { f, g } } — two files whose fns stack in
-    /// one vertical column, so Up/Down cross file boundaries.
+    /// root { a.rs { x(measure=6) }, b.rs { f, g } } — two files whose fns
+    /// stack in one vertical column, so Up/Down cross file boundaries.
+    ///
+    /// Geometry under kind-grouped + tallest-first packing (aspect=1.0):
+    ///   x has measure=6 → h=136, making a.rs h=204 > b.rs h=192.
+    ///   Root sorts a.rs first (tallest File), then b.rs below.
+    ///   x (16, 120, 480, 136), f (16, 332, 480, 58), g (16, 398, 480, 58) —
+    ///   one column of depth-2 pages spanning two files, a.rs on top.
     fn two_files() -> SymbolTree {
         SymbolTree {
             root: n(
@@ -294,7 +300,10 @@ mod tests {
                         SymbolKind::File,
                         "a.rs",
                         "a.rs",
-                        vec![n(SymbolKind::Item { label: "fn".into() }, "a.rs::x", "x", vec![])],
+                        vec![outrider_index::SymbolNode {
+                            measure: 6,
+                            ..n(SymbolKind::Item { label: "fn".into() }, "a.rs::x", "x", vec![])
+                        }],
                     ),
                     n(
                         SymbolKind::File,
@@ -326,8 +335,10 @@ mod tests {
         let t = two_files();
         let idx = TreeIndex::new(&t);
         let p = outrider_layout::pack(&t, &cfg());
-        // packed geometry: x (16, 120), f (16, 254), g (16, 320) —
-        // one column of depth-2 pages spanning two files
+        // Packed geometry (kind-grouped + tallest-first, aspect=1.0):
+        //   x (16, 120, 480, 136), f (16, 332, 480, 58), g (16, 398, 480, 58)
+        // a.rs (h=204) packs before b.rs (h=192) because it is taller;
+        // all three depth-2 fns land in one column spanning two files.
         let x = id(SymbolKind::Item { label: "fn".into() }, "a.rs::x");
         let f = id(SymbolKind::Item { label: "fn".into() }, "b.rs::f");
         let g = id(SymbolKind::Item { label: "fn".into() }, "b.rs::g");
@@ -336,7 +347,7 @@ mod tests {
         assert_eq!(spatial_step(&g, Dir::Up, &p, &idx), Some(f.clone())); // nearest, not x
         assert_eq!(spatial_step(&g, Dir::Down, &p, &idx), None); // no wrap
         assert_eq!(spatial_step(&f, Dir::Right, &p, &idx), None); // same x-center → not "right of"
-        // depth 1: the two files stack vertically
+        // depth 1: the two files stack vertically (a.rs above b.rs)
         let a = id(SymbolKind::File, "a.rs");
         let b = id(SymbolKind::File, "b.rs");
         assert_eq!(spatial_step(&a, Dir::Down, &p, &idx), Some(b.clone()));
