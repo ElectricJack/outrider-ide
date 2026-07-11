@@ -9,6 +9,8 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "029bf2f284b4e59f2
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "029bf2f284b4e59f20175d78443e630468f3a3e5", features = ["wayland"] }
 outrider-index = { path = "../outrider-index" }
 outrider-layout = { path = "../outrider-layout" }
+cosmic-text = "0.19"
+image = "0.25"
 
 [dev-dependencies]
 tempfile = "3.27.0"

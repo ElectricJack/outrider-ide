@@ -3,6 +3,7 @@ mod camera;
 mod chrome;
 mod content;
 mod focus;
+mod rasterize;
 mod theme;
 mod treemap;
 mod world;

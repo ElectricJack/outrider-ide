@@ -3622,8 +3622,10 @@ dependencies = [
 name = "outrider"
 version = "0.1.0"
 dependencies = [
+ "cosmic-text",
  "gpui",
  "gpui_platform",
+ "image",
  "outrider-index",
  "outrider-layout",
  "tempfile",

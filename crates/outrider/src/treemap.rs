@@ -38,7 +38,7 @@ fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
 /// Monospace advance width used by the minimap bars (spec §3): 0.6·FONT_PX.
 const CHAR_ADV: f64 = 0.6 * content::FONT_PX;
 /// Left text inset shared by name rows, body rows, and minimap bars.
-const BODY_PAD: f64 = 6.0;
+pub(crate) const BODY_PAD: f64 = 6.0;
 
 pub struct TreemapView {
     tree: SymbolTree,
