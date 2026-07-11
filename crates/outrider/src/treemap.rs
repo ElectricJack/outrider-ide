@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, Bounds,
-    BorderStyle, Context, Corners, FocusHandle, Pixels, RenderImage, TextAlign, TextRun, Window,
+    BorderStyle, ContentMask, Context, Corners, FocusHandle, Pixels, RenderImage, TextAlign,
+    TextRun, Window,
 };
 use outrider_index::buffer::HighlightSpan;
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
@@ -274,6 +275,46 @@ fn leaf_tex_rect(node: &SymbolNode, left: f64, top: f64, full_h: f64) -> (f64, f
     )
 }
 
+/// Predicted height of the pinned ancestor-header stack above `focus` under
+/// camera `cam`, mirroring paint_items' stacking: each named ancestor's
+/// header pins at max(its screen top clamped to the viewport, the previous
+/// header's bottom). Header height uses the 2-body-line cap, exact for
+/// zoom ≤ 1 (leaf framing) and a close estimate above it.
+fn pinned_stack_h(
+    focus: &SymbolId,
+    layout: &PackLayout,
+    index: &TreeIndex,
+    cam: &Camera,
+    vw: f64,
+    vh: f64,
+) -> f64 {
+    let hdr = (HEADER + 2.0 * LINE_STEP) * cam.zoom.min(1.0);
+    let mut chain = Vec::new();
+    let mut id = focus;
+    while let Some(p) = index.parent(id) {
+        chain.push(p);
+        id = p;
+    }
+    let mut bottom = 0.0f64;
+    for anc in chain.into_iter().rev() {
+        if index.node(anc).is_none_or(|n| n.name.is_empty()) {
+            continue;
+        }
+        let Some(r) = layout.rects.get(anc) else { continue };
+        let (_, sy) = cam.world_to_screen(r.x, r.y, vw, vh);
+        bottom = sy.max(0.0).max(bottom) + hdr;
+    }
+    bottom
+}
+
+/// Re-center `cam` vertically so `r` starts below `inset`: centered in the
+/// `[inset, vh]` band, or pinned to the band top when taller than the band.
+fn inset_top(mut cam: Camera, r: Rect, inset: f64, vh: f64) -> Camera {
+    let top = inset + ((vh - inset - r.h * cam.zoom) / 2.0).max(0.0);
+    cam.center_y = r.y - (top - vh / 2.0) / cam.zoom;
+    cam
+}
+
 /// Map a symbol node to the semantic tint for its box background.
 fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     match &node.id.kind {
@@ -345,8 +386,30 @@ impl TreemapView {
         (f64::from(vp.width), f64::from(vp.height) - chrome::TITLEBAR_H)
     }
 
+    /// Frame the focused rect below the pinned ancestor-header stack: frame
+    /// normally, predict the stack height under that camera, and if the rect
+    /// would start under the stack, reframe into the `[stack, vh]` band.
+    fn frame_below_headers(
+        &self,
+        index: &TreeIndex,
+        r: Rect,
+        vw: f64,
+        vh: f64,
+        frame: impl Fn(f64) -> Camera,
+    ) -> Camera {
+        let c0 = frame(vh);
+        let stack = pinned_stack_h(&self.focus.current, &self.layout, index, &c0, vw, vh);
+        let top0 = (vh - r.h * c0.zoom) / 2.0;
+        if stack <= top0 {
+            return c0;
+        }
+        let inset = stack.min(vh / 2.0);
+        inset_top(frame(vh - inset), r, inset, vh)
+    }
+
     /// Framing target for the current focus: leaf pages at natural size
-    /// (capped END fit), containers at FOCUS_FRACTION.
+    /// (capped END fit), containers at FOCUS_FRACTION — both nudged below
+    /// any pinned ancestor headers so the focus is never underlapped.
     fn frame_focus(
         &self,
         index: &TreeIndex,
@@ -356,12 +419,14 @@ impl TreemapView {
         max_zoom: f64,
     ) -> Option<Camera> {
         let r = *self.layout.rects.get(&self.focus.current)?;
-        match index.node(&self.focus.current) {
-            Some(n) if content::is_leaf_item(n) => {
-                Some(camera::frame_page(r, vw, vh, min_zoom, max_zoom))
+        let leaf = index.node(&self.focus.current).is_some_and(content::is_leaf_item);
+        Some(self.frame_below_headers(index, r, vw, vh, |vh_eff| {
+            if leaf {
+                camera::frame_page(r, vw, vh_eff, min_zoom, max_zoom)
+            } else {
+                camera::frame_rect(r, vw, vh_eff, camera::FOCUS_FRACTION, min_zoom, max_zoom)
             }
-            _ => Some(camera::frame_rect(r, vw, vh, camera::FOCUS_FRACTION, min_zoom, max_zoom)),
-        }
+        }))
     }
 
     /// Start (or retarget) the camera-follow tween from the current sample.
@@ -688,8 +753,12 @@ impl Render for TreemapView {
                         }
                         this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
-                    "end" => this.layout.rects.get(&this.focus.current).map(|&r| {
-                        camera::frame_rect(r, vw, vh, camera::END_FRACTION, min_zoom, max_zoom)
+                    "end" => this.layout.rects.get(&this.focus.current).copied().map(|r| {
+                        this.frame_below_headers(&index, r, vw, vh, |vh_eff| {
+                            camera::frame_rect(
+                                r, vw, vh_eff, camera::END_FRACTION, min_zoom, max_zoom,
+                            )
+                        })
                     }),
                     "home" => {
                         let c = Camera::fit(this.root_rect(), vw, vh);
@@ -767,27 +836,35 @@ impl Render for TreemapView {
                                     point(origin.x + px(t.x), origin.y + px(t.y)),
                                     size(px(t.w), px(t.h)),
                                 );
-                                let _ = window.paint_image(
-                                    tb,
-                                    Corners::default(),
-                                    t.image.clone(),
-                                    0,
-                                    false,
+                                // The texture rect is unclipped (it scales with
+                                // the whole page); mask it to the box so it
+                                // can't spill past the bottom edge at far zoom.
+                                window.with_content_mask(
+                                    Some(ContentMask { bounds: b }),
+                                    |window| {
+                                        let _ = window.paint_image(
+                                            tb,
+                                            Corners::default(),
+                                            t.image.clone(),
+                                            0,
+                                            false,
+                                        );
+                                        // Fade out the texture as text fades in by
+                                        // overlaying a semi-transparent bg-colored quad.
+                                        if item.tex_opacity < 1.0 {
+                                            let fade = 1.0 - item.tex_opacity;
+                                            let oc = rgb(theme::CODE_BG).opacity(fade);
+                                            window.paint_quad(quad(
+                                                tb,
+                                                px(0.),
+                                                oc,
+                                                px(0.),
+                                                oc,
+                                                BorderStyle::default(),
+                                            ));
+                                        }
+                                    },
                                 );
-                                // Fade out the texture as text fades in by
-                                // overlaying a semi-transparent bg-colored quad.
-                                if item.tex_opacity < 1.0 {
-                                    let fade = 1.0 - item.tex_opacity;
-                                    let oc = rgb(theme::CODE_BG).opacity(fade);
-                                    window.paint_quad(quad(
-                                        tb,
-                                        px(0.),
-                                        oc,
-                                        px(0.),
-                                        oc,
-                                        BorderStyle::default(),
-                                    ));
-                                }
                             }
                         }
                         // Pass 2a: leaf / non-header text (rendered under
@@ -1131,5 +1208,85 @@ mod tests {
         assert!((y - (50.0 + HEADER)).abs() < 1e-9);
         assert!((w - world::PAGE_W * 0.5).abs() < 1e-9);
         assert!((h - 10.0 * LINE_STEP * 0.5).abs() < 1e-9);
+    }
+
+    use super::{inset_top, pinned_stack_h};
+    use crate::camera::Camera;
+    use crate::focus::TreeIndex;
+    use outrider_index::SymbolTree;
+    use outrider_layout::{PackLayout, Rect};
+
+    fn screen_y(cam: &Camera, wy: f64, vh: f64) -> f64 {
+        (wy - cam.center_y) * cam.zoom + vh / 2.0
+    }
+
+    #[test]
+    fn inset_top_centers_rect_in_the_band_below_the_inset() {
+        let r = Rect { x: 0.0, y: 7.0, w: 100.0, h: 20.0 };
+        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 2.0 };
+        // band [20, 100], rect 20·2 = 40 tall → top at 20 + (80 − 40)/2 = 40
+        let c = inset_top(cam, r, 20.0, 100.0);
+        assert!((screen_y(&c, r.y, 100.0) - 40.0).abs() < 1e-9);
+        assert_eq!(c.zoom, cam.zoom); // vertical shift only
+    }
+
+    #[test]
+    fn inset_top_pins_to_band_top_when_rect_is_taller_than_the_band() {
+        let r = Rect { x: 0.0, y: 7.0, w: 100.0, h: 90.0 };
+        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 1.0 };
+        let c = inset_top(cam, r, 20.0, 100.0);
+        assert!((screen_y(&c, r.y, 100.0) - 20.0).abs() < 1e-9);
+    }
+
+    fn named(kind: SymbolKind, qual: &str, name: &str, children: Vec<SymbolNode>) -> SymbolNode {
+        SymbolNode { name: name.into(), children, ..node(kind, qual, None, 1, None, None) }
+    }
+
+    /// root { mid { anon(unnamed) { f } } } with rects far above the viewport.
+    fn stack_fixture() -> (SymbolTree, PackLayout, SymbolId) {
+        let leaf = named(SymbolKind::Item { label: "fn".into() }, "r/m/a/f", "f", vec![]);
+        let focus = leaf.id.clone();
+        let anon = named(SymbolKind::Folder, "r/m/a", "", vec![leaf]);
+        let anon_id = anon.id.clone();
+        let mid = named(SymbolKind::Folder, "r/m", "mid", vec![anon]);
+        let mid_id = mid.id.clone();
+        let root = named(SymbolKind::Folder, "r", "root", vec![mid]);
+        let mut rects = BTreeMap::new();
+        rects.insert(root.id.clone(), Rect { x: 0.0, y: -1000.0, w: 4000.0, h: 4000.0 });
+        rects.insert(mid_id, Rect { x: 10.0, y: -900.0, w: 3000.0, h: 3000.0 });
+        rects.insert(anon_id, Rect { x: 20.0, y: -800.0, w: 2000.0, h: 2000.0 });
+        rects.insert(focus.clone(), Rect { x: 30.0, y: 0.0, w: 480.0, h: 200.0 });
+        let tree = SymbolTree { root, repo_root: std::path::PathBuf::from("/x") };
+        (tree, PackLayout { rects }, focus)
+    }
+
+    #[test]
+    fn pinned_stack_h_stacks_named_offscreen_ancestors_and_skips_unnamed() {
+        let (tree, layout, focus) = stack_fixture();
+        let index = TreeIndex::new(&tree);
+        // Both named ancestors' tops are above the viewport → each pins at
+        // the top and stacks; the unnamed folder contributes nothing.
+        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 1.0 };
+        let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
+        let hdr = HEADER + 2.0 * LINE_STEP;
+        assert!((h - 2.0 * hdr).abs() < 1e-9);
+        // Header height scales with zoom below 1.
+        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 0.5 };
+        let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
+        assert!((h - hdr).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pinned_stack_h_pins_on_screen_ancestors_at_their_own_top() {
+        let (tree, layout, focus) = stack_fixture();
+        let index = TreeIndex::new(&tree);
+        // root top on screen at 50, mid top at 150 (clear of root's header)
+        // → stack bottom is mid's top plus one header.
+        let cam = Camera { center_x: 0.0, center_y: -750.0, zoom: 1.0 };
+        let vh = 600.0;
+        assert!((screen_y(&cam, -1000.0, vh) - 50.0).abs() < 1e-9);
+        let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, vh);
+        let hdr = HEADER + 2.0 * LINE_STEP;
+        assert!((h - (150.0 + hdr)).abs() < 1e-9);
     }
 }
