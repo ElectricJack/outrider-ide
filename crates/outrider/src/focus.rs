@@ -110,12 +110,15 @@ pub enum Dir {
     Down,
 }
 
-/// Spatial arrow step. When `current` is a leaf page
+/// Spatial arrow step: a beam cast. Slide `current`'s rect in `dir`; a
+/// candidate qualifies iff its span on the orthogonal axis strictly
+/// overlaps the current rect's span (corner contact does not count) and
+/// its near edge lies at or beyond the current rect's leading edge.
+/// Nearest edge-to-edge distance wins; ties break by orthogonal center
+/// misalignment, then SymbolId. When `current` is a leaf page
 /// (`content::is_leaf_item`), candidates are all other leaf pages at any
 /// tree depth; otherwise candidates are the nodes at `current`'s own
-/// depth. Among candidates whose center lies strictly in `dir`, pick the
-/// one scored lowest by primary distance + 2·|orthogonal offset|;
-/// SymbolId breaks exact ties. No wrap: no candidate → None.
+/// depth. No wrap and no fallback: no qualifier → None (dead key).
 pub fn spatial_step(
     current: &SymbolId,
     dir: Dir,
@@ -123,10 +126,9 @@ pub fn spatial_step(
     index: &TreeIndex,
 ) -> Option<SymbolId> {
     let cur = pack.rects.get(current)?;
-    let (cx, cy) = (cur.x + cur.w / 2.0, cur.y + cur.h / 2.0);
     let depth = index.depth(current)?;
     let leaf_mode = index.node(current).is_some_and(crate::content::is_leaf_item);
-    let mut best: Option<(f64, &SymbolId)> = None;
+    let mut best: Option<(f64, f64, &SymbolId)> = None;
     for (id, r) in &pack.rects {
         if id == current {
             continue;
@@ -139,26 +141,42 @@ pub fn spatial_step(
         if !eligible {
             continue;
         }
-        let (nx, ny) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
-        let (primary, ortho) = match dir {
-            Dir::Right => (nx - cx, (ny - cy).abs()),
-            Dir::Left => (cx - nx, (ny - cy).abs()),
-            Dir::Down => (ny - cy, (nx - cx).abs()),
-            Dir::Up => (cy - ny, (nx - cx).abs()),
+        let (overlap, primary, misalign) = match dir {
+            Dir::Left | Dir::Right => (
+                r.y < cur.y + cur.h && r.y + r.h > cur.y,
+                if dir == Dir::Left { cur.x - (r.x + r.w) } else { r.x - (cur.x + cur.w) },
+                ((r.y + r.h / 2.0) - (cur.y + cur.h / 2.0)).abs(),
+            ),
+            Dir::Up | Dir::Down => (
+                r.x < cur.x + cur.w && r.x + r.w > cur.x,
+                if dir == Dir::Up { cur.y - (r.y + r.h) } else { r.y - (cur.y + cur.h) },
+                ((r.x + r.w / 2.0) - (cur.x + cur.w / 2.0)).abs(),
+            ),
         };
-        if primary <= 0.0 {
+        if !overlap || primary < 0.0 {
             continue;
         }
-        let score = primary + 2.0 * ortho;
         let better = match best {
             None => true,
-            Some((s, b)) => score < s || (score == s && id < b),
+            Some((bp, bm, bid)) => {
+                primary < bp || (primary == bp && (misalign < bm || (misalign == bm && id < bid)))
+            }
         };
         if better {
-            best = Some((score, id));
+            best = Some((primary, misalign, id));
         }
     }
-    best.map(|(_, id)| id.clone())
+    best.map(|(_, _, id)| id.clone())
+}
+
+/// The four beam-cast arrow targets of `current`, indexed Left, Right,
+/// Up, Down. `None` entries are dead directions (and get no highlight).
+pub fn neighbors(
+    current: &SymbolId,
+    pack: &PackLayout,
+    index: &TreeIndex,
+) -> [Option<SymbolId>; 4] {
+    [Dir::Left, Dir::Right, Dir::Up, Dir::Down].map(|d| spatial_step(current, d, pack, index))
 }
 
 #[cfg(test)]
@@ -346,7 +364,7 @@ mod tests {
         assert_eq!(spatial_step(&f, Dir::Up, &p, &idx), Some(x.clone())); // back into a.rs
         assert_eq!(spatial_step(&g, Dir::Up, &p, &idx), Some(f.clone())); // nearest, not x
         assert_eq!(spatial_step(&g, Dir::Down, &p, &idx), None); // no wrap
-        assert_eq!(spatial_step(&f, Dir::Right, &p, &idx), None); // same x-center → not "right of"
+        assert_eq!(spatial_step(&f, Dir::Right, &p, &idx), None); // nothing beyond the right edge → dead key
         // depth 1: the two files stack vertically (a.rs above b.rs)
         let a = id(SymbolKind::File, "a.rs");
         let b = id(SymbolKind::File, "b.rs");
@@ -378,30 +396,116 @@ mod tests {
     }
 
     #[test]
-    fn spatial_step_penalizes_orthogonal_offset() {
+    fn spatial_step_requires_beam_overlap() {
         let t = scoring_tree();
         let idx = TreeIndex::new(&t);
-        let (c, p, q) =
-            (id(SymbolKind::Item { label: "fn".into() }, "c"), id(SymbolKind::Item { label: "fn".into() }, "p"), id(SymbolKind::Item { label: "fn".into() }, "q"));
-        // p: straight right, farther (primary 20, ortho 0 → 20);
-        // q: nearer in x but 20 off-axis (primary 12, ortho 20 → 52)
+        let c = id(SymbolKind::Item { label: "fn".into() }, "c");
+        let p = id(SymbolKind::Item { label: "fn".into() }, "p");
+        let q = id(SymbolKind::Item { label: "fn".into() }, "q");
+        // q is nearest by center but sits entirely below the beam (y-span
+        // 11..21 vs c's 0..10); p is farther but on-beam. Old center
+        // scoring picked q for Left — the "Left moves down" bug.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -10.0, y: -30.0, w: 100.0, h: 100.0 }),
+            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
+            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (p.clone(), Rect { x: -60.0, y: 2.0, w: 10.0, h: 6.0 }),
+            (q.clone(), Rect { x: -15.0, y: 11.0, w: 10.0, h: 10.0 }),
+        ]);
+        assert_eq!(spatial_step(&c, Dir::Left, &lay, &idx), Some(p.clone()));
+        // Only the off-beam candidate remains → Left is a dead key.
+        let lay = hand_layout(&[
+            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
+            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (q.clone(), Rect { x: -15.0, y: 11.0, w: 10.0, h: 10.0 }),
+        ]);
+        assert_eq!(spatial_step(&c, Dir::Left, &lay, &idx), None);
+        // A node missing from the layout steps nowhere.
+        assert_eq!(spatial_step(&c, Dir::Left, &hand_layout(&[]), &idx), None);
+    }
+
+    #[test]
+    fn spatial_step_nearest_edge_wins() {
+        let t = scoring_tree();
+        let idx = TreeIndex::new(&t);
+        let c = id(SymbolKind::Item { label: "fn".into() }, "c");
+        let p = id(SymbolKind::Item { label: "fn".into() }, "p");
+        let q = id(SymbolKind::Item { label: "fn".into() }, "q");
+        // Both overlap the beam. q's near edge (x=14, distance 4) beats
+        // p's (x=20, distance 10) even though p is perfectly centered
+        // and q's center is 10 off-axis.
+        let lay = hand_layout(&[
+            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
             (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
             (p.clone(), Rect { x: 20.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: 12.0, y: 20.0, w: 10.0, h: 10.0 }),
+            (q.clone(), Rect { x: 14.0, y: -30.0, w: 10.0, h: 50.0 }),
         ]);
-        assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
-        // exact tie (both primary 20, ortho 20): lesser SymbolId wins → p
+        assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(q.clone()));
+    }
+
+    #[test]
+    fn spatial_step_ties_break_on_misalignment_then_id() {
+        let t = scoring_tree();
+        let idx = TreeIndex::new(&t);
+        let c = id(SymbolKind::Item { label: "fn".into() }, "c");
+        let p = id(SymbolKind::Item { label: "fn".into() }, "p");
+        let q = id(SymbolKind::Item { label: "fn".into() }, "q");
+        // Equal edge distance (both at x=20). p center-y 11 → misalign 6;
+        // q center-y -4 → misalign 9. Better-centered p wins.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -10.0, y: -30.0, w: 100.0, h: 100.0 }),
+            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
             (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (p.clone(), Rect { x: 20.0, y: 20.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: 20.0, y: -20.0, w: 10.0, h: 10.0 }),
+            (p.clone(), Rect { x: 20.0, y: 6.0, w: 10.0, h: 10.0 }),
+            (q.clone(), Rect { x: 20.0, y: -9.0, w: 10.0, h: 10.0 }),
         ]);
         assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
-        // a node missing from the layout steps nowhere
-        assert_eq!(spatial_step(&c, Dir::Right, &hand_layout(&[]), &idx), None);
+        // Exact tie on distance AND misalignment (6 each): lesser SymbolId
+        // wins → p.
+        let lay = hand_layout(&[
+            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
+            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (p.clone(), Rect { x: 20.0, y: 6.0, w: 10.0, h: 10.0 }),
+            (q.clone(), Rect { x: 20.0, y: -6.0, w: 10.0, h: 10.0 }),
+        ]);
+        assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
+    }
+
+    #[test]
+    fn spatial_step_shared_edge_qualifies_but_corner_touch_does_not() {
+        let t = scoring_tree();
+        let idx = TreeIndex::new(&t);
+        let c = id(SymbolKind::Item { label: "fn".into() }, "c");
+        let p = id(SymbolKind::Item { label: "fn".into() }, "p");
+        let q = id(SymbolKind::Item { label: "fn".into() }, "q");
+        // p shares c's right edge (distance 0) → reachable. q touches only
+        // at the bottom-right corner → not reachable Down or Right.
+        let lay = hand_layout(&[
+            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
+            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (p.clone(), Rect { x: 10.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (q.clone(), Rect { x: 10.0, y: 10.0, w: 10.0, h: 10.0 }),
+        ]);
+        assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
+        assert_eq!(spatial_step(&c, Dir::Down, &lay, &idx), None);
+    }
+
+    #[test]
+    fn neighbors_returns_left_right_up_down() {
+        let t = scoring_tree();
+        let idx = TreeIndex::new(&t);
+        let c = id(SymbolKind::Item { label: "fn".into() }, "c");
+        let p = id(SymbolKind::Item { label: "fn".into() }, "p");
+        let q = id(SymbolKind::Item { label: "fn".into() }, "q");
+        // p directly right, q directly below; nothing left or up.
+        let lay = hand_layout(&[
+            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
+            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (p.clone(), Rect { x: 20.0, y: 0.0, w: 10.0, h: 10.0 }),
+            (q.clone(), Rect { x: 0.0, y: 20.0, w: 10.0, h: 10.0 }),
+        ]);
+        assert_eq!(
+            neighbors(&c, &lay, &idx),
+            [None, Some(p.clone()), None, Some(q.clone())]
+        );
     }
 
     /// A leaf page with source bytes (unlike `n`, which leaves byte_range None).
