@@ -47,7 +47,6 @@ fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
 /// joined into paragraphs (a blank line is a paragraph break), then each
 /// paragraph is greedy word-wrapped to the same char budget as
 /// `truncate_to_width`. Words longer than the budget are hard-split.
-#[allow(dead_code)]
 fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
     let budget = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
     if budget < 2 {
@@ -99,6 +98,26 @@ fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
         }
     }
     rows
+}
+
+/// Screen-space doc-overlay rows for a texture-tier leaf: the item's `///`
+/// doc wrapped to the box's inner width, one crisp 12px row per line
+/// starting under the pinned name row; rows that would leave the box are
+/// dropped. Also returns the backdrop-panel height (box top → last row
+/// bottom); (empty, 0.0) when nothing fits.
+fn doc_overlay(doc: &str, px: &world::PxRect) -> (Vec<BodyText>, f32) {
+    let mut rows = Vec::new();
+    let mut y = px.y + HEADER;
+    for text in wrap_doc(doc, px.w - 2.0 * BODY_PAD, FONT_PX) {
+        if y + LINE_STEP > px.y + px.h {
+            break;
+        }
+        let runs = vec![(text.len(), theme::TEXT_PRIMARY)];
+        rows.push(BodyText { x: (px.x + BODY_PAD) as f32, y: y as f32, text, runs });
+        y += LINE_STEP;
+    }
+    let panel_h = if rows.is_empty() { 0.0 } else { (y - px.y) as f32 };
+    (rows, panel_h)
 }
 
 /// Left text inset shared by name rows and body rows.
@@ -177,6 +196,13 @@ struct PaintItem {
     body_opacity: f32,
     /// Opacity for the baked texture quad (0..1); inverse of body_opacity in the fade zone.
     tex_opacity: f32,
+    /// Crisp 12px doc-description rows overlaid on a texture-tier leaf.
+    #[allow(dead_code)]
+    doc_rows: Vec<BodyText>, // read in the paint pass (next task)
+    /// Height of the translucent backdrop panel behind name + doc rows
+    /// (0.0 = no overlay).
+    #[allow(dead_code)]
+    doc_panel_h: f32, // read in the paint pass (next task)
     name: Option<NameRow>,
     body: Vec<BodyText>,
     tex: Option<TexQuad>,
@@ -585,6 +611,8 @@ impl TreemapView {
             let mut header_bg_y = item.px.y as f32;
             let mut body_opacity = 1.0f32;
             let mut tex_opacity = 1.0f32;
+            let mut doc_rows = Vec::new();
+            let mut doc_panel_h = 0.0f32;
             let mut name = None;
             let mut body = Vec::new();
             let mut tex: Option<TexQuad> = None;
@@ -630,6 +658,9 @@ impl TreemapView {
                                 });
                             }
                         }
+                        if let Some(doc) = &item.node.doc {
+                            (doc_rows, doc_panel_h) = doc_overlay(doc, &item.px);
+                        }
                         if font > content::TEXT_FADE_LO {
                             tex_opacity = 1.0
                                 - ((font - content::TEXT_FADE_LO)
@@ -672,6 +703,8 @@ impl TreemapView {
                 header_bg_y,
                 body_opacity,
                 tex_opacity,
+                doc_rows,
+                doc_panel_h,
                 name,
                 body,
                 tex,
@@ -1099,8 +1132,8 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
-        truncate_to_width, wrap_doc, HEADER, LINE_STEP,
+        code_line, container_body, doc_overlay, leaf_tex_rect, leaf_text_body, runs_from_spans,
+        truncate_to_width, wrap_doc, BODY_PAD, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -1408,5 +1441,31 @@ mod tests {
     #[test]
     fn wrap_doc_returns_nothing_when_no_room() {
         assert!(wrap_doc("anything", 13.0, 12.0).is_empty());
+    }
+
+    #[test]
+    fn doc_overlay_lays_rows_under_the_name_and_drops_overflow() {
+        // Box fits exactly 2 rows: h = HEADER + 2*LINE_STEP.
+        let px = crate::world::PxRect {
+            x: 100.0,
+            y: 50.0,
+            w: wrap_w(10) + 2.0 * BODY_PAD,
+            h: HEADER + 2.0 * LINE_STEP,
+        };
+        let (rows, panel_h) = doc_overlay("alpha beta gamma delta epsilon", &px);
+        assert_eq!(rows.len(), 2); // 3+ wrapped rows, only 2 fit
+        assert_eq!(rows[0].x, (100.0 + BODY_PAD) as f32);
+        assert_eq!(rows[0].y, (50.0 + HEADER) as f32);
+        assert_eq!(rows[1].y, (50.0 + HEADER + LINE_STEP) as f32);
+        assert_eq!(panel_h, (HEADER + 2.0 * LINE_STEP) as f32);
+        assert_eq!(rows[0].runs, vec![(rows[0].text.len(), crate::theme::TEXT_PRIMARY)]);
+    }
+
+    #[test]
+    fn doc_overlay_is_empty_when_no_row_fits() {
+        let px = crate::world::PxRect { x: 0.0, y: 0.0, w: 200.0, h: HEADER };
+        let (rows, panel_h) = doc_overlay("some description", &px);
+        assert!(rows.is_empty());
+        assert_eq!(panel_h, 0.0);
     }
 }
