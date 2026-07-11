@@ -208,6 +208,7 @@ fn leaf_text_body(
     let font = (FONT_PX * scale) as f32;
     let step = LINE_STEP * scale;
     let x = (left + BODY_PAD * scale) as f32;
+    let content_y0 = HEADER.max(HEADER * scale);
     let mut out = Vec::new();
     let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
     let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -215,7 +216,7 @@ fn leaf_text_body(
         if let Some(start) = m.symbol_start_line(&node.id) {
             let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
             for j in 0..count {
-                let y = top + (HEADER + j as f64 * LINE_STEP) * scale;
+                let y = top + content_y0 + j as f64 * LINE_STEP * scale;
                 if y > vh {
                     break;
                 }
@@ -233,7 +234,7 @@ fn leaf_text_body(
     }
     let lines = content::body_lines(node, Rung::Full);
     for (k, line) in lines.into_iter().enumerate() {
-        let y = top + (HEADER + k as f64 * LINE_STEP) * scale;
+        let y = top + content_y0 + k as f64 * LINE_STEP * scale;
         if y > vh {
             break;
         }
@@ -267,6 +268,7 @@ fn leaf_minimap(
     let scale = full_h / content::natural_px(node);
     let step = LINE_STEP * scale;
     let bar_h = (step * 0.7) as f32;
+    let content_y0 = HEADER.max(HEADER * scale);
     let mut bars = Vec::new();
     let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
     let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -274,7 +276,7 @@ fn leaf_minimap(
         if let Some(start) = m.symbol_start_line(&node.id) {
             let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
             for r in 0..count {
-                let row_y = top + (HEADER + r as f64 * LINE_STEP) * scale;
+                let row_y = top + content_y0 + r as f64 * LINE_STEP * scale;
                 if row_y > vh {
                     break;
                 }
