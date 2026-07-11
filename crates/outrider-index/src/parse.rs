@@ -229,6 +229,26 @@ pub fn parse_js_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     Ok(collect_items(tree.root_node(), source, &js_kind_fn, &js_item_name))
 }
 
+pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .context("loading tree-sitter-c-sharp grammar")?;
+    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let kind_fn = |node_kind: &str, _node: Node, _src: &[u8]| -> Option<&'static str> {
+        match node_kind {
+            "class_declaration" | "record_declaration" => Some("class"),
+            "interface_declaration" => Some("interface"),
+            "struct_declaration" => Some("struct"),
+            "enum_declaration" => Some("enum"),
+            "method_declaration" | "constructor_declaration" => Some("fn"),
+            "namespace_declaration" => Some("namespace"),
+            _ => None,
+        }
+    };
+    Ok(collect_items(tree.root_node(), source, &kind_fn, &item_name_default))
+}
+
 fn collect_items(
     node: Node,
     src: &[u8],
@@ -314,7 +334,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::types::SymbolKind;
-    use super::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items, parse_ts_items};
+    use super::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items, parse_ts_items, parse_csharp_items};
 
     const SRC: &str = r#"mod inner {
     pub fn helper() {
@@ -554,6 +574,62 @@ void draw(struct Point p) {
                 ("fn", "draw"),
             ]
         );
+    }
+
+    #[test]
+    fn extracts_csharp_items() {
+        let src = br#"
+namespace MyApp {
+    class Greeter {
+        public Greeter() {
+        }
+        public string Greet() {
+            return "hello";
+        }
+    }
+
+    interface IPrintable {
+        void Print();
+    }
+
+    enum Color {
+        Red,
+        Green,
+        Blue
+    }
+
+    struct Point {
+        public int X;
+        public int Y;
+    }
+
+    record Person(string Name, int Age);
+}
+"#;
+        let items = parse_csharp_items(src).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind.label(), "namespace");
+        assert_eq!(items[0].name, "MyApp");
+        let inner: Vec<(&str, &str)> = items[0]
+            .children
+            .iter()
+            .map(|i| (i.kind.label(), i.name.as_str()))
+            .collect();
+        assert_eq!(
+            inner,
+            vec![
+                ("class", "Greeter"),
+                ("interface", "IPrintable"),
+                ("enum", "Color"),
+                ("struct", "Point"),
+                ("class", "Person"),
+            ]
+        );
+        // Greeter has constructor + method
+        assert_eq!(items[0].children[0].children.len(), 2);
+        assert_eq!(items[0].children[0].children[0].kind.label(), "fn");
+        assert_eq!(items[0].children[0].children[0].name, "Greeter");
+        assert_eq!(items[0].children[0].children[1].name, "Greet");
     }
 }
 

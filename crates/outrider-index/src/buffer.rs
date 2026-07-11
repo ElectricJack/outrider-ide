@@ -115,6 +115,7 @@ impl FileBuffer {
             "js" | "jsx" => Some((tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::HIGHLIGHT_QUERY)),
             "ts" => Some((tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), tree_sitter_typescript::HIGHLIGHTS_QUERY)),
             "tsx" => Some((tree_sitter_typescript::LANGUAGE_TSX.into(), tree_sitter_typescript::HIGHLIGHTS_QUERY)),
+            "cs" => Some((tree_sitter_c_sharp::LANGUAGE.into(), tree_sitter_c_sharp::HIGHLIGHTS_QUERY)),
             _ => None,
         };
         let (tree, lines) = match lang {

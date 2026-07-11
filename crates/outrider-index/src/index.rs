@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use rayon::prelude::*;
 
-use crate::parse::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items, parse_ts_items, parse_tsx_items, RawItem};
+use crate::parse::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items, parse_ts_items, parse_tsx_items, parse_csharp_items, RawItem};
 use crate::scan::{build_tree, scan_files, ParsedFile, ScannedFile};
 use crate::types::{dedupe_ids, finalize_children, SymbolId, SymbolNode, SymbolTree};
 
@@ -35,6 +35,7 @@ fn parse_all(
                 "js" | "jsx" => parse_js_items,
                 "ts" => parse_ts_items,
                 "tsx" => parse_tsx_items,
+                "cs" => parse_csharp_items,
                 _ => return None,
             };
             Some((f, parser))
