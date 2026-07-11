@@ -5,7 +5,7 @@ use gpui::{
     FocusHandle, Pixels, TextAlign, TextRun, Window,
 };
 use outrider_index::buffer::HighlightSpan;
-use outrider_index::{SymbolId, SymbolNode, SymbolTree};
+use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::{collect_file_symbols, BufferManager};
@@ -293,6 +293,27 @@ fn leaf_minimap(
     bars
 }
 
+/// Map a symbol node to the semantic tint for its box background.
+fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
+    match &node.id.kind {
+        SymbolKind::Folder => {
+            match node.name.as_str() {
+                "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
+                "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
+                _ => theme::BoxTint::Normal,
+            }
+        }
+        SymbolKind::Item { label } => {
+            match label.as_str() {
+                "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef"
+                    => theme::BoxTint::TypeDef,
+                _ => theme::BoxTint::Normal,
+            }
+        }
+        _ => theme::BoxTint::Normal,
+    }
+}
+
 impl TreemapView {
     pub fn new(tree: SymbolTree, layout: PackLayout, cx: &mut Context<Self>) -> Self {
         let root_id = tree.root.id.clone();
@@ -427,7 +448,8 @@ impl TreemapView {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
-            let fill = theme::box_fill(is_leaf, item.level);
+            let tint = classify_tint(item.node);
+            let fill = theme::box_fill(is_leaf, item.level, tint);
             let mut body_font_px = FONT_PX as f32;
             let mut header_bg_h = 0.0f32;
             let mut name = None;
@@ -896,6 +918,66 @@ mod tests {
             leaf_text_body(&leaf, 0.0, 0.0, natural, 480.0, 600.0, &mut broken, &BTreeMap::new());
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two()");
+    }
+
+    fn make_node(kind: SymbolKind, name: &str) -> SymbolNode {
+        SymbolNode {
+            id: SymbolId { kind, qualified_path: name.into(), ordinal: 0 },
+            name: name.to_string(),
+            byte_range: None,
+            signature: None,
+            doc: None,
+            measure: 0,
+            churn: 0.0,
+            churn_count: 0,
+            children: vec![],
+        }
+    }
+
+    #[test]
+    fn classify_tint_docs_folder() {
+        use super::classify_tint;
+        use crate::theme::BoxTint;
+        for name in &["docs", "doc", "documentation"] {
+            let n = make_node(SymbolKind::Folder, name);
+            assert_eq!(classify_tint(&n), BoxTint::DocsFolder, "expected DocsFolder for {name}");
+        }
+    }
+
+    #[test]
+    fn classify_tint_test_folder() {
+        use super::classify_tint;
+        use crate::theme::BoxTint;
+        for name in &["test", "tests", "spec", "specs", "__tests__"] {
+            let n = make_node(SymbolKind::Folder, name);
+            assert_eq!(classify_tint(&n), BoxTint::TestFolder, "expected TestFolder for {name}");
+        }
+    }
+
+    #[test]
+    fn classify_tint_typedef_items() {
+        use super::classify_tint;
+        use crate::theme::BoxTint;
+        for label in &["struct", "enum", "trait", "class", "interface", "type", "typedef"] {
+            let n = make_node(SymbolKind::Item { label: label.to_string() }, "Foo");
+            assert_eq!(classify_tint(&n), BoxTint::TypeDef, "expected TypeDef for {label}");
+        }
+    }
+
+    #[test]
+    fn classify_tint_normal_cases() {
+        use super::classify_tint;
+        use crate::theme::BoxTint;
+        // Unrecognized folder name
+        assert_eq!(classify_tint(&make_node(SymbolKind::Folder, "src")), BoxTint::Normal);
+        // Non-typedef item label
+        assert_eq!(
+            classify_tint(&make_node(SymbolKind::Item { label: "fn".into() }, "foo")),
+            BoxTint::Normal
+        );
+        // File and Chunk always Normal
+        assert_eq!(classify_tint(&make_node(SymbolKind::File, "main.rs")), BoxTint::Normal);
+        assert_eq!(classify_tint(&make_node(SymbolKind::Chunk, "chunk")), BoxTint::Normal);
     }
 
     #[test]
