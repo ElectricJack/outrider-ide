@@ -140,33 +140,43 @@ fn size(
         return (cfg.page_w, h);
     }
     // Re-derive the ordering invariant locally; never trust input Vec order.
-    let mut order: Vec<(&SymbolNode, (f64, f64))> =
-        node.children.iter().map(|c| (c, size(c, cfg, rel))).collect();
-    if order.first().map(|(c, _)| &c.id.kind) == Some(&SymbolKind::Chunk) {
-        // Chunk children pack in source order, ignoring their heading labels.
-        order.sort_by(|(a, _), (b, _)| {
+    let mut order: Vec<(&SymbolNode, (f64, f64), u8)> = node
+        .children
+        .iter()
+        .map(|c| (c, size(c, cfg, rel), doc_rank(c)))
+        .collect();
+    // Chunk children, and all descendants of source-ordered files (prose,
+    // declare-before-use C/C++), pack in source order: reorganizing them
+    // would break top-to-bottom reading.
+    let source_ordered = order.first().map(|(c, ..)| &c.id.kind) == Some(&SymbolKind::Chunk)
+        || (!matches!(node.id.kind, SymbolKind::Folder)
+            && file_ext(&node.id.qualified_path).is_some_and(is_source_ordered_ext));
+    if source_ordered {
+        order.sort_by(|(a, ..), (b, ..)| {
             let ka = a.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
             let kb = b.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
             ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
         });
     } else {
-        // Kind groups first (types → fns → classes → modules), tallest
-        // first within a group so greedy column fill becomes FFD; name
-        // then ordinal keep equal-height runs alphabetical/deterministic.
-        order.sort_by(|(a, sa), (b, sb)| {
-            kind_rank(&a.id.kind)
-                .cmp(&kind_rank(&b.id.kind))
+        // Docs sink last; then kind groups (types → fns → classes →
+        // modules), tallest first within a group so greedy column fill
+        // becomes FFD; name then ordinal keep equal-height runs
+        // alphabetical/deterministic. Doc ranks were precomputed above —
+        // no tree walks inside the comparator.
+        order.sort_by(|(a, sa, da), (b, sb, db)| {
+            da.cmp(db)
+                .then(kind_rank(&a.id.kind).cmp(&kind_rank(&b.id.kind)))
                 .then(sb.1.total_cmp(&sa.1))
                 .then(a.name.as_bytes().cmp(b.name.as_bytes()))
                 .then(a.id.ordinal.cmp(&b.id.ordinal))
         });
     }
-    let area: f64 = order.iter().map(|(_, (w, h))| w * h).sum();
-    let tallest = order.iter().map(|&(_, (_, h))| h).fold(0.0, f64::max);
+    let area: f64 = order.iter().map(|(_, (w, h), _)| w * h).sum();
+    let tallest = order.iter().map(|&(_, (_, h), _)| h).fold(0.0, f64::max);
     // tallest.max(...) guarantees no child is ever forced to wrap alone.
     let target_h = tallest.max((area / cfg.aspect).sqrt());
     let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for &(child, (w, h)) in &order {
+    for &(child, (w, h), _) in &order {
         if y > 0.0 && y + h > target_h {
             x += col_w + cfg.gap;
             y = 0.0;
@@ -531,5 +541,139 @@ mod tests {
         // non-file/folder kinds never rank
         let it = n(SymbolKind::Item { label: "fn".into() }, "a.md::x", "x", 1, vec![]);
         assert_eq!(doc_rank(&it), 0);
+    }
+
+    #[test]
+    fn c_file_children_pack_in_source_order_not_kind_or_size() {
+        // Scrambled: the tall struct is declared LAST. Kind/size order would
+        // place it first (rank 0, tallest); a .c file must keep byte order.
+        let item = |label: &str, qp: &str, name: &str, measure: u64, start: usize| {
+            let mut it =
+                n(SymbolKind::Item { label: label.into() }, qp, name, measure, vec![]);
+            it.byte_range = Some(start..start + 10);
+            it
+        };
+        let mut file = n(
+            SymbolKind::File,
+            "src/m.c",
+            "m.c",
+            60,
+            vec![
+                item("struct", "src/m.c::S", "S", 50, 200),
+                item("fn", "src/m.c::zebra", "zebra", 2, 0),
+                item("fn", "src/m.c::mid", "mid", 5, 100),
+            ],
+        );
+        file.byte_range = Some(0..300);
+        let tree = SymbolTree {
+            root: n(SymbolKind::Folder, "", "", 0, vec![file]),
+            repo_root: "/x".into(),
+        };
+        let p = pack(&tree, &cfg());
+        let z = rect(&p, "src/m.c::zebra"); // byte 0
+        let m = rect(&p, "src/m.c::mid"); // byte 100
+        let s = rect(&p, "src/m.c::S"); // byte 200
+        // zebra and mid stack in the first column in byte order; the struct —
+        // which kind/size order would have placed first — packs last (wraps)
+        close(z.x, m.x);
+        assert!(z.y < m.y, "zebra(0) above mid(100)");
+        assert!(s.x > m.x, "S(200) last despite kind rank 0 and max height");
+    }
+
+    #[test]
+    fn nested_markdown_container_keeps_source_order() {
+        // A section inside a .md file: its children pack by byte offset even
+        // though tallest-first would reverse them.
+        let item = |qp: &str, name: &str, measure: u64, start: usize| {
+            let mut it =
+                n(SymbolKind::Item { label: "h2".into() }, qp, name, measure, vec![]);
+            it.byte_range = Some(start..start + 10);
+            it
+        };
+        let mut sec = n(
+            SymbolKind::Item { label: "h1".into() },
+            "g.md::Sec",
+            "Sec",
+            0,
+            vec![item("g.md::Sec::zz", "zz", 2, 0), item("g.md::Sec::aa", "aa", 30, 100)],
+        );
+        sec.byte_range = Some(0..200);
+        let mut file = n(SymbolKind::File, "g.md", "g.md", 40, vec![sec]);
+        file.byte_range = Some(0..200);
+        let tree = SymbolTree {
+            root: n(SymbolKind::Folder, "", "", 0, vec![file]),
+            repo_root: "/x".into(),
+        };
+        let p = pack(&tree, &cfg());
+        let zz = rect(&p, "g.md::Sec::zz"); // byte 0, short
+        let aa = rect(&p, "g.md::Sec::aa"); // byte 100, tall
+        // byte order beats tallest-first: zz is placed first (reading order)
+        assert!(zz.x < aa.x || (zz.x == aa.x && zz.y < aa.y), "zz(0) before aa(100)");
+    }
+
+    #[test]
+    fn doc_file_sinks_below_source_in_folder() {
+        // README.md is far taller; size order would place it first, but doc
+        // rank sinks it below the source file.
+        let tree = SymbolTree {
+            root: n(
+                SymbolKind::Folder,
+                "",
+                "",
+                0,
+                vec![
+                    n(SymbolKind::File, "README.md", "README.md", 500, vec![]),
+                    n(SymbolKind::File, "main.rs", "main.rs", 5, vec![]),
+                ],
+            ),
+            repo_root: "/x".into(),
+        };
+        let p = pack(&tree, &cfg());
+        let (r, m) = (rect(&p, "README.md"), rect(&p, "main.rs"));
+        // main.rs first: top-left of the content area
+        close(m.x, 8.0);
+        close(m.y, 60.0);
+        // README wraps to the second column
+        close(r.x, 496.0);
+        close(r.y, 60.0);
+    }
+
+    #[test]
+    fn folder_doc_share_over_70_percent_sinks() {
+        let f = |qp: &str, name: &str| n(SymbolKind::File, qp, name, 1, vec![]);
+        // "a_docs" (3/4 doc, recursive through sub) sinks after "mixed"
+        // (1/2 doc, not doc) even though a_docs wins BOTH fallback keys:
+        // it is taller (more children) and alphabetically first.
+        let docs = n(
+            SymbolKind::Folder,
+            "a_docs",
+            "a_docs",
+            0,
+            vec![
+                n(
+                    SymbolKind::Folder,
+                    "a_docs/sub",
+                    "sub",
+                    0,
+                    vec![f("a_docs/sub/a.md", "a.md"), f("a_docs/sub/b.md", "b.md")],
+                ),
+                f("a_docs/c.md", "c.md"),
+                f("a_docs/x.rs", "x.rs"),
+            ],
+        );
+        let mixed = n(
+            SymbolKind::Folder,
+            "mixed",
+            "mixed",
+            0,
+            vec![f("mixed/a.md", "a.md"), f("mixed/x.rs", "x.rs")],
+        );
+        let tree = SymbolTree {
+            root: n(SymbolKind::Folder, "", "", 0, vec![docs, mixed]),
+            repo_root: "/x".into(),
+        };
+        let p = pack(&tree, &cfg());
+        let (d, m) = (rect(&p, "a_docs"), rect(&p, "mixed"));
+        assert!(m.x < d.x || (m.x == d.x && m.y < d.y), "mixed before a_docs");
     }
 }
