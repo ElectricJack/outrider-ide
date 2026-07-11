@@ -112,9 +112,9 @@ cache: HashMap<SymbolId, LeafTexture> + LRU order
 
 ### 5. Paint order
 
-Textured quads paint in a new pass between Pass 1 (box quads) and Pass 2a
-(leaf/body text), replacing the bar pass slot — under all text and header
-backgrounds, over box fills.
+Textured quads paint exactly where each leaf's bars painted: inside
+Pass 1, per item, after the box quad and stripe — under all text and
+header backgrounds, over box fills.
 
 ## Testing
 
