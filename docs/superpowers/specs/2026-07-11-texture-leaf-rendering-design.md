@@ -50,7 +50,12 @@ text ↔ bars: texture opacity ramps 1→0 over the band while body text ramps
 0→1. Below `TEXT_FADE_LO` the texture paints at full opacity at all deeper
 zooms, including the Dot tier (the quad is clipped/scaled by the same
 content bounds the bars used). Opacity is applied via
-`window.with_element_opacity`.
+`window.with_element_opacity`. *Amended 2026-07-11:*
+`with_element_opacity` is `pub(crate)` in the pinned GPUI rev, so the fade
+is instead a `CODE_BG` overlay quad at alpha `1 − tex_opacity` painted over
+the texture (equivalent blend: leaf fill under the texture is uniformly
+`CODE_BG`; known cosmetic gap: the 3px churn stripe under the texture's
+left edge doesn't show through in the fade band).
 
 ### 2. Rasterizer (new module `crates/outrider/src/rasterize.rs`)
 
