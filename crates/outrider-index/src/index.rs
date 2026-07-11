@@ -4,13 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use rayon::prelude::*;
 
-use crate::parse::{parse_rust_items, RawItem};
+use crate::parse::{parse_rust_items, parse_c_items, RawItem};
 use crate::scan::{build_tree, scan_files, ParsedFile, ScannedFile};
 use crate::types::{dedupe_ids, finalize_children, SymbolId, SymbolNode, SymbolTree};
 
 pub fn index_repo(repo_root: &Path) -> anyhow::Result<SymbolTree> {
     let files = scan_files(repo_root)?;
-    let parsed_children = parse_all_rust(repo_root, &files)?;
+    let parsed_children = parse_all(repo_root, &files)?;
     let mut tree = build_tree(repo_root, &files, &parsed_children);
     dedupe_ids(&mut tree.root);
     let counts = crate::churn::churn_counts(repo_root)?;
@@ -18,18 +18,27 @@ pub fn index_repo(repo_root: &Path) -> anyhow::Result<SymbolTree> {
     Ok(tree)
 }
 
-/// Parse every .rs file in parallel (spec §5.2: rayon, whole repo at startup).
-fn parse_all_rust(
+/// Parse source files in parallel (spec §5.2: rayon, whole repo at startup).
+/// Dispatches to the correct parser based on file extension.
+fn parse_all(
     repo_root: &Path,
     files: &[ScannedFile],
 ) -> anyhow::Result<BTreeMap<PathBuf, ParsedFile>> {
     files
         .par_iter()
-        .filter(|f| f.rel_path.extension().is_some_and(|e| e == "rs"))
-        .map(|f| {
+        .filter_map(|f| {
+            let ext = f.rel_path.extension()?.to_str()?;
+            let parser: fn(&[u8]) -> anyhow::Result<Vec<RawItem>> = match ext {
+                "rs" => parse_rust_items,
+                "c" | "h" => parse_c_items,
+                _ => return None,
+            };
+            Some((f, parser))
+        })
+        .map(|(f, parser)| {
             let source = std::fs::read(repo_root.join(&f.rel_path))
                 .with_context(|| format!("reading {}", f.rel_path.display()))?;
-            let items = parse_rust_items(&source)
+            let items = parser(&source)
                 .with_context(|| format!("parsing {}", f.rel_path.display()))?;
             let file_qual = f.rel_path.to_string_lossy().replace('\\', "/");
             let mut children: Vec<SymbolNode> = items
@@ -37,10 +46,12 @@ fn parse_all_rust(
                 .map(|item| to_symbol_node(item, &file_qual))
                 .collect();
             finalize_children(&mut children);
-            Ok((
-                f.rel_path.clone(),
-                ParsedFile { items: children, doc: crate::parse::file_doc(&source) },
-            ))
+            let doc = if f.rel_path.extension().is_some_and(|e| e == "rs") {
+                crate::parse::file_doc(&source)
+            } else {
+                None
+            };
+            Ok((f.rel_path.clone(), ParsedFile { items: children, doc }))
         })
         .collect()
 }

@@ -12,6 +12,17 @@ pub enum SymbolKind {
     Item { label: String },
 }
 
+impl SymbolKind {
+    pub fn label(&self) -> &str {
+        match self {
+            SymbolKind::Folder => "folder",
+            SymbolKind::File => "file",
+            SymbolKind::Chunk => "chunk",
+            SymbolKind::Item { label } => label,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId {
     pub kind: SymbolKind,

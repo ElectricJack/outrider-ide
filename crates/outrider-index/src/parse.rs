@@ -23,46 +23,120 @@ pub fn parse_rust_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .context("loading tree-sitter-rust grammar")?;
     let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
-    Ok(collect_items(tree.root_node(), source))
+    let kind_fn = |node_kind: &str, _node: Node, _src: &[u8]| -> Option<&'static str> {
+        match node_kind {
+            "mod_item" => Some("module"),
+            "struct_item" => Some("struct"),
+            "enum_item" => Some("enum"),
+            "trait_item" => Some("trait"),
+            "impl_item" => Some("impl"),
+            "function_item" => Some("fn"),
+            _ => None,
+        }
+    };
+    Ok(collect_items(tree.root_node(), source, &kind_fn, &rust_item_name))
 }
 
-fn collect_items(node: Node, src: &[u8]) -> Vec<RawItem> {
+/// Extract struct/enum/typedef/fn items from C source.
+pub fn parse_c_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .context("loading tree-sitter-c grammar")?;
+    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let kind_fn = |node_kind: &str, node: Node, _src: &[u8]| -> Option<&'static str> {
+        match node_kind {
+            "function_definition" => Some("fn"),
+            "struct_specifier" if node.child_by_field_name("body").is_some() => Some("struct"),
+            "enum_specifier" if node.child_by_field_name("body").is_some() => Some("enum"),
+            "type_definition" => Some("typedef"),
+            _ => None,
+        }
+    };
+    Ok(collect_items(tree.root_node(), source, &kind_fn, &c_item_name))
+}
+
+/// C-specific name extraction.
+/// - `struct_specifier` / `enum_specifier`: `name` field.
+/// - `type_definition`: the last named child before `;` is the type alias
+///   (`type_identifier`).
+/// - `function_definition`: the `declarator` field is a `function_declarator`
+///   whose own `declarator` field is the identifier.
+fn c_item_name(node: Node, src: &[u8]) -> String {
+    match node.kind() {
+        "struct_specifier" | "enum_specifier" => {
+            node.child_by_field_name("name")
+                .map(|n| node_text(n, src))
+                .unwrap_or_else(|| "<anon>".to_string())
+        }
+        "type_definition" => {
+            // The alias identifier is the last type_identifier child.
+            let mut cursor = node.walk();
+            let mut last_ident = None;
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "type_identifier" {
+                    last_ident = Some(node_text(child, src));
+                }
+            }
+            last_ident.unwrap_or_else(|| "<anon>".to_string())
+        }
+        "function_definition" => {
+            // declarator field → function_declarator → declarator field (the name).
+            let declarator = node.child_by_field_name("declarator");
+            if let Some(decl) = declarator {
+                // function_declarator has a `declarator` field that is the identifier.
+                if let Some(inner) = decl.child_by_field_name("declarator") {
+                    return node_text(inner, src);
+                }
+                // fallback: first named child
+                if let Some(first) = decl.named_child(0) {
+                    return node_text(first, src);
+                }
+            }
+            "<anon>".to_string()
+        }
+        _ => item_name_default(node, src),
+    }
+}
+
+fn collect_items(
+    node: Node,
+    src: &[u8],
+    kind_fn: &dyn Fn(&str, Node, &[u8]) -> Option<&'static str>,
+    name_fn: &dyn Fn(Node, &[u8]) -> String,
+) -> Vec<RawItem> {
     let mut items = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if let Some(kind) = item_kind(child.kind()) {
+        if let Some(label) = kind_fn(child.kind(), child, src) {
             items.push(RawItem {
-                kind,
-                name: item_name(child, src),
+                kind: SymbolKind::Item { label: label.into() },
+                name: name_fn(child, src),
                 signature: item_signature(child, src),
                 byte_range: child.byte_range(),
                 line_count: (child.end_position().row - child.start_position().row + 1) as u64,
-                children: collect_items(child, src),
+                children: collect_items(child, src, kind_fn, name_fn),
             });
         } else {
-            items.extend(collect_items(child, src));
+            items.extend(collect_items(child, src, kind_fn, name_fn));
         }
     }
     items
-}
-
-fn item_kind(node_kind: &str) -> Option<SymbolKind> {
-    match node_kind {
-        "mod_item" => Some(SymbolKind::Item { label: "module".into() }),
-        "struct_item" => Some(SymbolKind::Item { label: "struct".into() }),
-        "enum_item" => Some(SymbolKind::Item { label: "enum".into() }),
-        "trait_item" => Some(SymbolKind::Item { label: "trait".into() }),
-        "impl_item" => Some(SymbolKind::Item { label: "impl".into() }),
-        "function_item" => Some(SymbolKind::Item { label: "fn".into() }),
-        _ => None,
-    }
 }
 
 fn node_text(node: Node, src: &[u8]) -> String {
     String::from_utf8_lossy(&src[node.byte_range()]).into_owned()
 }
 
-fn item_name(node: Node, src: &[u8]) -> String {
+/// Default name extraction: uses the `name` field of the node.
+fn item_name_default(node: Node, src: &[u8]) -> String {
+    node.child_by_field_name("name")
+        .map(|n| node_text(n, src))
+        .unwrap_or_else(|| "<anon>".to_string())
+}
+
+/// Rust-specific name extraction: handles `impl` blocks specially.
+fn rust_item_name(node: Node, src: &[u8]) -> String {
     if node.kind() == "impl_item" {
         let ty = node
             .child_by_field_name("type")
@@ -73,9 +147,7 @@ fn item_name(node: Node, src: &[u8]) -> String {
             None => ty,
         };
     }
-    node.child_by_field_name("name")
-        .map(|n| node_text(n, src))
-        .unwrap_or_else(|| "<anon>".to_string())
+    item_name_default(node, src)
 }
 
 /// Declaration text up to (excluding) the body `{` or a terminating `;`,
@@ -112,7 +184,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::types::SymbolKind;
-    use super::{parse_rust_items};
+    use super::{parse_rust_items, parse_c_items};
 
     const SRC: &str = r#"mod inner {
     pub fn helper() {
@@ -207,4 +279,37 @@ fn free() {
         assert_eq!(file_doc(b"fn x() {}\n"), None);
         assert_eq!(file_doc(b"// plain comment\n//! not leading\n"), None);
     }
+
+    #[test]
+    fn extracts_c_items() {
+        let src = br#"
+struct Point {
+    int x;
+    int y;
+};
+
+enum Color { RED, GREEN, BLUE };
+
+typedef unsigned long ulong;
+
+void draw(struct Point p) {
+    // body
 }
+"#;
+        let items = parse_c_items(src).unwrap();
+        let summary: Vec<(&str, &str)> = items
+            .iter()
+            .map(|i| (i.kind.label(), i.name.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("struct", "Point"),
+                ("enum", "Color"),
+                ("typedef", "ulong"),
+                ("fn", "draw"),
+            ]
+        );
+    }
+}
+

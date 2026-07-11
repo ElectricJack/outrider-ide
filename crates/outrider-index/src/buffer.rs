@@ -108,6 +108,7 @@ impl FileBuffer {
     pub fn new(text: String, ext: &str) -> anyhow::Result<Self> {
         let lang: Option<(tree_sitter::Language, &str)> = match ext {
             "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
+            "c" | "h" => Some((tree_sitter_c::LANGUAGE.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
             "md" => Some((tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK)),
             "toml" => Some((tree_sitter_toml_ng::LANGUAGE.into(), TOML_HIGHLIGHTS)),
             _ => None,
