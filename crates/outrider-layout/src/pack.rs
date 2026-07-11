@@ -79,26 +79,33 @@ fn size(
         return (cfg.page_w, h);
     }
     // Re-derive the ordering invariant locally; never trust input Vec order.
-    let mut order: Vec<&SymbolNode> = node.children.iter().collect();
-    if order.first().map(|c| &c.id.kind) == Some(&SymbolKind::Chunk) {
+    let mut order: Vec<(&SymbolNode, (f64, f64))> =
+        node.children.iter().map(|c| (c, size(c, cfg, rel))).collect();
+    if order.first().map(|(c, _)| &c.id.kind) == Some(&SymbolKind::Chunk) {
         // Chunk children pack in source order, ignoring their heading labels.
-        order.sort_by(|a, b| {
+        order.sort_by(|(a, _), (b, _)| {
             let ka = a.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
             let kb = b.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
             ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
         });
     } else {
-        order.sort_by(|a, b| {
-            a.name.as_bytes().cmp(b.name.as_bytes()).then(a.id.ordinal.cmp(&b.id.ordinal))
+        // Kind groups first (types → fns → classes → modules), tallest
+        // first within a group so greedy column fill becomes FFD; name
+        // then ordinal keep equal-height runs alphabetical/deterministic.
+        order.sort_by(|(a, sa), (b, sb)| {
+            kind_rank(&a.id.kind)
+                .cmp(&kind_rank(&b.id.kind))
+                .then(sb.1.total_cmp(&sa.1))
+                .then(a.name.as_bytes().cmp(b.name.as_bytes()))
+                .then(a.id.ordinal.cmp(&b.id.ordinal))
         });
     }
-    let sizes: Vec<(f64, f64)> = order.iter().map(|c| size(c, cfg, rel)).collect();
-    let area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
-    let tallest = sizes.iter().map(|&(_, h)| h).fold(0.0, f64::max);
+    let area: f64 = order.iter().map(|(_, (w, h))| w * h).sum();
+    let tallest = order.iter().map(|&(_, (_, h))| h).fold(0.0, f64::max);
     // tallest.max(...) guarantees no child is ever forced to wrap alone.
     let target_h = tallest.max((area / cfg.aspect).sqrt());
     let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for (child, &(w, h)) in order.iter().zip(&sizes) {
+    for &(child, (w, h)) in &order {
         if y > 0.0 && y + h > target_h {
             x += col_w + cfg.gap;
             y = 0.0;
@@ -229,8 +236,8 @@ mod tests {
     }
 
     #[test]
-    fn children_placed_by_name_then_ordinal_never_size() {
-        // "zeta" is huge, "alpha" tiny — alpha still comes first.
+    fn children_placed_tallest_first_names_break_ties() {
+        // "zeta" is huge, "alpha" tiny — zeta packs first now (size-aware).
         let tree = SymbolTree {
             root: n(
                 SymbolKind::Folder,
@@ -246,13 +253,52 @@ mod tests {
         };
         let p = pack(&tree, &cfg());
         let (a, z) = (rect(&p, "alpha.rs"), rect(&p, "zeta.rs"));
-        // alpha is placed first: top-left of the content area
-        close(a.x, 8.0);
-        close(a.y, 60.0);
-        // zeta is placed second: it wraps to the next column (alpha's column
-        // is full), landing at the same top — name order still decides first
-        close(z.x, 496.0);
+        // zeta is placed first: top-left of the content area
+        close(z.x, 8.0);
         close(z.y, 60.0);
+        // alpha wraps to the second column (zeta alone fills target_h)
+        close(a.x, 496.0);
+        close(a.y, 60.0);
+    }
+
+    #[test]
+    fn kind_groups_beat_size_types_first_modules_last() {
+        // Scrambled input: huge loose fn, small module, tiny struct, small
+        // class. Group rank wins over height: the tiny struct still packs
+        // first; the module packs last despite the fn being far taller.
+        let item = |label: &str, qp: &str, name: &str, measure: u64| {
+            n(SymbolKind::Item { label: label.into() }, qp, name, measure, vec![])
+        };
+        let file = n(
+            SymbolKind::File,
+            "m.rs",
+            "m.rs",
+            0,
+            vec![
+                item("fn", "m.rs::big", "big", 200),
+                item("module", "m.rs::sub", "sub", 3),
+                item("struct", "m.rs::S", "S", 2),
+                item("class", "m.rs::C", "C", 3),
+            ],
+        );
+        let tree = SymbolTree {
+            root: n(SymbolKind::Folder, "", "", 0, vec![file]),
+            repo_root: "/x".into(),
+        };
+        let p = pack(&tree, &cfg());
+        let (s, big, c, sub) = (
+            rect(&p, "m.rs::S"),
+            rect(&p, "m.rs::big"),
+            rect(&p, "m.rs::C"),
+            rect(&p, "m.rs::sub"),
+        );
+        // struct is first: top-left of m.rs's content area
+        assert!(s.x < big.x && s.y < big.y + big.h, "struct before fn");
+        // big fn wraps to its own column right of the struct
+        assert!(big.x > s.x, "fn in a later column than the struct");
+        // class after fn, module after class (later column or lower in same)
+        assert!(c.x > big.x || (c.x == big.x && c.y > big.y), "class after fn");
+        assert!(sub.x > c.x || (sub.x == c.x && sub.y > c.y), "module after class");
     }
 
     #[test]
