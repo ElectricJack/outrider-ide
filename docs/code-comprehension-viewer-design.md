@@ -393,7 +393,7 @@ No implementation choice may violate these. Each one, broken, degrades the tool 
 
 1. **Determinism.** Same structure → same layout, always. Same commit renders identically on any machine, for any reviewer.
 2. **Continuity.** Small structural change → small visual change. This is diff legibility; it is the whole review use case.
-3. **Stable ordering.** Order children by name/path, never by size. Size changes extent in place; it must never change *slot*.
+3. **Stable ordering.** Children order by kind group (types → fns → classes → modules), then height descending within group, then name; hierarchical stability holds (a container's layout depends only on its own children). Size changes extent in place; it must never change *slot*.
 4. **Anchors everywhere.** Every stored position — layout, call site, summary, traversal history — is an anchor/stable ID into the buffer, never a raw offset.
 5. **Single buffer, one path.** Render from the buffer; don't build a separate read-path and write-path.
 6. **Assess/explain paint split.** Structural signals own color and geometry and never speak prose. The LLM owns text only, at card fidelity and finer, always marked, and never drives color/heat/border.

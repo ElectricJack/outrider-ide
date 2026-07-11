@@ -293,7 +293,7 @@ mod tests {
             rect(&p, "m.rs::sub"),
         );
         // struct is first: top-left of m.rs's content area
-        assert!(s.x < big.x && s.y < big.y + big.h, "struct before fn");
+        assert!(s.x < big.x && s.y <= big.y, "struct before fn");
         // big fn wraps to its own column right of the struct
         assert!(big.x > s.x, "fn in a later column than the struct");
         // class after fn, module after class (later column or lower in same)
