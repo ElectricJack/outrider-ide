@@ -154,6 +154,54 @@ fn c_item_name(node: Node, src: &[u8]) -> String {
     }
 }
 
+pub fn js_kind_fn(node_kind: &str, node: Node, _src: &[u8]) -> Option<&'static str> {
+    match node_kind {
+        "function_declaration" | "generator_function_declaration" => Some("fn"),
+        "class_declaration" => Some("class"),
+        "method_definition" => Some("fn"),
+        "lexical_declaration" | "variable_declaration" => {
+            // Named arrow functions: const add = (a, b) => ...
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "variable_declarator" {
+                    if let Some(value) = child.child_by_field_name("value") {
+                        if value.kind() == "arrow_function" || value.kind() == "function" {
+                            return Some("fn");
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "export_statement" => None, // recurse into inner declaration
+        _ => None,
+    }
+}
+
+pub fn js_item_name(node: Node, src: &[u8]) -> String {
+    if node.kind() == "lexical_declaration" || node.kind() == "variable_declaration" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                return child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, src))
+                    .unwrap_or_else(|| "<anon>".to_string());
+            }
+        }
+    }
+    item_name_default(node, src)
+}
+
+pub fn parse_js_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .context("loading tree-sitter-javascript grammar")?;
+    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    Ok(collect_items(tree.root_node(), source, &js_kind_fn, &js_item_name))
+}
+
 fn collect_items(
     node: Node,
     src: &[u8],
@@ -239,7 +287,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::types::SymbolKind;
-    use super::{parse_rust_items, parse_c_items, parse_python_items};
+    use super::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items};
 
     const SRC: &str = r#"mod inner {
     pub fn helper() {
@@ -367,6 +415,42 @@ def decorated():
         );
         assert_eq!(items[0].children[0].name, "speak");
         assert_eq!(items[0].children[1].name, "eat");
+    }
+
+    #[test]
+    fn extracts_js_items() {
+        let src = br#"
+function greet(name) {
+    return "hello " + name;
+}
+
+class Greeter {
+    constructor(name) {
+        this.name = name;
+    }
+    greet() {
+        return "hello " + this.name;
+    }
+}
+
+const add = (a, b) => a + b;
+
+export function exported() {}
+"#;
+        let items = parse_js_items(src).unwrap();
+        let summary: Vec<(&str, &str, usize)> = items
+            .iter()
+            .map(|i| (i.kind.label(), i.name.as_str(), i.children.len()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("fn", "greet", 0),
+                ("class", "Greeter", 2),
+                ("fn", "add", 0),
+                ("fn", "exported", 0),
+            ]
+        );
     }
 
     #[test]
