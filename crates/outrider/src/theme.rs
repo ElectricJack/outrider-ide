@@ -23,6 +23,11 @@ const TINT_TEST: u32 = 0x306030;
 const TINT_TYPEDEF: u32 = 0x206060;
 const TINT_BLEND: f32 = 0.12;
 
+/// File containers get a subtle warm shift so they're visually distinct
+/// from the cool-gray folder depth ramp.
+const FILE_TINT: u32 = 0x443828;
+const FILE_BLEND: f32 = 0.25;
+
 /// Semantic category for box background tinting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoxTint {
@@ -58,11 +63,28 @@ pub fn depth_fill(level: u8) -> u32 {
     lerp_rgb(DEPTH_FILL_0, DEPTH_FILL_8, level.min(8) as f32 / 8.0)
 }
 
-/// Box background: leaf pages (code or text) keep the editor background
-/// at every rung — zooming in never changes a leaf's background —
-/// containers use the depth ramp. Tints blend a semantic color at TINT_BLEND.
-pub fn box_fill(is_leaf_page: bool, level: u8, tint: BoxTint) -> u32 {
-    let base = if is_leaf_page { CODE_BG } else { depth_fill(level) };
+/// Whether a box is a leaf page, a file/item container, or a folder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BoxKind {
+    Leaf,
+    File,
+    Folder,
+}
+
+/// File-container depth fill: the folder ramp shifted warm.
+pub fn file_fill(level: u8) -> u32 {
+    lerp_rgb(depth_fill(level), FILE_TINT, FILE_BLEND)
+}
+
+/// Box background: leaf pages keep the editor background, file containers
+/// use a warm depth ramp, folder containers use the cool depth ramp.
+/// Tints blend a semantic color at TINT_BLEND.
+pub fn box_fill(kind: BoxKind, level: u8, tint: BoxTint) -> u32 {
+    let base = match kind {
+        BoxKind::Leaf => CODE_BG,
+        BoxKind::File => file_fill(level),
+        BoxKind::Folder => depth_fill(level),
+    };
     let target = match tint {
         BoxTint::Normal => return base,
         BoxTint::TypeDef => TINT_TYPEDEF,
@@ -143,36 +165,48 @@ mod tests {
 
     #[test]
     fn box_fill_leaf_pages_are_editor_black_at_every_depth() {
-        assert_eq!(box_fill(true, 0, BoxTint::Normal), CODE_BG);
-        assert_eq!(box_fill(true, 5, BoxTint::Normal), CODE_BG);
-        assert_eq!(box_fill(false, 0, BoxTint::Normal), depth_fill(0));
-        assert_eq!(box_fill(false, 5, BoxTint::Normal), depth_fill(5));
+        assert_eq!(box_fill(BoxKind::Leaf, 0, BoxTint::Normal), CODE_BG);
+        assert_eq!(box_fill(BoxKind::Leaf, 5, BoxTint::Normal), CODE_BG);
+        assert_eq!(box_fill(BoxKind::Folder, 0, BoxTint::Normal), depth_fill(0));
+        assert_eq!(box_fill(BoxKind::Folder, 5, BoxTint::Normal), depth_fill(5));
+    }
+
+    #[test]
+    fn box_fill_files_differ_from_folders() {
+        for level in [0, 3, 8] {
+            let folder = box_fill(BoxKind::Folder, level, BoxTint::Normal);
+            let file = box_fill(BoxKind::File, level, BoxTint::Normal);
+            assert_ne!(file, folder, "file and folder fills must differ at level {level}");
+            assert_eq!(file, file_fill(level));
+        }
     }
 
     #[test]
     fn box_fill_tints_produce_different_colors_than_normal() {
-        // Container at level 0; each non-Normal tint shifts the color.
-        let normal = box_fill(false, 0, BoxTint::Normal);
-        assert_ne!(box_fill(false, 0, BoxTint::TypeDef), normal);
-        assert_ne!(box_fill(false, 0, BoxTint::DocsFolder), normal);
-        assert_ne!(box_fill(false, 0, BoxTint::TestFolder), normal);
+        // Folder at level 0; each non-Normal tint shifts the color.
+        let normal = box_fill(BoxKind::Folder, 0, BoxTint::Normal);
+        assert_ne!(box_fill(BoxKind::Folder, 0, BoxTint::TypeDef), normal);
+        assert_ne!(box_fill(BoxKind::Folder, 0, BoxTint::DocsFolder), normal);
+        assert_ne!(box_fill(BoxKind::Folder, 0, BoxTint::TestFolder), normal);
         // Leaf page; same contract.
-        let leaf_normal = box_fill(true, 0, BoxTint::Normal);
-        assert_ne!(box_fill(true, 0, BoxTint::TypeDef), leaf_normal);
-        assert_ne!(box_fill(true, 0, BoxTint::DocsFolder), leaf_normal);
-        assert_ne!(box_fill(true, 0, BoxTint::TestFolder), leaf_normal);
+        let leaf_normal = box_fill(BoxKind::Leaf, 0, BoxTint::Normal);
+        assert_ne!(box_fill(BoxKind::Leaf, 0, BoxTint::TypeDef), leaf_normal);
+        assert_ne!(box_fill(BoxKind::Leaf, 0, BoxTint::DocsFolder), leaf_normal);
+        assert_ne!(box_fill(BoxKind::Leaf, 0, BoxTint::TestFolder), leaf_normal);
     }
 
     #[test]
     fn tinted_fill_border_contract() {
         // border_for must remain lighter than the tinted fill on every channel.
-        for tint in [BoxTint::TypeDef, BoxTint::DocsFolder, BoxTint::TestFolder] {
-            let fill = box_fill(false, 2, tint);
-            let border = border_for(fill);
-            assert!((border >> 16) & 0xff >= (fill >> 16) & 0xff);
-            assert!((border >> 8) & 0xff >= (fill >> 8) & 0xff);
-            assert!(border & 0xff >= fill & 0xff);
-            assert_ne!(border, fill);
+        for kind in [BoxKind::Folder, BoxKind::File] {
+            for tint in [BoxTint::TypeDef, BoxTint::DocsFolder, BoxTint::TestFolder] {
+                let fill = box_fill(kind, 2, tint);
+                let border = border_for(fill);
+                assert!((border >> 16) & 0xff >= (fill >> 16) & 0xff);
+                assert!((border >> 8) & 0xff >= (fill >> 8) & 0xff);
+                assert!(border & 0xff >= fill & 0xff);
+                assert_ne!(border, fill);
+            }
         }
     }
 

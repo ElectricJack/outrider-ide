@@ -461,8 +461,15 @@ impl TreemapView {
                 }
             }
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
+            let box_kind = if is_leaf {
+                theme::BoxKind::Leaf
+            } else if item.node.id.kind == SymbolKind::Folder {
+                theme::BoxKind::Folder
+            } else {
+                theme::BoxKind::File
+            };
             let tint = classify_tint(item.node);
-            let fill = theme::box_fill(is_leaf, item.level, tint);
+            let fill = theme::box_fill(box_kind, item.level, tint);
             let mut body_font_px = FONT_PX as f32;
             let mut header_bg_h = 0.0f32;
             let mut header_bg_y = item.px.y as f32;
