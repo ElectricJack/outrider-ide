@@ -19,10 +19,11 @@ pub const MIN_TEXT_FONT_PX: f64 = 7.0;
 pub const TEXT_FADE_LO: f64 = 5.0;
 pub const TEXT_FADE_HI: f64 = 9.0;
 
-/// Box-height range (screen px) for the Label↔Minimap crossfade: bars
-/// fade in as the box grows past BAR_FADE_LO toward BAR_FADE_HI.
-pub const BAR_FADE_LO: f64 = 20.0;
-pub const BAR_FADE_HI: f64 = 50.0;
+/// Box-width range (screen px) for the far-zoom bar fade: bars stay
+/// visible at every leaf tier (even after names disappear) and gently
+/// fade out as the box narrows, fully gone below BAR_FADE_W_LO.
+pub const BAR_FADE_W_LO: f64 = 10.0;
+pub const BAR_FADE_W_HI: f64 = 60.0;
 
 /// A leaf page: has source bytes, no children, and is not a folder.
 /// Items are code pages; childless files (markdown, TOML, plain text,

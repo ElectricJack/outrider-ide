@@ -267,7 +267,10 @@ fn leaf_minimap(
 ) -> Vec<MinimapBar> {
     let scale = full_h / content::natural_px(node);
     let step = LINE_STEP * scale;
-    let bar_h = (step * 0.7) as f32;
+    // At far zoom rows go sub-pixel; stride to ~one bar per screen pixel
+    // (thicker to keep coverage) instead of stacking thousands of quads.
+    let stride = ((1.0 / step).ceil() as usize).max(1);
+    let bar_h = (step * stride as f64 * 0.7) as f32;
     let content_y0 = HEADER.max(HEADER * scale);
     let mut bars = Vec::new();
     let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
@@ -275,7 +278,7 @@ fn leaf_minimap(
     if let Some(m) = buffers.get(&rel, syms) {
         if let Some(start) = m.symbol_start_line(&node.id) {
             let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
-            for r in 0..count {
+            for r in (0..count).step_by(stride) {
                 let row_y = top + content_y0 + r as f64 * LINE_STEP * scale;
                 if row_y > vh {
                     break;
@@ -493,18 +496,17 @@ impl TreemapView {
                             .push((item.level, pin_y + header_bg_h as f64));
                     }
                 }
-                Draw::Leaf(LeafDraw::Dot) => {}
-                Draw::Leaf(LeafDraw::Label | LeafDraw::Minimap | LeafDraw::Text) => {
+                Draw::Leaf(tier) => {
                     let scale = item.full_h / content::natural_px(item.node);
                     let font = FONT_PX * scale;
                     body_font_px = (FONT_PX * scale) as f32;
-                    if item.px.h >= 14.0 {
+                    if tier != LeafDraw::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, false, item.px.y);
                     }
-                    let bar_h_fade = ((item.full_h - content::BAR_FADE_LO)
-                        / (content::BAR_FADE_HI - content::BAR_FADE_LO))
+                    let bar_w_fade = ((item.label_w - content::BAR_FADE_W_LO)
+                        / (content::BAR_FADE_W_HI - content::BAR_FADE_W_LO))
                         .clamp(0.0, 1.0) as f32;
-                    if bar_h_fade > 0.0 && font < content::TEXT_FADE_HI {
+                    if bar_w_fade > 0.0 && font < content::TEXT_FADE_HI {
                         bars = leaf_minimap(
                             item.node,
                             item.left,
@@ -514,7 +516,7 @@ impl TreemapView {
                             &mut self.buffers,
                             &self.file_symbols,
                         );
-                        bar_opacity = bar_h_fade;
+                        bar_opacity = bar_w_fade;
                         if font > content::TEXT_FADE_LO {
                             bar_opacity *= 1.0
                                 - ((font - content::TEXT_FADE_LO)
