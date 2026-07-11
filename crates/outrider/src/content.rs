@@ -14,6 +14,11 @@ pub const BOTTOM_PAD: f64 = 6.0;
 /// text (the text/minimap tier boundary).
 pub const MIN_TEXT_FONT_PX: f64 = 7.0;
 
+/// Font-size range for the Minimap↔Text crossfade: text fades in from
+/// FADE_LO to FADE_HI while minimap bars fade out over the same range.
+pub const TEXT_FADE_LO: f64 = 5.0;
+pub const TEXT_FADE_HI: f64 = 9.0;
+
 /// A leaf page: has source bytes, no children, and is not a folder.
 /// Items are code pages; childless files (markdown, TOML, plain text,
 /// unparsed .rs) are text pages. These boxes render their content at

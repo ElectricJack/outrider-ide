@@ -100,6 +100,10 @@ struct PaintItem {
     /// Y coordinate for the header background (may differ from `y` when
     /// nested pinned headers are stacked).
     header_bg_y: f32,
+    /// Opacity for body text (0..1); used for the Minimap→Text fade.
+    body_opacity: f32,
+    /// Opacity for minimap bars (0..1); inverse of body_opacity in the fade zone.
+    bar_opacity: f32,
     name: Option<NameRow>,
     body: Vec<BodyText>,
     bars: Vec<MinimapBar>,
@@ -267,8 +271,7 @@ fn leaf_minimap(
         if let Some(start) = m.symbol_start_line(&node.id) {
             let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
             for r in 0..count {
-                // Same y-band as code row r (past the header + 1 readout row).
-                let row_y = top + (HEADER + (1 + r) as f64 * LINE_STEP) * scale;
+                let row_y = top + (HEADER + r as f64 * LINE_STEP) * scale;
                 if row_y > vh {
                     break;
                 }
@@ -420,19 +423,6 @@ impl TreemapView {
         Some(NameRow { x: (item.px.x + BODY_PAD) as f32, y: y as f32, font_px: font, text })
     }
 
-    /// A leaf page's name row at uniform scale, anchored to the UNCLIPPED
-    /// top/left so it moves and scales with the page (spec §2).
-    fn scaled_name(item: &world::DrawItem, scale: f64) -> Option<NameRow> {
-        let font = (FONT_PX * scale) as f32;
-        let text = truncate_to_width(&item.node.name, item.label_w as f32, font)?;
-        Some(NameRow {
-            x: (item.left + BODY_PAD * scale) as f32,
-            y: (item.top + 4.0 * scale) as f32,
-            font_px: font,
-            text,
-        })
-    }
-
     fn paint_items(&mut self, vw: f64, vh: f64) -> Vec<PaintItem> {
         if let Some((tw, started)) = self.tween {
             let t = started.elapsed().as_secs_f64();
@@ -472,6 +462,8 @@ impl TreemapView {
             let mut body_font_px = FONT_PX as f32;
             let mut header_bg_h = 0.0f32;
             let mut header_bg_y = item.px.y as f32;
+            let mut body_opacity = 1.0f32;
+            let mut bar_opacity = 1.0f32;
             let mut name = None;
             let mut body = Vec::new();
             let mut bars = Vec::new();
@@ -496,34 +488,51 @@ impl TreemapView {
                 Draw::Leaf(LeafDraw::Dot) => {}
                 Draw::Leaf(LeafDraw::Label) => {
                     if item.px.h >= 14.0 {
-                        name = Self::pinned_name(&item, true, item.px.y);
+                        name = Self::pinned_name(&item, false, item.px.y);
                     }
                 }
-                Draw::Leaf(LeafDraw::Minimap) => {
-                    bars = leaf_minimap(
-                        item.node,
-                        item.left,
-                        item.top,
-                        item.full_h,
-                        vh,
-                        &mut self.buffers,
-                        &self.file_symbols,
-                    );
-                }
-                Draw::Leaf(LeafDraw::Text) => {
+                Draw::Leaf(LeafDraw::Minimap | LeafDraw::Text) => {
                     let scale = item.full_h / content::natural_px(item.node);
+                    let font = FONT_PX * scale;
                     body_font_px = (FONT_PX * scale) as f32;
-                    name = Self::scaled_name(&item, scale);
-                    body = leaf_text_body(
-                        item.node,
-                        item.left,
-                        item.top,
-                        item.full_h,
-                        item.label_w,
-                        vh,
-                        &mut self.buffers,
-                        &self.file_symbols,
-                    );
+                    if item.px.h >= 14.0 {
+                        name = Self::pinned_name(&item, false, item.px.y);
+                    }
+                    if font < content::TEXT_FADE_HI {
+                        bars = leaf_minimap(
+                            item.node,
+                            item.left,
+                            item.top,
+                            item.full_h,
+                            vh,
+                            &mut self.buffers,
+                            &self.file_symbols,
+                        );
+                        bar_opacity = if font > content::TEXT_FADE_LO {
+                            1.0 - ((font - content::TEXT_FADE_LO)
+                                / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
+                                as f32
+                        } else {
+                            1.0
+                        };
+                    }
+                    if font >= content::TEXT_FADE_LO
+                        && item.label_w >= world::CODE_MIN_W
+                    {
+                        body = leaf_text_body(
+                            item.node,
+                            item.left,
+                            item.top,
+                            item.full_h,
+                            item.label_w,
+                            vh,
+                            &mut self.buffers,
+                            &self.file_symbols,
+                        );
+                        body_opacity = ((font - content::TEXT_FADE_LO)
+                            / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
+                            .clamp(0.0, 1.0) as f32;
+                    }
                 }
             }
             out.push(PaintItem {
@@ -538,6 +547,8 @@ impl TreemapView {
                 body_font_px,
                 header_bg_h,
                 header_bg_y,
+                body_opacity,
+                bar_opacity,
                 name,
                 body,
                 bars,
@@ -748,12 +759,13 @@ impl Render for TreemapView {
                                     point(origin.x + px(bar.x), origin.y + px(bar.y)),
                                     size(px(bar.w), px(bar.h)),
                                 );
+                                let bc = rgb(bar.color).opacity(item.bar_opacity);
                                 window.paint_quad(quad(
                                     bb,
                                     px(0.),
-                                    rgb(bar.color),
+                                    bc,
                                     px(0.),
-                                    rgb(bar.color),
+                                    bc,
                                     BorderStyle::default(),
                                 ));
                             }
@@ -785,8 +797,13 @@ impl Render for TreemapView {
                                 if bt.text.is_empty() {
                                     continue;
                                 }
-                                let runs: Vec<TextRun> =
-                                    bt.runs.iter().map(|&(len, color)| run(len, color)).collect();
+                                let runs: Vec<TextRun> = bt.runs.iter().map(|&(len, color)| {
+                                    let mut r = run(len, color);
+                                    if item.body_opacity < 1.0 {
+                                        r.color = r.color.opacity(item.body_opacity);
+                                    }
+                                    r
+                                }).collect();
                                 let line = window.text_system().shape_line(
                                     bt.text.clone().into(),
                                     px(item.body_font_px),
@@ -1072,8 +1089,8 @@ mod tests {
         let bars = leaf_minimap(&leaf, 0.0, 0.0, natural, 600.0, &mut mgr, &file_symbols);
         // two non-blank source lines → two bars
         assert_eq!(bars.len(), 2);
-        // bar 0 sits centered in the first code row (HEADER + LINE_STEP)
-        let row_y0 = HEADER + LINE_STEP;
+        // bar 0 sits centered in the first code row (HEADER)
+        let row_y0 = HEADER;
         assert!((f64::from(bars[0].y) - (row_y0 + LINE_STEP * 0.15)).abs() < 1e-3);
         // second line is indented 4 spaces → its bar starts further right
         assert!(bars[1].x > bars[0].x);
