@@ -49,6 +49,21 @@ pub fn pack(tree: &SymbolTree, cfg: &PackConfig) -> PackLayout {
     PackLayout { rects }
 }
 
+/// Packing group for a sibling (spec: types → loose fns → classes/impls
+/// → modules → unknown). Files/folders don't group — all rank 0.
+fn kind_rank(kind: &SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Item { label } => match label.as_str() {
+            "struct" | "enum" | "trait" | "interface" | "type" => 0,
+            "fn" => 1,
+            "class" | "impl" => 2,
+            "module" | "namespace" => 3,
+            _ => 4,
+        },
+        _ => 0,
+    }
+}
+
 /// Bottom-up size pass: returns (w, h) and records each node's position
 /// relative to its parent's origin in `rel` (x, y, w, h). Children fill
 /// columns top-to-bottom, wrapping right toward a square aspect (spec §5).
@@ -338,5 +353,23 @@ mod tests {
         close(z.x, m.x);
         close(m.x, a.x);
         assert!(z.y < m.y && m.y < a.y, "chunks stack zzz(0) < mmm(60) < aaa(120)");
+    }
+
+    #[test]
+    fn kind_rank_groups_types_fns_classes_modules() {
+        let item = |l: &str| SymbolKind::Item { label: l.into() };
+        for l in ["struct", "enum", "trait", "interface", "type"] {
+            assert_eq!(kind_rank(&item(l)), 0, "{l} is a type");
+        }
+        assert_eq!(kind_rank(&item("fn")), 1);
+        assert_eq!(kind_rank(&item("class")), 2);
+        assert_eq!(kind_rank(&item("impl")), 2);
+        assert_eq!(kind_rank(&item("module")), 3);
+        assert_eq!(kind_rank(&item("namespace")), 3);
+        // unknown labels pack last
+        assert_eq!(kind_rank(&item("macro")), 4);
+        // files/folders have no kind grouping: all rank 0
+        assert_eq!(kind_rank(&SymbolKind::File), 0);
+        assert_eq!(kind_rank(&SymbolKind::Folder), 0);
     }
 }
