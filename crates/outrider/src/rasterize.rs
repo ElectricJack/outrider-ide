@@ -32,6 +32,7 @@ pub struct LeafTexture {
 
 impl LeafTexture {
     /// The level to paint at `screen_h` on-screen pixels, or None if empty.
+    #[allow(dead_code)]
     pub fn level_for(&self, screen_h: f32) -> Option<&Arc<RenderImage>> {
         if self.levels.is_empty() {
             return None;
@@ -44,6 +45,7 @@ impl LeafTexture {
 
 /// Index of the smallest level (heights ordered largest→smallest) whose
 /// height still covers `screen_h`; clamps to the last level below that.
+#[allow(dead_code)]
 pub fn pick_level(heights: &[u32], screen_h: f32) -> usize {
     let mut best = 0;
     for (i, &lh) in heights.iter().enumerate() {
@@ -223,6 +225,116 @@ fn ct_color(c: u32) -> Color {
     Color::rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
+use std::collections::HashMap;
+
+use outrider_index::SymbolId;
+
+/// Bakes per frame; keeps zoom-out pop-in bounded without stalling a frame.
+pub const BAKES_PER_FRAME: usize = 4;
+/// Total texture budget across all levels of all cached leaves.
+#[allow(dead_code)]
+pub const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+struct Entry {
+    tex: LeafTexture,
+    last_used: u64,
+}
+
+/// Per-leaf texture cache: misses queue during the item pass, then
+/// `bake_queued` bakes the largest few and LRU-evicts past the budget.
+#[allow(dead_code)]
+pub struct TextureCache {
+    raster: Rasterizer,
+    entries: HashMap<SymbolId, Entry>,
+    clock: u64,
+    bytes: usize,
+    max_bytes: usize,
+    queue: Vec<(SymbolId, f64)>,
+    retired: Vec<Arc<RenderImage>>,
+}
+
+#[allow(dead_code)]
+impl TextureCache {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            raster: Rasterizer::new(),
+            entries: HashMap::new(),
+            clock: 0,
+            bytes: 0,
+            max_bytes,
+            queue: Vec::new(),
+            retired: Vec::new(),
+        }
+    }
+
+    /// Cache lookup. A hit refreshes LRU recency; a miss queues the leaf
+    /// for `bake_queued` at the end of the frame.
+    pub fn get(&mut self, id: &SymbolId, screen_area: f64) -> Option<&LeafTexture> {
+        self.clock += 1;
+        if self.entries.contains_key(id) {
+            let e = self.entries.get_mut(id).unwrap();
+            e.last_used = self.clock;
+            Some(&e.tex)
+        } else {
+            self.queue.push((id.clone(), screen_area));
+            None
+        }
+    }
+
+    pub fn has_queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Bake up to BAKES_PER_FRAME queued leaves, largest on screen first,
+    /// then evict LRU entries past the byte budget. Returns whether misses
+    /// remain (the caller schedules a repaint so they bake next frame).
+    pub fn bake_queued(
+        &mut self,
+        mut lines_for: impl FnMut(&SymbolId) -> Option<Vec<Line>>,
+    ) -> bool {
+        self.queue.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let queue = std::mem::take(&mut self.queue);
+        let mut it = queue.into_iter();
+        for (id, _) in it.by_ref().take(BAKES_PER_FRAME) {
+            // None → empty texture: negative-cached so a leaf without a
+            // buffer doesn't re-queue (and repaint) forever.
+            let tex = match lines_for(&id) {
+                Some(lines) => self.raster.bake(&lines),
+                None => LeafTexture { levels: Vec::new(), bytes: 0 },
+            };
+            self.bytes += tex.bytes;
+            self.clock += 1;
+            self.entries.insert(id, Entry { tex, last_used: self.clock });
+        }
+        let remaining = it.next().is_some();
+        while self.bytes > self.max_bytes {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            let e = self.entries.remove(&victim).unwrap();
+            self.bytes -= e.tex.bytes;
+            self.retired.extend(e.tex.levels);
+        }
+        remaining
+    }
+
+    /// Evicted images, for the caller to hand to `window.drop_image` so
+    /// atlas memory is actually reclaimed.
+    pub fn take_retired(&mut self) -> Vec<Arc<RenderImage>> {
+        std::mem::take(&mut self.retired)
+    }
+
+    #[cfg(test)]
+    fn set_max_bytes_for_test(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +423,86 @@ mod tests {
         assert_eq!(tex.level_for(12.0).unwrap().size(0).height.0, 20);
         assert_eq!(tex.level_for(2.0).unwrap().size(0).height.0, 5);
         assert!(Rasterizer::new().bake(&[]).level_for(10.0).is_none());
+    }
+
+    use outrider_index::{SymbolId, SymbolKind};
+
+    fn sid(name: &str) -> SymbolId {
+        SymbolId {
+            qualified_path: name.to_string(),
+            kind: SymbolKind::Item { label: "fn".into() },
+            ordinal: 0,
+        }
+    }
+
+    fn some_lines(n: usize) -> Option<Vec<Line>> {
+        Some((0..n).map(|_| plain("let x = 1;")).collect())
+    }
+
+    #[test]
+    fn cache_bakes_largest_first_within_budget() {
+        let mut cache = TextureCache::new(MAX_BYTES);
+        for i in 0..6 {
+            // areas 10, 20, .. 60 — misses enqueue
+            assert!(cache.get(&sid(&format!("l{i}")), (i + 1) as f64 * 10.0).is_none());
+        }
+        assert!(cache.has_queued());
+        let remaining = cache.bake_queued(|_| some_lines(4));
+        assert!(remaining, "6 queued, budget 4 — misses remain");
+        // The 4 largest (l2..l5) are now hits; the 2 smallest are not.
+        for i in 2..6 {
+            assert!(cache.get(&sid(&format!("l{i}")), 1.0).is_some());
+        }
+        assert!(cache.get(&sid("l0"), 1.0).is_none());
+        assert!(cache.get(&sid("l1"), 1.0).is_none());
+        // Next frame the rest bake and nothing remains.
+        assert!(!cache.bake_queued(|_| some_lines(4)));
+        assert!(cache.get(&sid("l0"), 1.0).is_some());
+    }
+
+    #[test]
+    fn cache_negative_caches_leaves_without_lines() {
+        let mut cache = TextureCache::new(MAX_BYTES);
+        assert!(cache.get(&sid("nofile"), 1.0).is_none());
+        assert!(!cache.bake_queued(|_| None));
+        // Cached as empty: a hit (no re-queue), but paints nothing.
+        let tex = cache.get(&sid("nofile"), 1.0).expect("negative-cached");
+        assert!(tex.levels.is_empty());
+        assert!(!cache.has_queued());
+    }
+
+    #[test]
+    fn cache_evicts_lru_and_retires_images() {
+        // Identical lines → identical bytes per texture, so a budget of
+        // exactly one texture forces exactly one eviction.
+        let mut cache = TextureCache::new(usize::MAX);
+        cache.get(&sid("a"), 1.0);
+        cache.bake_queued(|_| some_lines(4));
+        let one = cache.get(&sid("a"), 1.0).unwrap().bytes;
+        cache.set_max_bytes_for_test(one); // room for exactly one texture
+        cache.get(&sid("b"), 1.0);
+        cache.bake_queued(|_| some_lines(4)); // 2×one > one → evict LRU (a)
+        assert!(cache.get(&sid("b"), 1.0).is_some());
+        assert!(cache.get(&sid("a"), 1.0).is_none());
+        let retired = cache.take_retired();
+        assert!(!retired.is_empty(), "evicted levels are retired");
+        assert!(cache.take_retired().is_empty(), "drained");
+    }
+
+    #[test]
+    fn cache_hit_refreshes_lru_order() {
+        let mut cache = TextureCache::new(usize::MAX);
+        cache.get(&sid("a"), 1.0);
+        cache.bake_queued(|_| some_lines(4));
+        cache.get(&sid("b"), 1.0);
+        cache.bake_queued(|_| some_lines(4));
+        let one = cache.get(&sid("a"), 1.0).unwrap().bytes; // touch a
+        cache.set_max_bytes_for_test(2 * one); // room for two textures
+        cache.get(&sid("c"), 1.0);
+        cache.bake_queued(|_| some_lines(4)); // 3×one > 2×one → evict one
+        // b (older touch than a) is the LRU victim.
+        assert!(cache.get(&sid("a"), 1.0).is_some());
+        assert!(cache.get(&sid("b"), 1.0).is_none());
+        assert!(cache.get(&sid("c"), 1.0).is_some());
     }
 }
