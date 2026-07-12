@@ -108,6 +108,14 @@ pub(crate) const BODY_PAD: f64 = 6.0;
 /// Width of the floating doc panel shown to the right of the focused leaf.
 const DOC_PANEL_W: f64 = 280.0;
 
+/// State for the right-click context menu popup.
+struct ContextMenu {
+    /// Position (window coords) at which the menu was opened.
+    position: gpui::Point<Pixels>,
+    /// The tree node that was right-clicked.
+    target: SymbolId,
+}
+
 /// Root GPUI view: owns the symbol tree, pack layout, camera state, buffer
 /// cache, and texture cache; produces a full-screen canvas each frame.
 pub struct TreemapView {
@@ -142,6 +150,8 @@ pub struct TreemapView {
     show_welcome: bool,
     /// Whether the settings overlay is open.
     settings_open: bool,
+    /// Right-click context menu, if currently open.
+    context_menu: Option<ContextMenu>,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -508,6 +518,7 @@ impl TreemapView {
             settings,
             show_welcome,
             settings_open: false,
+            context_menu: None,
         }
     }
 
@@ -1002,6 +1013,7 @@ impl TreemapView {
                 self.neighbors = None;
                 self.hover_id = None;
                 self.camera = None;
+                self.context_menu = None;
                 self.palette = palette::Palette::new();
                 self.tree = tree;
                 self.layout = layout;
@@ -1019,6 +1031,97 @@ impl TreemapView {
                 let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
             }
         }
+    }
+
+    /// Build the right-click context menu popup positioned at the click site.
+    /// Returns None if no context menu is open.
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let menu = self.context_menu.as_ref()?;
+        let x = f32::from(menu.position.x);
+        let y = f32::from(menu.position.y);
+        let target = menu.target.clone();
+
+        // Resolve display name and path for this target.
+        let node_name = Self::find_node(&self.tree.root, &target)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| target.qualified_path.clone());
+        let fs_path = resolve_fs_path(&target, &self.tree.repo_root);
+        let rel_path = fs_path
+            .strip_prefix(&self.tree.repo_root)
+            .unwrap_or(&fs_path)
+            .to_string_lossy()
+            .into_owned();
+        let copy_path_str = rel_path.clone();
+        let copy_name_str = node_name.clone();
+        let open_path = fs_path.clone();
+
+        let menu_div = div()
+            .absolute()
+            .top(px(y))
+            .left(px(x))
+            .w(px(210.0))
+            .bg(rgb(theme::CODE_BG))
+            .border_1()
+            .border_color(rgb(theme::FOCUS_BORDER))
+            .rounded(px(4.0))
+            .overflow_hidden()
+            .shadow_lg()
+            // "Open in File Manager" row
+            .child(
+                div()
+                    .id(ElementId::Name("ctx-open-fm".into()))
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(0x2a3040_u32)))
+                    .child("Open in File Manager")
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        open_in_file_manager(&open_path);
+                        this.context_menu = None;
+                        cx.notify();
+                    })),
+            )
+            // "Copy Path" row
+            .child(
+                div()
+                    .id(ElementId::Name("ctx-copy-path".into()))
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(0x2a3040_u32)))
+                    .child("Copy Path")
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_path_str.clone()));
+                        this.context_menu = None;
+                        cx.notify();
+                    })),
+            )
+            // "Copy Name" row
+            .child(
+                div()
+                    .id(ElementId::Name("ctx-copy-name".into()))
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(0x2a3040_u32)))
+                    .child("Copy Name")
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_name_str.clone()));
+                        this.context_menu = None;
+                        cx.notify();
+                    })),
+            );
+
+        Some(menu_div)
     }
 
     /// Build the settings overlay div (absolutely positioned, centered).
@@ -1335,6 +1438,9 @@ impl Render for TreemapView {
         // Build the welcome overlay (needs cx for click listeners).
         let welcome_overlay = self.show_welcome.then(|| self.render_welcome(vw, cx));
 
+        // Build the context menu overlay (needs cx for click listeners).
+        let context_menu_overlay = self.render_context_menu(cx);
+
         let title = self.window_title();
         let map = div()
             .flex_grow(1.)
@@ -1345,9 +1451,35 @@ impl Render for TreemapView {
             .track_focus(&self.focus_handle)
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseDownEvent, _w, _cx| {
+                cx.listener(|this, e: &gpui::MouseDownEvent, _w, cx| {
+                    // Dismiss context menu on any left-click.
+                    if this.context_menu.is_some() {
+                        this.context_menu = None;
+                        cx.notify();
+                    }
                     this.drag_last = Some(e.position);
                     this.press_origin = Some(e.position);
+                }),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, e: &gpui::MouseDownEvent, w, cx| {
+                    let Some(cam) = this.camera else { return };
+                    let (vw, vh) = Self::map_viewport(w);
+                    let items = world::visible_nodes(&this.tree, &this.layout, &cam, vw, vh);
+                    let (mx, my) = (
+                        f64::from(e.position.x),
+                        f64::from(e.position.y) - chrome::TITLEBAR_H,
+                    );
+                    if let Some(hit) = world::hit_test(&items, mx, my) {
+                        this.context_menu = Some(ContextMenu {
+                            position: e.position,
+                            target: hit.node.id.clone(),
+                        });
+                    } else {
+                        this.context_menu = None;
+                    }
+                    cx.notify();
                 }),
             )
             .on_mouse_up(
@@ -1432,6 +1564,12 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
+                // Esc closes context menu if open, consuming the key.
+                if this.context_menu.is_some() && e.keystroke.key.as_str() == "escape" {
+                    this.context_menu = None;
+                    cx.notify();
+                    return;
+                }
                 // While the welcome screen is open, block all keys except Esc.
                 if this.show_welcome {
                     if e.keystroke.key.as_str() == "escape" {
@@ -1446,12 +1584,14 @@ impl Render for TreemapView {
                         "p" => {
                             this.palette.open(palette::PaletteMode::File, &this.tree);
                             this.settings_open = false;
+                            this.context_menu = None;
                             cx.notify();
                             return;
                         }
                         "t" => {
                             this.palette.open(palette::PaletteMode::Symbol, &this.tree);
                             this.settings_open = false;
+                            this.context_menu = None;
                             cx.notify();
                             return;
                         }
@@ -1460,6 +1600,7 @@ impl Render for TreemapView {
                             if this.settings_open {
                                 this.palette.close();
                                 this.show_welcome = false;
+                                this.context_menu = None;
                             }
                             cx.notify();
                             return;
@@ -1881,7 +2022,8 @@ impl Render for TreemapView {
             )
             .children(palette_overlay)
             .children(settings_overlay)
-            .children(welcome_overlay);
+            .children(welcome_overlay)
+            .children(context_menu_overlay);
 
         div()
             .relative()
