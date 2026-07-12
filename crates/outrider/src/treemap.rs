@@ -17,6 +17,7 @@ use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
+use crate::palette;
 use crate::chrome;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
@@ -128,6 +129,12 @@ pub struct TreemapView {
     neighbors: Option<(SymbolId, [Option<SymbolId>; 4])>,
     /// Leaf node currently under the mouse cursor (for doc tooltip).
     hover_id: Option<SymbolId>,
+    /// Ordered list of focused SymbolIds visited via Enter/Esc/click (not arrow keys).
+    nav_history: Vec<SymbolId>,
+    /// Index into `nav_history` of the currently displayed location.
+    nav_cursor: usize,
+    /// Search palette (Ctrl+P = file mode, Ctrl+T = symbol mode).
+    palette: palette::Palette,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -414,6 +421,55 @@ fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     }
 }
 
+const NAV_HISTORY_CAP: usize = 64;
+
+fn nav_push_to(hist: &mut Vec<SymbolId>, cursor: &mut usize, id: SymbolId) {
+    hist.truncate(*cursor + 1);
+    hist.push(id);
+    *cursor = hist.len() - 1;
+    if hist.len() > NAV_HISTORY_CAP {
+        let excess = hist.len() - NAV_HISTORY_CAP;
+        hist.drain(..excess);
+        *cursor -= excess;
+    }
+}
+
+fn nav_back_cursor(_hist: &[SymbolId], cursor: usize) -> Option<usize> {
+    if cursor == 0 { None } else { Some(cursor - 1) }
+}
+
+fn nav_forward_cursor(hist: &[SymbolId], cursor: usize) -> Option<usize> {
+    if cursor + 1 >= hist.len() { None } else { Some(cursor + 1) }
+}
+
+fn resolve_fs_path(id: &SymbolId, repo_root: &std::path::Path) -> std::path::PathBuf {
+    let rel = match id.kind {
+        SymbolKind::Folder => id.qualified_path.as_str(),
+        _ => crate::buffers::BufferManager::file_path_of(&id.qualified_path),
+    };
+    repo_root.join(rel)
+}
+
+fn open_in_file_manager(path: &std::path::Path) {
+    use std::process::Command;
+
+    if cfg!(target_os = "windows") {
+        let arg = if path.is_dir() {
+            format!("{}", path.display())
+        } else {
+            format!("/select,\"{}\"", path.display())
+        };
+        let _ = Command::new("explorer.exe").arg(&arg).spawn();
+    } else {
+        let dir = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        let _ = Command::new("xdg-open").arg(&dir).spawn();
+    }
+}
+
 /// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
     /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
@@ -429,7 +485,7 @@ impl TreemapView {
             home_zoom: 1.0,
             drag_last: None,
             press_origin: None,
-            focus: Focus::new(root_id),
+            focus: Focus::new(root_id.clone()),
             tween: None,
             focus_handle: cx.focus_handle(),
             buffers,
@@ -438,6 +494,9 @@ impl TreemapView {
             bake_pending: false,
             neighbors: None,
             hover_id: None,
+            nav_history: vec![root_id],
+            nav_cursor: 0,
+            palette: palette::Palette::new(),
         }
     }
 
@@ -757,6 +816,55 @@ impl TreemapView {
         };
         (out, doc_panel)
     }
+
+    /// Build the palette overlay div (absolutely positioned, centered horizontally).
+    /// `map_w` is the map viewport width in logical pixels, used for centering.
+    fn render_palette(&self, map_w: f64) -> gpui::Div {
+        const PALETTE_W: f32 = 500.0;
+        let left_offset = ((map_w as f32 - PALETTE_W) / 2.0).max(0.0);
+        let mode_label = match self.palette.mode {
+            palette::PaletteMode::File => "File",
+            palette::PaletteMode::Symbol => "Symbol",
+        };
+        div()
+            .absolute()
+            .top(px(60.0))
+            .left(px(left_offset))
+            .w(px(PALETTE_W))
+            .bg(rgb(theme::CODE_BG))
+            .border_1()
+            .border_color(rgb(theme::FOCUS_BORDER))
+            .rounded(px(4.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(14.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .child(format!("[{mode_label}] {}│", self.palette.query)),
+            )
+            .children(
+                self.palette.results.iter().enumerate().map(|(i, id)| {
+                    let name = self.palette.name_of(id);
+                    let path = &id.qualified_path;
+                    let selected = i == self.palette.selection;
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_size(px(13.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(if selected {
+                            rgb(theme::TEXT_PRIMARY)
+                        } else {
+                            rgb(theme::TEXT_SECONDARY)
+                        })
+                        .when(selected, |d| d.bg(rgb(0x2a2d32_u32)))
+                        .child(format!("{name}  {path}"))
+                }),
+            )
+    }
 }
 
 /// GPUI render entry point: wires input handlers onto the map canvas and
@@ -779,6 +887,9 @@ impl Render for TreemapView {
 
         let max_zoom = camera::MAX_ZOOM;
         let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+
+        // Build the palette overlay before the map div (while &self is free).
+        let palette_overlay = self.palette.is_open().then(|| self.render_palette(vw));
 
         let title = self.window_title();
         let map = div()
@@ -818,7 +929,9 @@ impl Render for TreemapView {
                     if let Some(id) = hit {
                         let index = TreeIndex::new(&this.tree);
                         // click sets focus; camera does NOT move (spec §2)
-                        this.focus.set(id, &index);
+                        if this.focus.set(id, &index) {
+                            nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
+                        }
                         cx.notify();
                     }
                 }),
@@ -875,6 +988,85 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
+                // Ctrl+P / Ctrl+T open the palette regardless of camera state.
+                if e.keystroke.modifiers.control && !e.keystroke.modifiers.shift {
+                    match e.keystroke.key.as_str() {
+                        "p" => {
+                            this.palette.open(palette::PaletteMode::File, &this.tree);
+                            cx.notify();
+                            return;
+                        }
+                        "t" => {
+                            this.palette.open(palette::PaletteMode::Symbol, &this.tree);
+                            cx.notify();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // Ctrl+Shift+E: open focused file in system file manager.
+                if e.keystroke.modifiers.control && e.keystroke.modifiers.shift {
+                    if e.keystroke.key.as_str() == "e" {
+                        let path = resolve_fs_path(&this.focus.current, &this.tree.repo_root);
+                        open_in_file_manager(&path);
+                        return;
+                    }
+                }
+                // While the palette is open, all keys route to it.
+                if this.palette.is_open() {
+                    match e.keystroke.key.as_str() {
+                        "escape" => {
+                            this.palette.close();
+                            cx.notify();
+                        }
+                        "enter" => {
+                            if let Some(id) = this.palette.confirm() {
+                                this.palette.close();
+                                let index = TreeIndex::new(&this.tree);
+                                if this.focus.set(id, &index) {
+                                    nav_push_to(
+                                        &mut this.nav_history,
+                                        &mut this.nav_cursor,
+                                        this.focus.current.clone(),
+                                    );
+                                }
+                                let (vw, vh) = Self::map_viewport(w);
+                                let max_zoom = camera::MAX_ZOOM;
+                                let min_zoom = (this.home_zoom * 0.5).min(camera::MAX_ZOOM);
+                                if let Some(to) =
+                                    this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                                {
+                                    this.start_tween(to);
+                                }
+                            }
+                            cx.notify();
+                        }
+                        "up" => {
+                            this.palette.move_selection(-1);
+                            cx.notify();
+                        }
+                        "down" => {
+                            this.palette.move_selection(1);
+                            cx.notify();
+                        }
+                        "backspace" => {
+                            this.palette.backspace(&this.tree);
+                            cx.notify();
+                        }
+                        _ => {
+                            // Single printable character → type into palette.
+                            if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
+                                let mut chars = s.chars();
+                                let c = chars.next()?;
+                                if chars.next().is_none() { Some(c) } else { None }
+                            }) {
+                                this.palette.type_char(ch, &this.tree);
+                                cx.notify();
+                            }
+                        }
+                    }
+                    return;
+                }
                 if this.camera.is_none() {
                     return;
                 }
@@ -887,12 +1079,14 @@ impl Render for TreemapView {
                         if !this.focus.step_in(&index) {
                             return;
                         }
+                        nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
                         this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
                     "escape" => {
                         if !this.focus.step_out(&index) {
                             return;
                         }
+                        nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
                         this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
                     "end" => this.layout.rects.get(&this.focus.current).copied().map(|r| {
@@ -906,6 +1100,28 @@ impl Render for TreemapView {
                         let c = Camera::fit(this.root_rect(), vw, vh);
                         this.home_zoom = c.zoom;
                         Some(c)
+                    }
+                    "left" if e.keystroke.modifiers.alt => {
+                        let Some(c) = nav_back_cursor(&this.nav_history, this.nav_cursor) else {
+                            return;
+                        };
+                        this.nav_cursor = c;
+                        let id = this.nav_history[c].clone();
+                        this.focus.current = id;
+                        this.focus.record_visit(&index);
+                        this.neighbors = None;
+                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                    }
+                    "right" if e.keystroke.modifiers.alt => {
+                        let Some(c) = nav_forward_cursor(&this.nav_history, this.nav_cursor) else {
+                            return;
+                        };
+                        this.nav_cursor = c;
+                        let id = this.nav_history[c].clone();
+                        this.focus.current = id;
+                        this.focus.record_visit(&index);
+                        this.neighbors = None;
+                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
                     "up" | "down" | "left" | "right" => {
                         let dir = match e.keystroke.key.as_str() {
@@ -1191,7 +1407,8 @@ impl Render for TreemapView {
                     },
                 )
                 .size_full(),
-            );
+            )
+            .children(palette_overlay);
 
         div()
             .relative()
@@ -1521,4 +1738,164 @@ mod tests {
         assert!(wrap_doc("anything", 13.0, 12.0).is_empty());
     }
 
+    #[test]
+    fn nav_history_push_and_back() {
+        use super::{nav_back_cursor, nav_push_to};
+        let ids: Vec<SymbolId> = (0..4)
+            .map(|i| SymbolId {
+                kind: SymbolKind::File,
+                qualified_path: format!("f{i}.rs"),
+                ordinal: 0,
+            })
+            .collect();
+        let mut hist = vec![ids[0].clone()];
+        let mut cursor: usize = 0;
+
+        // push 3 more
+        for id in &ids[1..] {
+            nav_push_to(&mut hist, &mut cursor, id.clone());
+        }
+        assert_eq!(hist.len(), 4);
+        assert_eq!(cursor, 3);
+
+        // back twice
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(hist[cursor], ids[2]);
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 1);
+
+        // back at beginning is None
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 0);
+        assert!(nav_back_cursor(&hist, cursor).is_none());
+    }
+
+    #[test]
+    fn nav_history_forward_after_back() {
+        use super::{nav_back_cursor, nav_forward_cursor, nav_push_to};
+        let ids: Vec<SymbolId> = (0..3)
+            .map(|i| SymbolId {
+                kind: SymbolKind::File,
+                qualified_path: format!("f{i}.rs"),
+                ordinal: 0,
+            })
+            .collect();
+        let mut hist = vec![ids[0].clone()];
+        let mut cursor: usize = 0;
+        for id in &ids[1..] {
+            nav_push_to(&mut hist, &mut cursor, id.clone());
+        }
+        // back to f1
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(hist[cursor], ids[1]);
+        // forward to f2
+        cursor = nav_forward_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(hist[cursor], ids[2]);
+        // forward at end is None
+        assert!(nav_forward_cursor(&hist, cursor).is_none());
+    }
+
+    #[test]
+    fn nav_history_push_truncates_forward() {
+        use super::{nav_back_cursor, nav_push_to};
+        let ids: Vec<SymbolId> = (0..4)
+            .map(|i| SymbolId {
+                kind: SymbolKind::File,
+                qualified_path: format!("f{i}.rs"),
+                ordinal: 0,
+            })
+            .collect();
+        let mut hist = vec![ids[0].clone()];
+        let mut cursor: usize = 0;
+        for id in &ids[1..3] {
+            nav_push_to(&mut hist, &mut cursor, id.clone());
+        }
+        // back to f0
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        // push f3 — truncates f1, f2
+        nav_push_to(&mut hist, &mut cursor, ids[3].clone());
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0], ids[0]);
+        assert_eq!(hist[1], ids[3]);
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn nav_history_caps_at_64() {
+        use super::nav_push_to;
+        let mut hist = vec![SymbolId {
+            kind: SymbolKind::File,
+            qualified_path: "f0.rs".into(),
+            ordinal: 0,
+        }];
+        let mut cursor: usize = 0;
+        for i in 1..=70 {
+            nav_push_to(
+                &mut hist,
+                &mut cursor,
+                SymbolId {
+                    kind: SymbolKind::File,
+                    qualified_path: format!("f{i}.rs"),
+                    ordinal: 0,
+                },
+            );
+        }
+        assert_eq!(hist.len(), 64);
+        // cursor points to the most recent entry
+        assert_eq!(cursor, 63);
+        // oldest was dropped — first entry is no longer f0
+        assert_ne!(hist[0].qualified_path, "f0.rs");
+    }
+
+
+    #[test]
+    fn resolve_fs_path_file_node() {
+        let root = std::path::Path::new("/home/user/project");
+        let id = SymbolId {
+            kind: SymbolKind::File,
+            qualified_path: "src/main.rs".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/home/user/project/src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_fs_path_item_node() {
+        let root = std::path::Path::new("/home/user/project");
+        let id = SymbolId {
+            kind: SymbolKind::Item { label: "fn".into() },
+            qualified_path: "src/lib.rs::Point::norm".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/home/user/project/src/lib.rs"));
+    }
+
+    #[test]
+    fn resolve_fs_path_chunk_node() {
+        let root = std::path::Path::new("/repo");
+        let id = SymbolId {
+            kind: SymbolKind::Chunk,
+            qualified_path: "BIG.md#2".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/repo/BIG.md"));
+    }
+
+    #[test]
+    fn resolve_fs_path_folder_node() {
+        let root = std::path::Path::new("/repo");
+        let id = SymbolId {
+            kind: SymbolKind::Folder,
+            qualified_path: "src/utils".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/repo/src/utils"));
+    }
 }
