@@ -4,7 +4,7 @@
 //! (quads, text runs, and baked texture quads) via a static canvas closure.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, Bounds,
@@ -152,6 +152,15 @@ pub struct TreemapView {
     settings_open: bool,
     /// Right-click context menu, if currently open.
     context_menu: Option<ContextMenu>,
+    /// Background indexing in progress (Open Folder or re-index).
+    loading: Option<LoadingState>,
+}
+
+/// Tracks a background indexing thread and its progress.
+struct LoadingState {
+    folder_name: String,
+    progress: Arc<outrider_index::IndexProgress>,
+    result: Arc<Mutex<Option<Result<outrider_index::SymbolTree, String>>>>,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -531,6 +540,7 @@ impl TreemapView {
             show_welcome,
             settings_open: false,
             context_menu: None,
+            loading: None,
         }
     }
 
@@ -717,6 +727,18 @@ impl TreemapView {
                         header_stack
                             .push((item.level, pin_y + header_bg_h as f64));
                     }
+                    if rung == Rung::Card && !item.node.children.is_empty() {
+                        let area = item.px.w * item.px.h;
+                        if let Some(t) = self.textures.get(&item.node.id, area) {
+                            tex = t.level_for(item.px.h as f32).map(|img| TexQuad {
+                                x: item.px.x as f32,
+                                y: item.px.y as f32,
+                                w: item.px.w as f32,
+                                h: item.px.h as f32,
+                                image: img.clone(),
+                            });
+                        }
+                    }
                 }
                 Draw::Leaf(tier) => {
                     let scale = item.full_h / content::natural_px(item.node);
@@ -829,8 +851,14 @@ impl TreemapView {
             let index = TreeIndex::new(&self.tree);
             let buffers = &mut self.buffers;
             let file_symbols = &self.file_symbols;
-            self.textures.bake_queued(|id| {
+            let layout = &self.layout;
+            self.textures.bake_queued(|id, rasterizer| {
                 let node = index.node(id)?;
+                if !content::is_leaf_item(node) {
+                    let rect = layout.rects.get(id)?;
+                    let level = index.depth(id).unwrap_or(0) as u8;
+                    return Some(rasterize::bake_folder(node, *rect, layout, level));
+                }
                 let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
                 let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
                 let m = buffers.get(&rel, syms)?;
@@ -843,7 +871,7 @@ impl TreemapView {
                     let runs = runs_from_spans(text.len(), spans);
                     lines.push((text, runs));
                 }
-                (!lines.is_empty()).then_some(lines)
+                if lines.is_empty() { None } else { Some(rasterizer.bake(&lines)) }
             })
         } else {
             false
@@ -1009,10 +1037,46 @@ impl TreemapView {
             .children(preview_div)
     }
 
-    /// Re-run indexing and rebuild the full layout after settings change.
+    /// Re-run indexing in the background after settings change.
     fn reindex(&mut self) {
         let repo = self.tree.repo_root.clone();
-        match outrider_index::index_repo(&repo, &self.settings.filter_extensions, &self.settings.filter_folders) {
+        self.start_loading(repo);
+    }
+
+    /// Spawn a background thread to index `folder`, showing a progress overlay.
+    fn start_loading(&mut self, folder: std::path::PathBuf) {
+        let folder_name = folder
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| folder.to_string_lossy().into_owned());
+        let progress = Arc::new(outrider_index::IndexProgress::new());
+        let result: Arc<Mutex<Option<Result<outrider_index::SymbolTree, String>>>> =
+            Arc::new(Mutex::new(None));
+
+        let p = Arc::clone(&progress);
+        let r = Arc::clone(&result);
+        let exts = self.settings.filter_extensions.clone();
+        let dirs = self.settings.filter_folders.clone();
+        std::thread::spawn(move || {
+            let res = outrider_index::index_repo_with_progress(&folder, &exts, &dirs, &p);
+            *r.lock().unwrap() = Some(res.map_err(|e| format!("{e:#}")));
+        });
+
+        self.palette.close();
+        self.show_welcome = false;
+        self.settings_open = false;
+        self.context_menu = None;
+        self.loading = Some(LoadingState { folder_name, progress, result });
+    }
+
+    /// Check if background indexing completed; if so, apply the result.
+    fn poll_loading(&mut self) -> bool {
+        let Some(state) = &self.loading else { return false };
+        let mut guard = state.result.lock().unwrap();
+        let Some(result) = guard.take() else { return false };
+        drop(guard);
+        let loading = self.loading.take().unwrap();
+        match result {
             Ok(tree) => {
                 let layout = outrider_layout::pack(&tree, &world::pack_config());
                 self.file_symbols = collect_file_symbols(&tree);
@@ -1030,8 +1094,85 @@ impl TreemapView {
                 self.tree = tree;
                 self.layout = layout;
             }
-            Err(e) => eprintln!("reindex failed: {e:#}"),
+            Err(e) => eprintln!("open folder failed: {e}"),
         }
+        drop(loading);
+        true
+    }
+
+    /// Render the loading progress overlay.
+    fn render_loading(&self, vw: f64) -> gpui::Div {
+        let state = self.loading.as_ref().unwrap();
+        let phase = state.progress.phase.load(std::sync::atomic::Ordering::Relaxed);
+        let total = state.progress.files_total.load(std::sync::atomic::Ordering::Relaxed);
+        let parsed = state.progress.files_parsed.load(std::sync::atomic::Ordering::Relaxed);
+
+        let (status_text, fraction) = match phase {
+            0 => ("Scanning files…".to_string(), 0.0_f32),
+            1 => {
+                if total > 0 {
+                    let frac = parsed as f32 / total as f32;
+                    (format!("Parsing {parsed}/{total} files…"), frac)
+                } else {
+                    ("Parsing…".to_string(), 0.0)
+                }
+            }
+            2 => ("Building symbol tree…".to_string(), 1.0),
+            _ => ("Done".to_string(), 1.0),
+        };
+
+        let bar_w = 300.0_f32.min(vw as f32 - 80.0);
+        let fill_w = bar_w * fraction;
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000088))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(16.0))
+                    .px(px(40.0))
+                    .py(px(32.0))
+                    .bg(rgb(theme::CODE_BG))
+                    .border_1()
+                    .border_color(rgb(theme::border_for(theme::CODE_BG)))
+                    .rounded(px(8.0))
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .child(format!("Indexing {}…", state.folder_name)),
+                    )
+                    .child(
+                        div()
+                            .w(px(bar_w))
+                            .h(px(6.0))
+                            .rounded(px(3.0))
+                            .bg(rgb(0x333340))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(px(fill_w))
+                                    .rounded(px(3.0))
+                                    .bg(rgb(theme::FOCUS_BORDER)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child(status_text),
+                    ),
+            )
     }
 
     /// Open the settings.json file in the system editor.
@@ -1420,13 +1561,19 @@ impl Render for TreemapView {
             self.focus_handle.focus(window, cx);
         }
 
+        if self.poll_loading() {
+            cx.notify();
+        }
+
         let (vw, vh) = Self::map_viewport(window);
+        let is_loading = self.loading.is_some();
+
         let (items, doc_panel) = self.paint_items(vw, vh);
 
         for img in self.textures.take_retired() {
             let _ = window.drop_image(img);
         }
-        if self.tween.is_some() || self.bake_pending {
+        if self.tween.is_some() || self.bake_pending || is_loading {
             window.request_animation_frame();
         }
 
@@ -1444,6 +1591,9 @@ impl Render for TreemapView {
 
         // Build the context menu overlay (needs cx for click listeners).
         let context_menu_overlay = self.render_context_menu(cx);
+
+        // Build the loading overlay if indexing in background.
+        let loading_overlay = is_loading.then(|| self.render_loading(vw));
 
         let title = self.window_title();
         let file_menu = div()
@@ -1471,31 +1621,7 @@ impl Render for TreemapView {
                             .pick_folder()
                         {
                             this.settings = crate::settings::Settings::load();
-                            match outrider_index::index_repo(
-                                &folder,
-                                &this.settings.filter_extensions,
-                                &this.settings.filter_folders,
-                            ) {
-                                Ok(tree) => {
-                                    let layout =
-                                        outrider_layout::pack(&tree, &world::pack_config());
-                                    this.file_symbols = collect_file_symbols(&tree);
-                                    this.buffers = BufferManager::new(tree.repo_root.clone());
-                                    this.textures =
-                                        TextureCache::new(rasterize::MAX_BYTES);
-                                    let root_id = tree.root.id.clone();
-                                    this.focus = Focus::new(root_id.clone());
-                                    this.nav_history = vec![root_id];
-                                    this.nav_cursor = 0;
-                                    this.neighbors = None;
-                                    this.hover_id = None;
-                                    this.camera = None;
-                                    this.palette = palette::Palette::new();
-                                    this.tree = tree;
-                                    this.layout = layout;
-                                }
-                                Err(e) => eprintln!("open folder failed: {e:#}"),
-                            }
+                            this.start_loading(folder);
                         }
                         cx.notify();
                     })),
@@ -2105,7 +2231,8 @@ impl Render for TreemapView {
             .children(palette_overlay)
             .children(settings_overlay)
             .children(welcome_overlay)
-            .children(context_menu_overlay);
+            .children(context_menu_overlay)
+            .children(loading_overlay);
 
         div()
             .relative()

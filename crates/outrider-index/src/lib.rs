@@ -12,5 +12,5 @@ pub mod parse;
 pub mod scan;
 pub mod types;
 
-pub use index::index_repo;
+pub use index::{index_repo, index_repo_with_progress, IndexProgress};
 pub use types::{dedupe_ids, finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};

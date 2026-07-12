@@ -206,8 +206,14 @@ fn walk<'a>(
         left: sx,
         full_h: ph,
     });
-    for child in &node.children {
-        walk(child, pack, camera, vw, vh, level.saturating_add(1), out);
+    // Containers at Dot/Label/Card are too small for meaningful child
+    // rendering — skip recursion. Card-rung containers get a pre-baked
+    // thumbnail texture in the paint path instead.
+    let prune = matches!(draw, Draw::Container(Rung::Dot | Rung::Label | Rung::Card));
+    if !prune {
+        for child in &node.children {
+            walk(child, pack, camera, vw, vh, level.saturating_add(1), out);
+        }
     }
 }
 
@@ -372,18 +378,15 @@ mod tests {
     }
 
     #[test]
-    fn packed_walk_merges_tiny_nodes() {
+    fn packed_walk_prunes_dot_containers() {
         let (tree, p) = packed_example();
-        // zoomed far out: g is 58·0.03 = 1.74px < MERGE_PX and vanishes;
-        // everything else survives as Dot (all widths < LABEL_MIN_W)
+        // Zoomed far out: root at Dot rung (width < LABEL_MIN_W) does
+        // not recurse into children — only the root itself appears.
         let cam = Camera { center_x: 500.0, center_y: 819.6, zoom: 0.03 };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        assert_eq!(names, vec!["", "a.rs", "b.rs", "f"]);
-        assert!(items.iter().all(|i| matches!(
-            i.draw,
-            Draw::Container(Rung::Dot) | Draw::Leaf(LeafDraw::Dot)
-        )));
+        assert_eq!(names, vec![""]);
+        assert!(matches!(items[0].draw, Draw::Container(Rung::Dot)));
     }
 
     #[test]

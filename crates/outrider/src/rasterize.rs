@@ -228,9 +228,145 @@ fn ct_color(c: u32) -> Color {
     Color::rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
+use outrider_index::{SymbolId, SymbolKind, SymbolNode};
+use outrider_layout::{PackLayout, Rect};
+
 use std::collections::HashMap;
 
-use outrider_index::SymbolId;
+/// Maximum pixel dimension (longer side) for a folder thumbnail texture.
+const FOLDER_TEX_MAX: f64 = 256.0;
+
+/// Rasterize a container's subtree as colored rectangles into a mipped texture.
+/// No text — just the box layout with theme-correct fills and borders.
+pub fn bake_folder(
+    node: &SymbolNode,
+    container_rect: Rect,
+    layout: &PackLayout,
+    base_level: u8,
+) -> LeafTexture {
+    if node.children.is_empty() || container_rect.w < 1.0 || container_rect.h < 1.0 {
+        return LeafTexture { levels: Vec::new(), bytes: 0 };
+    }
+    let aspect = container_rect.w / container_rect.h;
+    let (tw, th) = if aspect >= 1.0 {
+        (FOLDER_TEX_MAX as u32, (FOLDER_TEX_MAX / aspect).ceil().max(1.0) as u32)
+    } else {
+        ((FOLDER_TEX_MAX * aspect).ceil().max(1.0) as u32, FOLDER_TEX_MAX as u32)
+    };
+    let sx = tw as f64 / container_rect.w;
+    let sy = th as f64 / container_rect.h;
+
+    let mut rgba = vec![0u8; (tw as usize) * (th as usize) * 4];
+    folder_fill(node, &container_rect, layout, sx, sy, tw, th, &mut rgba, base_level + 1);
+
+    for p in rgba.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
+
+    let mut levels = Vec::new();
+    let mut bytes = 0usize;
+    let (mut cw, mut ch, mut cur) = (tw, th, rgba);
+    loop {
+        bytes += cur.len();
+        let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(cw, ch, cur.clone())
+            .expect("buffer sized to cw*ch*4");
+        levels.push(Arc::new(RenderImage::new(vec![Frame::new(img)])));
+        if ch as i32 <= MIN_LEVEL_H || cw <= 1 {
+            break;
+        }
+        (cw, ch, cur) = downsample(&cur, cw, ch);
+    }
+    LeafTexture { levels, bytes }
+}
+
+/// Recursively fill descendant rectangles into the RGBA buffer.
+fn folder_fill(
+    node: &SymbolNode,
+    root: &Rect,
+    layout: &PackLayout,
+    sx: f64,
+    sy: f64,
+    tw: u32,
+    th: u32,
+    rgba: &mut [u8],
+    level: u8,
+) {
+    for child in &node.children {
+        let Some(r) = layout.rects.get(&child.id) else { continue };
+        let px = ((r.x - root.x) * sx) as i32;
+        let py = ((r.y - root.y) * sy) as i32;
+        let pw = (r.w * sx).max(1.0).ceil() as i32;
+        let ph = (r.h * sy).max(1.0).ceil() as i32;
+
+        let is_leaf = child.byte_range.is_some()
+            && child.children.is_empty()
+            && child.id.kind != SymbolKind::Folder;
+        let kind = if is_leaf {
+            theme::BoxKind::Leaf
+        } else if child.id.kind == SymbolKind::Folder {
+            theme::BoxKind::Folder
+        } else {
+            theme::BoxKind::File
+        };
+        let tint = match &child.id.kind {
+            SymbolKind::Folder => match child.name.as_str() {
+                "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
+                "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
+                _ => theme::BoxTint::Normal,
+            },
+            SymbolKind::Item { label } => match label.as_str() {
+                "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef" => {
+                    theme::BoxTint::TypeDef
+                }
+                _ => theme::BoxTint::Normal,
+            },
+            _ => theme::BoxTint::Normal,
+        };
+        let fill = theme::box_fill(kind, level, tint);
+        let border = theme::border_for(fill);
+        let (fr, fg, fb) = rgb_u8(fill);
+        let (br, bg, bb) = rgb_u8(border);
+
+        for y in py.max(0)..(py + ph).min(th as i32) {
+            for x in px.max(0)..(px + pw).min(tw as i32) {
+                let i = (y as u32 * tw + x as u32) as usize * 4;
+                let on_border = x == px || x == px + pw - 1 || y == py || y == py + ph - 1;
+                if on_border {
+                    rgba[i] = br;
+                    rgba[i + 1] = bg;
+                    rgba[i + 2] = bb;
+                } else {
+                    rgba[i] = fr;
+                    rgba[i + 1] = fg;
+                    rgba[i + 2] = fb;
+                }
+                rgba[i + 3] = 255;
+            }
+        }
+
+        if child.churn > 0.0 {
+            let heat = theme::churn_heat(child.churn);
+            let (hr, hg, hb) = rgb_u8(heat);
+            let sw = ((theme::STRIPE_W as f64 * sx / 4.0).ceil() as i32).max(1);
+            for y in (py + 1).max(0)..(py + ph - 1).min(th as i32) {
+                for x in (px + 1).max(0)..(px + 1 + sw).min((px + pw - 1).min(tw as i32)) {
+                    let i = (y as u32 * tw + x as u32) as usize * 4;
+                    rgba[i] = hr;
+                    rgba[i + 1] = hg;
+                    rgba[i + 2] = hb;
+                }
+            }
+        }
+
+        if !child.children.is_empty() {
+            folder_fill(child, root, layout, sx, sy, tw, th, rgba, level.saturating_add(1));
+        }
+    }
+}
+
+fn rgb_u8(c: u32) -> (u8, u8, u8) {
+    ((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
 
 /// Bakes per frame; keeps zoom-out pop-in bounded without stalling a frame.
 pub const BAKES_PER_FRAME: usize = 4;
@@ -289,23 +425,21 @@ impl TextureCache {
         !self.queue.is_empty()
     }
 
-    /// Bake up to BAKES_PER_FRAME queued leaves, largest on screen first,
-    /// then evict LRU entries past the byte budget. Returns whether misses
-    /// remain (the caller schedules a repaint so they bake next frame).
+    /// Bake up to BAKES_PER_FRAME queued items, largest on screen first,
+    /// then evict LRU entries past the byte budget. The callback receives
+    /// the `SymbolId` and a `&mut Rasterizer` and returns a ready-to-cache
+    /// `LeafTexture` (or `None` for negative caching). Returns whether
+    /// misses remain (the caller schedules a repaint so they bake next frame).
     pub fn bake_queued(
         &mut self,
-        mut lines_for: impl FnMut(&SymbolId) -> Option<Vec<Line>>,
+        mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<LeafTexture>,
     ) -> bool {
         self.queue.sort_by(|a, b| b.1.total_cmp(&a.1));
         let queue = std::mem::take(&mut self.queue);
         let mut it = queue.into_iter();
         for (id, _) in it.by_ref().take(BAKES_PER_FRAME) {
-            // None → empty texture: negative-cached so a leaf without a
-            // buffer doesn't re-queue (and repaint) forever.
-            let tex = match lines_for(&id) {
-                Some(lines) => self.raster.bake(&lines),
-                None => LeafTexture { levels: Vec::new(), bytes: 0 },
-            };
+            let tex = bake_fn(&id, &mut self.raster)
+                .unwrap_or_else(|| LeafTexture { levels: Vec::new(), bytes: 0 });
             self.bytes += tex.bytes;
             self.clock += 1;
             self.entries.insert(id, Entry { tex, last_used: self.clock });
@@ -439,28 +573,26 @@ mod tests {
         }
     }
 
-    fn some_lines(n: usize) -> Option<Vec<Line>> {
-        Some((0..n).map(|_| plain("let x = 1;")).collect())
+    fn some_tex(n: usize, raster: &mut Rasterizer) -> Option<LeafTexture> {
+        let lines: Vec<Line> = (0..n).map(|_| plain("let x = 1;")).collect();
+        Some(raster.bake(&lines))
     }
 
     #[test]
     fn cache_bakes_largest_first_within_budget() {
         let mut cache = TextureCache::new(MAX_BYTES);
         for i in 0..6 {
-            // areas 10, 20, .. 60 — misses enqueue
             assert!(cache.get(&sid(&format!("l{i}")), (i + 1) as f64 * 10.0).is_none());
         }
         assert!(cache.has_queued());
-        let remaining = cache.bake_queued(|_| some_lines(4));
+        let remaining = cache.bake_queued(|_, r| some_tex(4, r));
         assert!(remaining, "6 queued, budget 4 — misses remain");
-        // The 4 largest (l2..l5) are now hits; the 2 smallest are not.
         for i in 2..6 {
             assert!(cache.get(&sid(&format!("l{i}")), 1.0).is_some());
         }
         assert!(cache.get(&sid("l0"), 1.0).is_none());
         assert!(cache.get(&sid("l1"), 1.0).is_none());
-        // Next frame the rest bake and nothing remains.
-        assert!(!cache.bake_queued(|_| some_lines(4)));
+        assert!(!cache.bake_queued(|_, r| some_tex(4, r)));
         assert!(cache.get(&sid("l0"), 1.0).is_some());
     }
 
@@ -468,8 +600,7 @@ mod tests {
     fn cache_negative_caches_leaves_without_lines() {
         let mut cache = TextureCache::new(MAX_BYTES);
         assert!(cache.get(&sid("nofile"), 1.0).is_none());
-        assert!(!cache.bake_queued(|_| None));
-        // Cached as empty: a hit (no re-queue), but paints nothing.
+        assert!(!cache.bake_queued(|_, _| None));
         let tex = cache.get(&sid("nofile"), 1.0).expect("negative-cached");
         assert!(tex.levels.is_empty());
         assert!(!cache.has_queued());
@@ -477,15 +608,13 @@ mod tests {
 
     #[test]
     fn cache_evicts_lru_and_retires_images() {
-        // Identical lines → identical bytes per texture, so a budget of
-        // exactly one texture forces exactly one eviction.
         let mut cache = TextureCache::new(usize::MAX);
         cache.get(&sid("a"), 1.0);
-        cache.bake_queued(|_| some_lines(4));
+        cache.bake_queued(|_, r| some_tex(4, r));
         let one = cache.get(&sid("a"), 1.0).unwrap().bytes;
-        cache.set_max_bytes_for_test(one); // room for exactly one texture
+        cache.set_max_bytes_for_test(one);
         cache.get(&sid("b"), 1.0);
-        cache.bake_queued(|_| some_lines(4)); // 2×one > one → evict LRU (a)
+        cache.bake_queued(|_, r| some_tex(4, r));
         assert!(cache.get(&sid("b"), 1.0).is_some());
         assert!(cache.get(&sid("a"), 1.0).is_none());
         let retired = cache.take_retired();
@@ -497,14 +626,13 @@ mod tests {
     fn cache_hit_refreshes_lru_order() {
         let mut cache = TextureCache::new(usize::MAX);
         cache.get(&sid("a"), 1.0);
-        cache.bake_queued(|_| some_lines(4));
+        cache.bake_queued(|_, r| some_tex(4, r));
         cache.get(&sid("b"), 1.0);
-        cache.bake_queued(|_| some_lines(4));
-        let one = cache.get(&sid("a"), 1.0).unwrap().bytes; // touch a
-        cache.set_max_bytes_for_test(2 * one); // room for two textures
+        cache.bake_queued(|_, r| some_tex(4, r));
+        let one = cache.get(&sid("a"), 1.0).unwrap().bytes;
+        cache.set_max_bytes_for_test(2 * one);
         cache.get(&sid("c"), 1.0);
-        cache.bake_queued(|_| some_lines(4)); // 3×one > 2×one → evict one
-        // b (older touch than a) is the LRU victim.
+        cache.bake_queued(|_, r| some_tex(4, r));
         assert!(cache.get(&sid("a"), 1.0).is_some());
         assert!(cache.get(&sid("b"), 1.0).is_none());
         assert!(cache.get(&sid("c"), 1.0).is_some());
