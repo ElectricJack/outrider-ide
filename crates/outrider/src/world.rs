@@ -163,11 +163,16 @@ pub fn visible_nodes<'a>(
     has_thumbnail: impl Fn(&outrider_index::SymbolId) -> bool,
 ) -> Vec<DrawItem<'a>> {
     let mut out = Vec::new();
-    walk(&tree.root, pack, camera, vw, vh, 0, &has_thumbnail, &mut out);
+    walk(&tree.root, pack, camera, vw, vh, 0, false, &has_thumbnail, &mut out);
     out
 }
 
 /// Recursive DFS helper for `visible_nodes`: project, cull, classify, clip.
+///
+/// `parent_has_thumb` is true when the immediate parent already has a cached
+/// folder thumbnail. When false, children that would normally merge away
+/// (below `MERGE_PX`) are kept as Dot fills so they remain visible until
+/// the parent's thumbnail is ready to replace the whole subtree.
 fn walk<'a>(
     node: &'a SymbolNode,
     pack: &outrider_layout::PackLayout,
@@ -175,29 +180,29 @@ fn walk<'a>(
     vw: f64,
     vh: f64,
     level: u8,
+    parent_has_thumb: bool,
     has_thumbnail: &dyn Fn(&outrider_index::SymbolId) -> bool,
     out: &mut Vec<DrawItem<'a>>,
 ) {
     let Some(r) = pack.rects.get(&node.id) else { return };
     let (sx, sy) = camera.world_to_screen(r.x, r.y, vw, vh);
     let (pw, ph) = (r.w * camera.zoom, r.h * camera.zoom);
-    // Children sit strictly inside the parent: off-screen prunes the subtree.
     if sx > vw || sx + pw < 0.0 || sy > vh || sy + ph < 0.0 {
         return;
     }
     let draw = if content::is_leaf_item(node) {
         match leaf_draw(ph, pw, content::natural_px(node)) {
             Some(ld) => Draw::Leaf(ld),
-            None => return, // merged away
+            None if !parent_has_thumb && ph >= 1.0 => Draw::Leaf(LeafDraw::Dot),
+            None => return,
         }
     } else {
         match rung_for(ph, pw) {
             Some(r) => Draw::Container(r),
-            None => return, // merged away
+            None if !parent_has_thumb && ph >= 1.0 => Draw::Container(Rung::Dot),
+            None => return,
         }
     };
-    // Clip to the viewport (±2px slack keeps borders off-screen) before f32
-    // ever sees the coordinates; the draw mode and scale use the UNclipped size.
     let x0 = sx.max(-2.0);
     let x1 = (sx + pw).min(vw + 2.0);
     let y0 = sy.max(-2.0);
@@ -214,14 +219,14 @@ fn walk<'a>(
     });
     // Containers only prune their subtree when a folder thumbnail is cached,
     // so children stay visible until the thumbnail is ready to replace them.
-    // Children below MERGE_PX are individually culled by rung_for/leaf_draw.
+    let this_has_thumb = has_thumbnail(&node.id);
     let prune = match draw {
-        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => has_thumbnail(&node.id),
+        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => this_has_thumb,
         _ => false,
     };
     if !prune {
         for child in &node.children {
-            walk(child, pack, camera, vw, vh, level.saturating_add(1), has_thumbnail, out);
+            walk(child, pack, camera, vw, vh, level.saturating_add(1), this_has_thumb, has_thumbnail, out);
         }
     }
 }
@@ -390,12 +395,14 @@ mod tests {
     fn packed_walk_shows_children_until_thumbnail_ready() {
         let (tree, p) = packed_example();
         // Zoomed far out: root at Dot rung. Without a cached thumbnail,
-        // children above MERGE_PX still appear (a.rs ~48px, b.rs ~10px).
+        // all children remain visible (sub-MERGE_PX nodes kept as Dots).
         let cam = Camera { center_x: 500.0, center_y: 819.6, zoom: 0.03 };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert!(names.contains(&""));
         assert!(names.contains(&"a.rs"));
+        assert!(names.contains(&"b.rs"));
+        assert!(names.contains(&"f"));
         assert!(matches!(items[0].draw, Draw::Container(Rung::Dot)));
 
         // With a thumbnail cached for root, children are pruned.
