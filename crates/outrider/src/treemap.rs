@@ -112,7 +112,7 @@ fn doc_overlay(doc: &str, px: &world::PxRect) -> (Vec<BodyText>, f32) {
         if y + LINE_STEP > px.y + px.h {
             break;
         }
-        let runs = vec![(text.len(), theme::TEXT_PRIMARY)];
+        let runs = vec![(text.len(), theme::DOC_COLOR)];
         rows.push(BodyText { x: (px.x + BODY_PAD) as f32, y: y as f32, text, runs });
         y += LINE_STEP;
     }
@@ -970,12 +970,6 @@ impl Render for TreemapView {
                                     },
                                 );
                             }
-                            // Doc overlay: translucent panel + crisp 12px doc
-                            // rows over the blurred texture. Fades out with
-                            // tex_opacity as real code text fades in. Painted
-                            // in Pass 1 so pinned headers and focus rings
-                            // (later passes) stay on top; the name row paints
-                            // over the panel in Pass 2a.
                             if !item.doc_rows.is_empty() {
                                 let pc = rgb(theme::CODE_BG).opacity(0.85 * item.tex_opacity);
                                 let pb = Bounds::new(
@@ -996,15 +990,19 @@ impl Render for TreemapView {
                                     pc,
                                     BorderStyle::default(),
                                 ));
+                                let doc_run = |len: usize, color: u32| TextRun {
+                                    len,
+                                    font: gpui::font(theme::FONT_FAMILY_SANS),
+                                    color: rgb(color).into(),
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
                                 for bt in &item.doc_rows {
                                     let runs: Vec<TextRun> = bt
                                         .runs
                                         .iter()
-                                        .map(|&(len, color)| {
-                                            let mut r = run(len, color);
-                                            r.color = r.color.opacity(item.tex_opacity);
-                                            r
-                                        })
+                                        .map(|&(len, color)| doc_run(len, color))
                                         .collect();
                                     let line = window.text_system().shape_line(
                                         bt.text.clone().into(),
@@ -1508,7 +1506,7 @@ mod tests {
         assert_eq!(rows[0].y, (50.0 + HEADER) as f32);
         assert_eq!(rows[1].y, (50.0 + HEADER + LINE_STEP) as f32);
         assert_eq!(panel_h, (HEADER + 2.0 * LINE_STEP) as f32);
-        assert_eq!(rows[0].runs, vec![(rows[0].text.len(), crate::theme::TEXT_PRIMARY)]);
+        assert_eq!(rows[0].runs, vec![(rows[0].text.len(), crate::theme::DOC_COLOR)]);
     }
 
     #[test]

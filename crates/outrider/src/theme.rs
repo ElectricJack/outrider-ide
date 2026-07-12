@@ -20,6 +20,12 @@ pub const FOCUS_BORDER: u32 = 0x4da6ff;
 pub const FONT_FAMILY: &str = "Consolas";
 #[cfg(not(target_os = "windows"))]
 pub const FONT_FAMILY: &str = "DejaVu Sans Mono";
+#[cfg(target_os = "windows")]
+pub const FONT_FAMILY_SANS: &str = "Arial";
+#[cfg(not(target_os = "windows"))]
+pub const FONT_FAMILY_SANS: &str = "Liberation Sans";
+/// Comment-green used for doc-description overlays.
+pub const DOC_COLOR: u32 = 0x6a9955;
 /// Depth-shaded box fill: darker outside, lighter inside, clamped at 8.
 const DEPTH_FILL_0: u32 = 0x17171B;
 const DEPTH_FILL_8: u32 = 0x3C3C46;
