@@ -705,7 +705,7 @@ impl TreemapView {
             }
             let is_focused = item.node.id == focus_id;
             let is_hovered = self.hover_id.as_ref() == Some(&item.node.id);
-            if is_leaf && item.node.doc.is_some() {
+            if item.node.doc.is_some() {
                 if is_hovered {
                     panel_doc = Some((
                         item.node.doc.clone().unwrap(),
@@ -874,7 +874,7 @@ impl Render for TreemapView {
                         f64::from(e.position.y) - chrome::TITLEBAR_H,
                     );
                     let hit = world::hit_test(&items, mx, my)
-                        .filter(|i| matches!(i.draw, Draw::Leaf(_)))
+                        .filter(|i| i.node.doc.is_some())
                         .map(|i| i.node.id.clone());
                     if hit != this.hover_id {
                         this.hover_id = hit;
@@ -1351,11 +1351,9 @@ mod tests {
         let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
         let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0);
-        // churn readout + doc first line (no items → no kind-counts line)
-        assert_eq!(body.len(), 2);
-        assert_eq!(body[1].text, "Doc line.");
+        // churn readout only (doc shown via hover panel, no children → no kinds)
+        assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - HEADER).abs() < 1e-3);
-        assert!((f64::from(body[1].y) - (HEADER + LINE_STEP)).abs() < 1e-3);
     }
 
     #[test]

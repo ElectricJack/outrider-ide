@@ -141,26 +141,15 @@ pub fn body_lines(node: &SymbolNode, rung: Rung) -> Vec<BodyLine> {
             SymbolKind::File => {
                 if rung == Rung::Detail {
                     let mut out = vec![BodyLine::Dim(churn_readout(node))];
-                    if let Some(first) = node.doc.as_deref().and_then(|d| d.lines().next()) {
-                        out.push(BodyLine::Plain(first.to_string()));
-                    }
                     let kinds = kind_counts(node);
                     if !kinds.is_empty() {
                         out.push(BodyLine::Dim(kinds));
                     }
                     out
                 } else if node.children.is_empty() {
-                    // Text page: one signature-equivalent row; the paint
-                    // path appends the file text from row 1 (spec §3).
                     vec![BodyLine::Dim(churn_readout(node))]
                 } else {
-                    let mut out: Vec<BodyLine> = node
-                        .doc
-                        .as_deref()
-                        .map(|d| d.lines().map(|l| BodyLine::Plain(l.to_string())).collect())
-                        .unwrap_or_default();
-                    out.push(BodyLine::Dim(inventory(node)));
-                    out
+                    vec![BodyLine::Dim(inventory(node))]
                 }
             }
             SymbolKind::Chunk => vec![BodyLine::Dim(churn_readout(node))],
@@ -289,23 +278,18 @@ mod tests {
             body_lines(container, Rung::Full),
             vec![Plain("impl Point".into()), Dim(inventory(container))]
         );
-        // file Detail: churn readout + doc first line + kind counts
+        // file Detail: churn readout + kind counts (doc shown via hover panel)
         assert_eq!(
             body_lines(&f, Rung::Detail),
             vec![
                 Dim("480L · 47 commits · p96".into()),
-                Plain("Doc first.".into()),
                 Dim("3 fns · 1 impl · 1 struct".into()),
             ]
         );
-        // file Full: whole doc block + inventory
+        // file Full: inventory only (doc shown via hover panel)
         assert_eq!(
             body_lines(&f, Rung::Full),
-            vec![
-                Plain("Doc first.".into()),
-                Plain("Doc second.".into()),
-                Dim(inventory(&f)),
-            ]
+            vec![Dim(inventory(&f))]
         );
         // folder Detail: readout + counts; Full: inventory only
         assert_eq!(
@@ -325,10 +309,7 @@ mod tests {
 
     #[test]
     fn childless_file_full_body_is_one_readout_row() {
-        use BodyLine::{Dim, Plain};
-        // even with a doc comment, Full is exactly one row: the paint
-        // path appends the file text (which contains the doc) from row 1,
-        // keeping natural_px = HEADER + (1+measure)·LINE_STEP + BOTTOM_PAD
+        use BodyLine::Dim;
         let f = node(
             SymbolKind::File,
             "README.md",
@@ -340,11 +321,7 @@ mod tests {
             vec![],
         );
         assert_eq!(body_lines(&f, Rung::Full), vec![Dim("12L · 5 commits · p20".into())]);
-        // Detail is unchanged: readout + doc first line (no kinds — childless)
-        assert_eq!(
-            body_lines(&f, Rung::Detail),
-            vec![Dim("12L · 5 commits · p20".into()), Plain("# Readme".into())]
-        );
+        assert_eq!(body_lines(&f, Rung::Detail), vec![Dim("12L · 5 commits · p20".into())]);
     }
 
     #[test]
