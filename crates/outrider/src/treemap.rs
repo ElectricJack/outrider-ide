@@ -753,15 +753,17 @@ impl TreemapView {
             if wrapped.is_empty() {
                 return None;
             }
+            let row_count = wrapped.len() as f32;
+            let panel_h = BODY_PAD as f32 + row_count * LINE_STEP as f32 + BODY_PAD as f32;
+            let panel_y = fy - panel_h - 4.0;
             let mut rows = Vec::new();
-            let mut y = fy + BODY_PAD as f32;
+            let mut y = panel_y + BODY_PAD as f32;
             for text in wrapped {
                 let runs = vec![(text.len(), theme::DOC_COLOR)];
                 rows.push(BodyText { x: fx + BODY_PAD as f32, y, text, runs });
                 y += LINE_STEP as f32;
             }
-            let panel_h = y - fy + BODY_PAD as f32;
-            Some(DocPanel { x: fx, y: fy, w: panel_w, h: panel_h, rows })
+            Some(DocPanel { x: fx, y: panel_y, w: panel_w, h: panel_h, rows })
         });
         self.bake_pending = if self.textures.has_queued() {
             let index = TreeIndex::new(&self.tree);
