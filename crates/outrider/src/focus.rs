@@ -87,7 +87,7 @@ impl Focus {
         }
     }
 
-    /// Enter: last-visited child if still valid, else first child.
+    /// Enter: last-visited child if still valid, else largest child by measure.
     pub fn step_in(&mut self, index: &TreeIndex) -> bool {
         let Some(node) = index.node(&self.current) else { return false };
         if node.children.is_empty() {
@@ -98,7 +98,14 @@ impl Focus {
             .get(&self.current)
             .filter(|lc| node.children.iter().any(|c| &c.id == *lc))
             .cloned()
-            .unwrap_or_else(|| node.children[0].id.clone());
+            .unwrap_or_else(|| {
+                node.children
+                    .iter()
+                    .max_by_key(|c| c.measure)
+                    .unwrap()
+                    .id
+                    .clone()
+            });
         self.land(next, index)
     }
 
@@ -219,6 +226,16 @@ mod tests {
 
     /// The Phase 2 worked example: root { a.rs, b.rs { f, g } }.
     fn tree() -> SymbolTree {
+        let mut b = n(
+            SymbolKind::File,
+            "b.rs",
+            "b.rs",
+            vec![
+                n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![]),
+                n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", vec![]),
+            ],
+        );
+        b.measure = 2;
         SymbolTree {
             root: n(
                 SymbolKind::Folder,
@@ -226,15 +243,7 @@ mod tests {
                 "",
                 vec![
                     n(SymbolKind::File, "a.rs", "a.rs", vec![]),
-                    n(
-                        SymbolKind::File,
-                        "b.rs",
-                        "b.rs",
-                        vec![
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![]),
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", vec![]),
-                        ],
-                    ),
+                    b,
                 ],
             ),
             repo_root: std::path::PathBuf::from("/x"),
@@ -246,14 +255,17 @@ mod tests {
     }
 
     #[test]
-    fn enter_steps_into_first_child_and_leaf_is_noop() {
+    fn enter_steps_into_largest_child_and_leaf_is_noop() {
         let t = tree();
         let idx = TreeIndex::new(&t);
         let mut f = Focus::new(t.root.id.clone());
+        // b.rs has measure 2 (largest child of root)
         assert!(f.step_in(&idx));
-        assert_eq!(f.current, id(SymbolKind::File, "a.rs"));
-        assert!(!f.step_in(&idx)); // a.rs is a leaf
-        assert_eq!(f.current, id(SymbolKind::File, "a.rs"));
+        assert_eq!(f.current, id(SymbolKind::File, "b.rs"));
+        // b.rs has children f and g (both measure 1); step in picks last-max
+        assert!(f.step_in(&idx));
+        assert_eq!(f.current.qualified_path, "b.rs::g");
+        assert!(!f.step_in(&idx)); // leaf is a noop
     }
 
     #[test]
