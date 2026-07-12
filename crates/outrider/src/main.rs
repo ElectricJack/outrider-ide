@@ -9,6 +9,7 @@ mod content;
 mod focus;
 mod rasterize;
 mod palette;
+mod settings;
 mod theme;
 mod treemap;
 mod world;
