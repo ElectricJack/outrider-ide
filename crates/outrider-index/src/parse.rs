@@ -1,4 +1,4 @@
-//! Tree-sitter-based source parsers for Rust, Python, C, JS/TS/TSX, and C#.
+//! Tree-sitter-based source parsers for Rust, Python, C, C++, JS/TS/TSX, and C#.
 //! Each `parse_*_items` function returns a nested `RawItem` tree that mirrors
 //! the language's structural hierarchy. `file_doc` extracts `//!` module docs;
 //! each item carries the `///` block found directly above it.
@@ -160,6 +160,89 @@ fn c_item_name(node: Node, src: &[u8]) -> String {
             "<anon>".to_string()
         }
         _ => item_name_default(node, src),
+    }
+}
+
+/// Extract class/struct/enum/namespace/fn items from C++ source.
+pub fn parse_cpp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .context("loading tree-sitter-cpp grammar")?;
+    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let kind_fn = |node_kind: &str, node: Node, _src: &[u8]| -> Option<&'static str> {
+        match node_kind {
+            "function_definition" => Some("fn"),
+            "class_specifier" if node.child_by_field_name("body").is_some() => Some("class"),
+            "struct_specifier" if node.child_by_field_name("body").is_some() => Some("struct"),
+            "enum_specifier" if node.child_by_field_name("body").is_some() => Some("enum"),
+            "namespace_definition" => Some("namespace"),
+            "type_definition" => Some("typedef"),
+            "template_declaration" => None,
+            _ => None,
+        }
+    };
+    Ok(collect_items(tree.root_node(), source, &kind_fn, &cpp_item_name))
+}
+
+/// C++-specific name extraction.
+/// Extends the C name logic with support for qualified identifiers
+/// (`Foo::bar`), destructors (`~Foo`), and operator overloads.
+fn cpp_item_name(node: Node, src: &[u8]) -> String {
+    match node.kind() {
+        "class_specifier" | "struct_specifier" | "enum_specifier" => {
+            node.child_by_field_name("name")
+                .map(|n| node_text(n, src))
+                .unwrap_or_else(|| "<anon>".to_string())
+        }
+        "namespace_definition" => {
+            node.child_by_field_name("name")
+                .map(|n| node_text(n, src))
+                .unwrap_or_else(|| "<anon>".to_string())
+        }
+        "type_definition" => {
+            let mut cursor = node.walk();
+            let mut last_ident = None;
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "type_identifier" {
+                    last_ident = Some(node_text(child, src));
+                }
+            }
+            last_ident.unwrap_or_else(|| "<anon>".to_string())
+        }
+        "function_definition" => {
+            let declarator = node.child_by_field_name("declarator");
+            if let Some(decl) = declarator {
+                return cpp_declarator_name(decl, src);
+            }
+            "<anon>".to_string()
+        }
+        _ => item_name_default(node, src),
+    }
+}
+
+/// Walks through nested C++ declarators to extract the function/method name,
+/// handling `function_declarator`, `qualified_identifier`, `destructor_name`,
+/// and `operator_name`.
+fn cpp_declarator_name(node: Node, src: &[u8]) -> String {
+    match node.kind() {
+        "function_declarator" => {
+            if let Some(inner) = node.child_by_field_name("declarator") {
+                return cpp_declarator_name(inner, src);
+            }
+            node.named_child(0)
+                .map(|n| node_text(n, src))
+                .unwrap_or_else(|| "<anon>".to_string())
+        }
+        "qualified_identifier" => node_text(node, src),
+        "destructor_name" | "operator_name" => node_text(node, src),
+        "reference_declarator" | "pointer_declarator" => {
+            if let Some(inner) = node.named_child(0) {
+                return cpp_declarator_name(inner, src);
+            }
+            node_text(node, src)
+        }
+        _ => node_text(node, src),
     }
 }
 
@@ -393,7 +476,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::types::SymbolKind;
-    use super::{parse_rust_items, parse_c_items, parse_python_items, parse_js_items, parse_ts_items, parse_csharp_items};
+    use super::{parse_rust_items, parse_c_items, parse_cpp_items, parse_python_items, parse_js_items, parse_ts_items, parse_csharp_items};
 
     const SRC: &str = r#"mod inner {
     pub fn helper() {
@@ -710,6 +793,113 @@ namespace MyApp {
         assert_eq!(items[0].children[0].children[0].kind.label(), "fn");
         assert_eq!(items[0].children[0].children[0].name, "Greeter");
         assert_eq!(items[0].children[0].children[1].name, "Greet");
+    }
+
+    #[test]
+    fn extracts_cpp_items() {
+        let src = br#"
+namespace geometry {
+
+class Shape {
+public:
+    virtual ~Shape() {}
+    virtual double area() const = 0;
+};
+
+class Circle : public Shape {
+public:
+    Circle(double r) : radius(r) {}
+    ~Circle() {}
+    double area() const override {
+        return 3.14159 * radius * radius;
+    }
+private:
+    double radius;
+};
+
+struct Point {
+    double x;
+    double y;
+};
+
+enum Color { RED, GREEN, BLUE };
+
+}
+
+typedef unsigned long ulong;
+
+void standalone() {
+    // body
+}
+"#;
+        let items = parse_cpp_items(src).unwrap();
+        assert_eq!(items[0].kind.label(), "namespace");
+        assert_eq!(items[0].name, "geometry");
+        let inner: Vec<(&str, &str)> = items[0]
+            .children
+            .iter()
+            .map(|i| (i.kind.label(), i.name.as_str()))
+            .collect();
+        assert_eq!(
+            inner,
+            vec![
+                ("class", "Shape"),
+                ("class", "Circle"),
+                ("struct", "Point"),
+                ("enum", "Color"),
+            ]
+        );
+        // Shape has destructor only (pure virtual decl is not a definition)
+        assert_eq!(items[0].children[0].children.len(), 1);
+        // Circle has constructor + destructor + method
+        assert_eq!(items[0].children[1].children.len(), 3);
+
+        // Top-level items after namespace
+        let top: Vec<(&str, &str)> = items[1..]
+            .iter()
+            .map(|i| (i.kind.label(), i.name.as_str()))
+            .collect();
+        assert_eq!(
+            top,
+            vec![
+                ("typedef", "ulong"),
+                ("fn", "standalone"),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_cpp_templates_and_qualified_names() {
+        let src = br#"
+template <typename T>
+class Container {
+public:
+    void add(T item) {}
+};
+
+class Foo {
+public:
+    void bar();
+};
+
+void Foo::bar() {
+    // out-of-line definition
+}
+"#;
+        let items = parse_cpp_items(src).unwrap();
+        // Template declaration is transparent, so we see the inner class
+        assert_eq!(items[0].kind.label(), "class");
+        assert_eq!(items[0].name, "Container");
+        assert_eq!(items[0].children.len(), 1);
+        assert_eq!(items[0].children[0].name, "add");
+
+        // Foo class with declared method
+        assert_eq!(items[1].kind.label(), "class");
+        assert_eq!(items[1].name, "Foo");
+
+        // Out-of-line Foo::bar
+        assert_eq!(items[2].kind.label(), "fn");
+        assert_eq!(items[2].name, "Foo::bar");
     }
 }
 
