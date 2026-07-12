@@ -24,8 +24,8 @@ pub const FONT_FAMILY: &str = "DejaVu Sans Mono";
 pub const FONT_FAMILY_SANS: &str = "Arial";
 #[cfg(not(target_os = "windows"))]
 pub const FONT_FAMILY_SANS: &str = "Liberation Sans";
-/// Comment-green used for doc-description overlays.
-pub const DOC_COLOR: u32 = 0x6a9955;
+/// Light blue for doc-description overlays (matches the focus accent family).
+pub const DOC_COLOR: u32 = 0x7cb8e4;
 /// Depth-shaded box fill: darker outside, lighter inside, clamped at 8.
 const DEPTH_FILL_0: u32 = 0x17171B;
 const DEPTH_FILL_8: u32 = 0x3C3C46;

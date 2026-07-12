@@ -102,18 +102,19 @@ fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
 
 /// Screen-space doc-overlay rows for a texture-tier leaf: the item's `///`
 /// doc wrapped to the box's inner width, one crisp 12px row per line
-/// starting under the pinned name row; rows that would leave the box are
-/// dropped. Also returns the backdrop-panel height (box top → last row
-/// bottom); (empty, 0.0) when nothing fits.
+/// starting under the pinned name row. If the wrapped text overflows the
+/// box, the entire overlay is hidden (returns empty) — partial descriptions
+/// at small sizes are unreadable.
 fn doc_overlay(doc: &str, px: &world::PxRect) -> (Vec<BodyText>, f32) {
+    let wrapped = wrap_doc(doc, px.w - 2.0 * BODY_PAD, FONT_PX);
     let mut rows = Vec::new();
     let mut y = px.y + HEADER;
-    for text in wrap_doc(doc, px.w - 2.0 * BODY_PAD, FONT_PX) {
+    for text in &wrapped {
         if y + LINE_STEP > px.y + px.h {
-            break;
+            return (Vec::new(), 0.0);
         }
         let runs = vec![(text.len(), theme::DOC_COLOR)];
-        rows.push(BodyText { x: (px.x + BODY_PAD) as f32, y: y as f32, text, runs });
+        rows.push(BodyText { x: (px.x + BODY_PAD) as f32, y: y as f32, text: text.clone(), runs });
         y += LINE_STEP;
     }
     let panel_h = if rows.is_empty() { 0.0 } else { (y - px.y) as f32 };
@@ -122,6 +123,9 @@ fn doc_overlay(doc: &str, px: &world::PxRect) -> (Vec<BodyText>, f32) {
 
 /// Left text inset shared by name rows and body rows.
 pub(crate) const BODY_PAD: f64 = 6.0;
+
+/// Width of the floating doc panel shown to the right of the focused leaf.
+const DOC_PANEL_W: f64 = 280.0;
 
 /// Root GPUI view: owns the symbol tree, pack layout, camera state, buffer
 /// cache, and texture cache; produces a full-screen canvas each frame.
@@ -169,6 +173,15 @@ struct TexQuad {
     w: f32,
     h: f32,
     image: Arc<RenderImage>,
+}
+
+/// Floating doc-description panel shown to the right of the focused leaf.
+struct DocPanel {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rows: Vec<BodyText>,
 }
 
 /// Owned, GPUI-free paint instruction — built in render (which may borrow
@@ -560,8 +573,9 @@ impl TreemapView {
     }
 
     /// Advance the tween, materialize buffers/textures, and build the
-    /// `PaintItem` list for the current frame; also kicks off queued bakes.
-    fn paint_items(&mut self, vw: f64, vh: f64) -> Vec<PaintItem> {
+    /// `PaintItem` list + optional focused-leaf doc panel for the current
+    /// frame; also kicks off queued bakes.
+    fn paint_items(&mut self, vw: f64, vh: f64) -> (Vec<PaintItem>, Option<DocPanel>) {
         if let Some((tw, started)) = self.tween {
             let t = started.elapsed().as_secs_f64();
             self.camera = Some(tw.sample(t));
@@ -586,6 +600,7 @@ impl TreemapView {
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
         let mut out = Vec::with_capacity(items.len());
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
+        let mut focus_doc: Option<(String, f32, f32, f32, f32)> = None;
         for item in items {
             while let Some(&(lvl, _)) = header_stack.last() {
                 if lvl >= item.level {
@@ -685,6 +700,18 @@ impl TreemapView {
                     }
                 }
             }
+            let is_focused = item.node.id == focus_id;
+            if is_focused && is_leaf {
+                if let Some(doc) = &item.node.doc {
+                    focus_doc = Some((
+                        doc.clone(),
+                        item.px.x as f32,
+                        item.px.y as f32,
+                        item.px.w as f32,
+                        item.px.h as f32,
+                    ));
+                }
+            }
             out.push(PaintItem {
                 x: item.px.x as f32,
                 y: item.px.y as f32,
@@ -693,8 +720,8 @@ impl TreemapView {
                 fill,
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
-                focused: item.node.id == focus_id,
-                neighbor: item.node.id != focus_id
+                focused: is_focused,
+                neighbor: !is_focused
                     && neighbor_ids.iter().flatten().any(|n| *n == item.node.id),
                 body_font_px,
                 header_bg_h,
@@ -708,6 +735,23 @@ impl TreemapView {
                 tex,
             });
         }
+        let doc_panel = focus_doc.and_then(|(doc, fx, fy, fw, fh)| {
+            let panel_x = fx + fw + 4.0;
+            let panel_w = DOC_PANEL_W as f32;
+            let wrapped = wrap_doc(&doc, (panel_w as f64) - 2.0 * BODY_PAD, FONT_PX);
+            if wrapped.is_empty() {
+                return None;
+            }
+            let mut rows = Vec::new();
+            let mut y = fy + BODY_PAD as f32;
+            for text in wrapped {
+                let runs = vec![(text.len(), theme::DOC_COLOR)];
+                rows.push(BodyText { x: panel_x + BODY_PAD as f32, y, text, runs });
+                y += LINE_STEP as f32;
+            }
+            let panel_h = y - fy + BODY_PAD as f32;
+            Some(DocPanel { x: panel_x, y: fy, w: panel_w, h: panel_h.min(fh), rows })
+        });
         self.bake_pending = if self.textures.has_queued() {
             let index = TreeIndex::new(&self.tree);
             let buffers = &mut self.buffers;
@@ -731,7 +775,7 @@ impl TreemapView {
         } else {
             false
         };
-        out
+        (out, doc_panel)
     }
 }
 
@@ -744,7 +788,7 @@ impl Render for TreemapView {
         }
 
         let (vw, vh) = Self::map_viewport(window);
-        let items = self.paint_items(vw, vh);
+        let (items, doc_panel) = self.paint_items(vw, vh);
 
         for img in self.textures.take_retired() {
             let _ = window.drop_image(img);
@@ -1156,6 +1200,50 @@ impl Render for TreemapView {
                                 BorderStyle::default(),
                             ));
                         }
+                        // Pass 4: focused-leaf doc panel (floats to the right).
+                        if let Some(dp) = &doc_panel {
+                            let pb = Bounds::new(
+                                point(origin.x + px(dp.x), origin.y + px(dp.y)),
+                                size(px(dp.w), px(dp.h)),
+                            );
+                            window.paint_quad(quad(
+                                pb,
+                                px(theme::CORNER_RADIUS),
+                                rgb(theme::CODE_BG),
+                                px(1.0),
+                                rgb(theme::FOCUS_BORDER),
+                                BorderStyle::default(),
+                            ));
+                            let doc_run = |len: usize, color: u32| TextRun {
+                                len,
+                                font: gpui::font(theme::FONT_FAMILY_SANS),
+                                color: rgb(color).into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            for bt in &dp.rows {
+                                let runs: Vec<TextRun> = bt
+                                    .runs
+                                    .iter()
+                                    .map(|&(len, color)| doc_run(len, color))
+                                    .collect();
+                                let line = window.text_system().shape_line(
+                                    bt.text.clone().into(),
+                                    px(FONT_PX as f32),
+                                    &runs,
+                                    None,
+                                );
+                                let _ = line.paint(
+                                    point(origin.x + px(bt.x), origin.y + px(bt.y)),
+                                    px(FONT_PX as f32 * 1.3),
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    _cx,
+                                );
+                            }
+                        }
                     },
                 )
                 .size_full(),
@@ -1492,8 +1580,26 @@ mod tests {
     }
 
     #[test]
-    fn doc_overlay_lays_rows_under_the_name_and_drops_overflow() {
-        // Box fits exactly 2 rows: h = HEADER + 2*LINE_STEP.
+    fn doc_overlay_shows_rows_when_text_fits() {
+        // Box fits exactly 2 rows and text wraps to exactly 2 rows.
+        let px = crate::world::PxRect {
+            x: 100.0,
+            y: 50.0,
+            w: wrap_w(10) + 2.0 * BODY_PAD,
+            h: HEADER + 2.0 * LINE_STEP,
+        };
+        let (rows, panel_h) = doc_overlay("alpha beta gamma", &px);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].x, (100.0 + BODY_PAD) as f32);
+        assert_eq!(rows[0].y, (50.0 + HEADER) as f32);
+        assert_eq!(rows[1].y, (50.0 + HEADER + LINE_STEP) as f32);
+        assert_eq!(panel_h, (HEADER + 2.0 * LINE_STEP) as f32);
+        assert_eq!(rows[0].runs, vec![(rows[0].text.len(), crate::theme::DOC_COLOR)]);
+    }
+
+    #[test]
+    fn doc_overlay_hides_entirely_when_text_overflows() {
+        // Box fits 2 rows but text wraps to 3+: overlay is hidden.
         let px = crate::world::PxRect {
             x: 100.0,
             y: 50.0,
@@ -1501,12 +1607,8 @@ mod tests {
             h: HEADER + 2.0 * LINE_STEP,
         };
         let (rows, panel_h) = doc_overlay("alpha beta gamma delta epsilon", &px);
-        assert_eq!(rows.len(), 2); // 3+ wrapped rows, only 2 fit
-        assert_eq!(rows[0].x, (100.0 + BODY_PAD) as f32);
-        assert_eq!(rows[0].y, (50.0 + HEADER) as f32);
-        assert_eq!(rows[1].y, (50.0 + HEADER + LINE_STEP) as f32);
-        assert_eq!(panel_h, (HEADER + 2.0 * LINE_STEP) as f32);
-        assert_eq!(rows[0].runs, vec![(rows[0].text.len(), crate::theme::DOC_COLOR)]);
+        assert!(rows.is_empty());
+        assert_eq!(panel_h, 0.0);
     }
 
     #[test]
