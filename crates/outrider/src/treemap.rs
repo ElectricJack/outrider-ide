@@ -140,6 +140,8 @@ pub struct TreemapView {
     settings: settings::Settings,
     /// Whether to show the welcome overlay this session.
     show_welcome: bool,
+    /// Whether the settings overlay is open.
+    settings_open: bool,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -505,6 +507,7 @@ impl TreemapView {
             palette: palette::Palette::new(),
             settings,
             show_welcome,
+            settings_open: false,
         }
     }
 
@@ -983,6 +986,208 @@ impl TreemapView {
             .children(preview_div)
     }
 
+    /// Re-run indexing and rebuild the full layout after settings change.
+    fn reindex(&mut self) {
+        let repo = self.tree.repo_root.clone();
+        match outrider_index::index_repo(&repo, &self.settings.filter_extensions, &self.settings.filter_folders) {
+            Ok(tree) => {
+                let layout = outrider_layout::pack(&tree, &world::pack_config());
+                self.file_symbols = collect_file_symbols(&tree);
+                self.buffers = BufferManager::new(tree.repo_root.clone());
+                self.textures = TextureCache::new(rasterize::MAX_BYTES);
+                let root_id = tree.root.id.clone();
+                self.focus = Focus::new(root_id.clone());
+                self.nav_history = vec![root_id];
+                self.nav_cursor = 0;
+                self.neighbors = None;
+                self.hover_id = None;
+                self.camera = None;
+                self.palette = palette::Palette::new();
+                self.tree = tree;
+                self.layout = layout;
+            }
+            Err(e) => eprintln!("reindex failed: {e:#}"),
+        }
+    }
+
+    /// Open the settings.json file in the system editor.
+    fn open_settings_file() {
+        if let Some(path) = settings::Settings::path() {
+            if cfg!(target_os = "windows") {
+                let _ = std::process::Command::new("notepad").arg(&path).spawn();
+            } else {
+                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+            }
+        }
+    }
+
+    /// Build the settings overlay div (absolutely positioned, centered).
+    /// Shows current filter settings read-only with action buttons.
+    fn render_settings_window(&self, map_w: f64, cx: &mut Context<Self>) -> gpui::Div {
+        const SETTINGS_W: f32 = 600.0;
+        let left_offset = ((map_w as f32 - SETTINGS_W) / 2.0).max(0.0);
+
+        let ext_list: Vec<_> = self.settings.filter_extensions.iter().map(|s| {
+            div()
+                .text_size(px(12.0))
+                .font_family(theme::FONT_FAMILY)
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(format!(".{s}"))
+        }).collect();
+
+        let folder_list: Vec<_> = self.settings.filter_folders.iter().map(|s| {
+            div()
+                .text_size(px(12.0))
+                .font_family(theme::FONT_FAMILY)
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(s.clone())
+        }).collect();
+
+        let settings_path_text = settings::Settings::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(path unknown)".into());
+
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left(px(left_offset))
+            .w(px(SETTINGS_W))
+            .bg(rgb(theme::CODE_BG))
+            .border_1()
+            .border_color(rgb(theme::FOCUS_BORDER))
+            .rounded(px(6.0))
+            .overflow_hidden()
+            .px(px(24.0))
+            .py(px(20.0))
+            // Title
+            .child(
+                div()
+                    .text_size(px(18.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .pb(px(14.0))
+                    .child("Settings"),
+            )
+            // Filtered Extensions label
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::FOCUS_BORDER))
+                    .pb(px(4.0))
+                    .child("Filtered Extensions:"),
+            )
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .mb(px(12.0))
+                    .bg(rgb(0x1a1d21_u32))
+                    .rounded(px(3.0))
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .children(ext_list),
+            )
+            // Filtered Folders label
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::FOCUS_BORDER))
+                    .pb(px(4.0))
+                    .child("Filtered Folders:"),
+            )
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .mb(px(12.0))
+                    .bg(rgb(0x1a1d21_u32))
+                    .rounded(px(3.0))
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .children(folder_list),
+            )
+            // Settings file path
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .pb(px(14.0))
+                    .child(format!("Edit: {settings_path_text}")),
+            )
+            // Separator
+            .child(div().h(px(1.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
+            // Buttons row
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.0))
+                    // "Open Settings File" button
+                    .child(
+                        div()
+                            .id(ElementId::Name("settings-open-file".into()))
+                            .px(px(14.0))
+                            .py(px(7.0))
+                            .bg(rgb(theme::FOCUS_BORDER))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(0x000000_u32))
+                            .child("Open Settings File")
+                            .on_click(cx.listener(|_this, _e, _w, _cx| {
+                                Self::open_settings_file();
+                            })),
+                    )
+                    // "Reset to Defaults" button
+                    .child(
+                        div()
+                            .id(ElementId::Name("settings-reset".into()))
+                            .px(px(14.0))
+                            .py(px(7.0))
+                            .border_1()
+                            .border_color(rgb(theme::TEXT_SECONDARY))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child("Reset to Defaults")
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.settings = settings::Settings::default();
+                                this.settings.save();
+                                this.reindex();
+                                this.settings_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    // "Close" button
+                    .child(
+                        div()
+                            .id(ElementId::Name("settings-close".into()))
+                            .px(px(14.0))
+                            .py(px(7.0))
+                            .border_1()
+                            .border_color(rgb(theme::TEXT_SECONDARY))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child("Close")
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.settings_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
     /// Build the welcome screen overlay div (absolutely positioned, centered).
     /// `map_w` is the map viewport width in logical pixels.
     fn render_welcome(&self, map_w: f64, cx: &mut Context<Self>) -> gpui::Div {
@@ -1124,6 +1329,9 @@ impl Render for TreemapView {
         // Build the palette overlay before the map div (while &self is free).
         let palette_overlay = self.palette.is_open().then(|| self.render_palette(vw));
 
+        // Build the settings overlay (needs cx for click listeners).
+        let settings_overlay = self.settings_open.then(|| self.render_settings_window(vw, cx));
+
         // Build the welcome overlay (needs cx for click listeners).
         let welcome_overlay = self.show_welcome.then(|| self.render_welcome(vw, cx));
 
@@ -1232,21 +1440,40 @@ impl Render for TreemapView {
                     }
                     return;
                 }
-                // Ctrl+P / Ctrl+T open the palette regardless of camera state.
+                // Ctrl+P / Ctrl+T / Ctrl+Comma — open palette or settings.
                 if e.keystroke.modifiers.control && !e.keystroke.modifiers.shift {
                     match e.keystroke.key.as_str() {
                         "p" => {
                             this.palette.open(palette::PaletteMode::File, &this.tree);
+                            this.settings_open = false;
                             cx.notify();
                             return;
                         }
                         "t" => {
                             this.palette.open(palette::PaletteMode::Symbol, &this.tree);
+                            this.settings_open = false;
+                            cx.notify();
+                            return;
+                        }
+                        "," => {
+                            this.settings_open = !this.settings_open;
+                            if this.settings_open {
+                                this.palette.close();
+                                this.show_welcome = false;
+                            }
                             cx.notify();
                             return;
                         }
                         _ => {}
                     }
+                }
+                // While the settings overlay is open, block all keys except Esc.
+                if this.settings_open {
+                    if e.keystroke.key.as_str() == "escape" {
+                        this.settings_open = false;
+                        cx.notify();
+                    }
+                    return;
                 }
                 // Ctrl+Shift+E: open focused file in system file manager.
                 if e.keystroke.modifiers.control && e.keystroke.modifiers.shift {
@@ -1653,6 +1880,7 @@ impl Render for TreemapView {
                 .size_full(),
             )
             .children(palette_overlay)
+            .children(settings_overlay)
             .children(welcome_overlay);
 
         div()
