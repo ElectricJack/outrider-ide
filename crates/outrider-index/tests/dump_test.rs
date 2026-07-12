@@ -5,7 +5,7 @@ use outrider_index::index_repo;
 #[test]
 fn dump_format_shows_kind_name_measure_and_churn_readout() {
     let dir = common::copy_fixture("mini_repo");
-    let tree = index_repo(dir.path()).unwrap();
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
     let out = outrider_index::dump::render(&tree);
 
     // spec §5.4 inspectability: raw count and percentile, both visible

@@ -31,7 +31,13 @@ pub struct ScannedFile {
 /// Hidden files (dotfiles, .git) are skipped by the walker's default.
 /// Generated lock files (Cargo.lock etc.) are skipped: they are not source,
 /// and their size dwarfs real files in the treemap.
-pub fn scan_files(repo_root: &Path) -> anyhow::Result<Vec<ScannedFile>> {
+/// `filter_extensions` lists extensions to skip (e.g. `["exe", "png"]`).
+/// `filter_folders` lists folder names to skip (e.g. `["target", "node_modules"]`).
+pub fn scan_files(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+) -> anyhow::Result<Vec<ScannedFile>> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(repo_root).require_git(false).build();
     for entry in walker {
@@ -42,11 +48,23 @@ pub fn scan_files(repo_root: &Path) -> anyhow::Result<Vec<ScannedFile>> {
         if entry.path().extension().is_some_and(|e| e == "lock") {
             continue;
         }
+        // Skip files with filtered extensions
+        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+            if filter_extensions.iter().any(|f| f.eq_ignore_ascii_case(ext)) {
+                continue;
+            }
+        }
         let rel_path = entry
             .path()
             .strip_prefix(repo_root)
             .context("walker yielded path outside repo root")?
             .to_path_buf();
+        // Skip files inside filtered folders
+        if rel_path.components().any(|c| {
+            filter_folders.iter().any(|f| c.as_os_str().to_string_lossy() == f.as_str())
+        }) {
+            continue;
+        }
         let bytes = std::fs::read(entry.path())
             .with_context(|| format!("reading {}", entry.path().display()))?;
         files.push(ScannedFile {
@@ -217,7 +235,7 @@ mod tests {
     use crate::types::SymbolKind;
 
     fn scan_tree(dir: &std::path::Path) -> SymbolTree {
-        let files = scan_files(dir).unwrap();
+        let files = scan_files(dir, &[], &[]).unwrap();
         build_tree(dir, &files, &BTreeMap::new())
     }
 

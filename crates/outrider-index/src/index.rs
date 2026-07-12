@@ -13,8 +13,12 @@ use crate::scan::{build_tree, scan_files, ParsedFile, ScannedFile};
 use crate::types::{dedupe_ids, finalize_children, SymbolId, SymbolNode, SymbolTree};
 
 /// Full indexing pipeline: scan → parse → assemble → dedupe → churn annotate.
-pub fn index_repo(repo_root: &Path) -> anyhow::Result<SymbolTree> {
-    let files = scan_files(repo_root)?;
+pub fn index_repo(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+) -> anyhow::Result<SymbolTree> {
+    let files = scan_files(repo_root, filter_extensions, filter_folders)?;
     let parsed_children = parse_all(repo_root, &files)?;
     let mut tree = build_tree(repo_root, &files, &parsed_children);
     dedupe_ids(&mut tree.root);

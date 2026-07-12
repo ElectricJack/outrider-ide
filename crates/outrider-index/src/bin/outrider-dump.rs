@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .map_or_else(std::env::current_dir, Ok)?;
-    let tree = outrider_index::index_repo(&root)?;
+    let tree = outrider_index::index_repo(&root, &[], &[])?;
     print!("{}", outrider_index::dump::render(&tree));
     Ok(())
 }

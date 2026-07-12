@@ -8,7 +8,7 @@ use outrider_index::SymbolKind;
 #[test]
 fn scan_respects_gitignore_and_builds_sorted_tree() {
     let dir = common::copy_fixture("mini_repo");
-    let files = scan_files(dir.path()).unwrap();
+    let files = scan_files(dir.path(), &[], &[]).unwrap();
 
     let paths: Vec<String> = files
         .iter()

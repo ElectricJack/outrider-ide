@@ -12,7 +12,7 @@ fn find<'a>(node: &'a SymbolNode, qual: &str) -> Option<&'a SymbolNode> {
 #[test]
 fn index_repo_parses_rust_files_into_items() {
     let dir = common::copy_fixture("mini_repo");
-    let tree = index_repo(dir.path()).unwrap();
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
 
     let lib = find(&tree.root, "src/lib.rs").expect("src/lib.rs node");
     assert_eq!(lib.id.kind, SymbolKind::File);
@@ -67,7 +67,7 @@ fn index_repo_parses_rust_files_into_items() {
 #[test]
 fn symbol_ids_are_unique_tree_wide() {
     let dir = common::copy_fixture("mini_repo");
-    let tree = index_repo(dir.path()).unwrap();
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
     fn walk(n: &outrider_index::SymbolNode, out: &mut Vec<outrider_index::SymbolId>) {
         out.push(n.id.clone());
         for c in &n.children {

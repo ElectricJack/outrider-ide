@@ -30,8 +30,9 @@ fn main() {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("no working directory"));
+    let settings = settings::Settings::load();
     eprintln!("indexing {}…", repo.display());
-    let tree = match outrider_index::index_repo(&repo) {
+    let tree = match outrider_index::index_repo(&repo, &settings.filter_extensions, &settings.filter_folders) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: {e:#}");

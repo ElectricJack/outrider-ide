@@ -58,7 +58,7 @@ fn churn_counts_real_repo_writes_and_reuses_cache() {
 #[test]
 fn index_repo_annotates_percentiles_and_inherits_to_methods() {
     let dir = git_fixture();
-    let tree = index_repo(dir.path()).unwrap();
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
 
     fn find<'a>(
         n: &'a outrider_index::SymbolNode,
@@ -91,6 +91,6 @@ fn index_repo_annotates_percentiles_and_inherits_to_methods() {
 #[test]
 fn non_git_dir_yields_zero_churn_not_error() {
     let dir = common::copy_fixture("mini_repo");
-    let tree = index_repo(dir.path()).unwrap();
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
     assert_eq!(tree.root.churn_count, 0);
 }
