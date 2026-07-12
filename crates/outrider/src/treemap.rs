@@ -100,27 +100,6 @@ fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
     rows
 }
 
-/// Screen-space doc-overlay rows for a texture-tier leaf: the item's `///`
-/// doc wrapped to the box's inner width, one crisp 12px row per line
-/// starting under the pinned name row. If the wrapped text overflows the
-/// box, the entire overlay is hidden (returns empty) — partial descriptions
-/// at small sizes are unreadable.
-fn doc_overlay(doc: &str, px: &world::PxRect) -> (Vec<BodyText>, f32) {
-    let wrapped = wrap_doc(doc, px.w - 2.0 * BODY_PAD, FONT_PX);
-    let mut rows = Vec::new();
-    let mut y = px.y + HEADER;
-    for text in &wrapped {
-        if y + LINE_STEP > px.y + px.h {
-            return (Vec::new(), 0.0);
-        }
-        let runs = vec![(text.len(), theme::DOC_COLOR)];
-        rows.push(BodyText { x: (px.x + BODY_PAD) as f32, y: y as f32, text: text.clone(), runs });
-        y += LINE_STEP;
-    }
-    let panel_h = if rows.is_empty() { 0.0 } else { (y - px.y) as f32 };
-    (rows, panel_h)
-}
-
 /// Left text inset shared by name rows and body rows.
 pub(crate) const BODY_PAD: f64 = 6.0;
 
@@ -211,11 +190,6 @@ struct PaintItem {
     body_opacity: f32,
     /// Opacity for the baked texture quad (0..1); inverse of body_opacity in the fade zone.
     tex_opacity: f32,
-    /// Crisp 12px doc-description rows overlaid on a texture-tier leaf.
-    doc_rows: Vec<BodyText>,
-    /// Height of the translucent backdrop panel behind name + doc rows
-    /// (0.0 = no overlay).
-    doc_panel_h: f32,
     name: Option<NameRow>,
     body: Vec<BodyText>,
     tex: Option<TexQuad>,
@@ -627,8 +601,6 @@ impl TreemapView {
             let mut header_bg_y = item.px.y as f32;
             let mut body_opacity = 1.0f32;
             let mut tex_opacity = 1.0f32;
-            let mut doc_rows = Vec::new();
-            let mut doc_panel_h = 0.0f32;
             let mut name = None;
             let mut body = Vec::new();
             let mut tex: Option<TexQuad> = None;
@@ -673,9 +645,6 @@ impl TreemapView {
                                     image: img.clone(),
                                 });
                             }
-                        }
-                        if let Some(doc) = &item.node.doc {
-                            (doc_rows, doc_panel_h) = doc_overlay(doc, &item.px);
                         }
                         if font > content::TEXT_FADE_LO {
                             tex_opacity = 1.0
@@ -740,8 +709,6 @@ impl TreemapView {
                 header_bg_y,
                 body_opacity,
                 tex_opacity,
-                doc_rows,
-                doc_panel_h,
                 name,
                 body,
                 tex,
@@ -1041,56 +1008,6 @@ impl Render for TreemapView {
                                     },
                                 );
                             }
-                            if !item.doc_rows.is_empty() {
-                                let pc = rgb(theme::CODE_BG).opacity(0.85 * item.tex_opacity);
-                                let pb = Bounds::new(
-                                    point(
-                                        origin.x + px(item.x + 1.0),
-                                        origin.y + px(item.y + 1.0),
-                                    ),
-                                    size(
-                                        px((item.w - 2.0).max(0.0)),
-                                        px((item.doc_panel_h - 1.0).max(0.0)),
-                                    ),
-                                );
-                                window.paint_quad(quad(
-                                    pb,
-                                    px(0.),
-                                    pc,
-                                    px(0.),
-                                    pc,
-                                    BorderStyle::default(),
-                                ));
-                                let doc_run = |len: usize, color: u32| TextRun {
-                                    len,
-                                    font: gpui::font(theme::FONT_FAMILY_SANS),
-                                    color: rgb(color).into(),
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                };
-                                for bt in &item.doc_rows {
-                                    let runs: Vec<TextRun> = bt
-                                        .runs
-                                        .iter()
-                                        .map(|&(len, color)| doc_run(len, color))
-                                        .collect();
-                                    let line = window.text_system().shape_line(
-                                        bt.text.clone().into(),
-                                        px(FONT_PX as f32),
-                                        &runs,
-                                        None,
-                                    );
-                                    let _ = line.paint(
-                                        point(origin.x + px(bt.x), origin.y + px(bt.y)),
-                                        px(FONT_PX as f32 * 1.3),
-                                        TextAlign::Left,
-                                        None,
-                                        window,
-                                        _cx,
-                                    );
-                                }
-                            }
                         }
                         // Pass 2a: leaf / non-header text (rendered under
                         // pinned headers so code doesn't bleed through).
@@ -1295,7 +1212,7 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, doc_overlay, leaf_tex_rect, leaf_text_body, runs_from_spans,
+        code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
         truncate_to_width, wrap_doc, BODY_PAD, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
@@ -1604,43 +1521,4 @@ mod tests {
         assert!(wrap_doc("anything", 13.0, 12.0).is_empty());
     }
 
-    #[test]
-    fn doc_overlay_shows_rows_when_text_fits() {
-        // Box fits exactly 2 rows and text wraps to exactly 2 rows.
-        let px = crate::world::PxRect {
-            x: 100.0,
-            y: 50.0,
-            w: wrap_w(10) + 2.0 * BODY_PAD,
-            h: HEADER + 2.0 * LINE_STEP,
-        };
-        let (rows, panel_h) = doc_overlay("alpha beta gamma", &px);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].x, (100.0 + BODY_PAD) as f32);
-        assert_eq!(rows[0].y, (50.0 + HEADER) as f32);
-        assert_eq!(rows[1].y, (50.0 + HEADER + LINE_STEP) as f32);
-        assert_eq!(panel_h, (HEADER + 2.0 * LINE_STEP) as f32);
-        assert_eq!(rows[0].runs, vec![(rows[0].text.len(), crate::theme::DOC_COLOR)]);
-    }
-
-    #[test]
-    fn doc_overlay_hides_entirely_when_text_overflows() {
-        // Box fits 2 rows but text wraps to 3+: overlay is hidden.
-        let px = crate::world::PxRect {
-            x: 100.0,
-            y: 50.0,
-            w: wrap_w(10) + 2.0 * BODY_PAD,
-            h: HEADER + 2.0 * LINE_STEP,
-        };
-        let (rows, panel_h) = doc_overlay("alpha beta gamma delta epsilon", &px);
-        assert!(rows.is_empty());
-        assert_eq!(panel_h, 0.0);
-    }
-
-    #[test]
-    fn doc_overlay_is_empty_when_no_row_fits() {
-        let px = crate::world::PxRect { x: 0.0, y: 0.0, w: 200.0, h: HEADER };
-        let (rows, panel_h) = doc_overlay("some description", &px);
-        assert!(rows.is_empty());
-        assert_eq!(panel_h, 0.0);
-    }
 }
