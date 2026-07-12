@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, Bounds,
-    BorderStyle, ContentMask, Context, Corners, FocusHandle, Pixels, RenderImage, TextAlign,
-    TextRun, Window,
+    BorderStyle, ContentMask, Context, Corners, ElementId, FocusHandle, Pixels, RenderImage,
+    TextAlign, TextRun, Window,
 };
 use outrider_index::buffer::HighlightSpan;
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
@@ -19,6 +19,7 @@ use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
 use crate::palette;
 use crate::chrome;
+use crate::settings;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
 use crate::rasterize::{self, TextureCache};
@@ -135,6 +136,10 @@ pub struct TreemapView {
     nav_cursor: usize,
     /// Search palette (Ctrl+P = file mode, Ctrl+T = symbol mode).
     palette: palette::Palette,
+    /// Persisted user preferences.
+    settings: settings::Settings,
+    /// Whether to show the welcome overlay this session.
+    show_welcome: bool,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -474,10 +479,11 @@ fn open_in_file_manager(path: &std::path::Path) {
 impl TreemapView {
     /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
     /// camera is deferred until the first render supplies a viewport.
-    pub fn new(tree: SymbolTree, layout: PackLayout, cx: &mut Context<Self>) -> Self {
+    pub fn new(tree: SymbolTree, layout: PackLayout, settings: settings::Settings, cx: &mut Context<Self>) -> Self {
         let root_id = tree.root.id.clone();
         let file_symbols = collect_file_symbols(&tree);
         let buffers = BufferManager::new(tree.repo_root.clone());
+        let show_welcome = settings.show_welcome;
         Self {
             tree,
             layout,
@@ -497,6 +503,8 @@ impl TreemapView {
             nav_history: vec![root_id],
             nav_cursor: 0,
             palette: palette::Palette::new(),
+            settings,
+            show_welcome,
         }
     }
 
@@ -974,6 +982,122 @@ impl TreemapView {
             .child(list_div)
             .children(preview_div)
     }
+
+    /// Build the welcome screen overlay div (absolutely positioned, centered).
+    /// `map_w` is the map viewport width in logical pixels.
+    fn render_welcome(&self, map_w: f64, cx: &mut Context<Self>) -> gpui::Div {
+        const WELCOME_W: f32 = 600.0;
+        let left_offset = ((map_w as f32 - WELCOME_W) / 2.0).max(0.0);
+
+        // Keybinding table rows: (key, action)
+        let keybindings: &[(&str, &str)] = &[
+            ("Enter / Esc", "Step into / out of focused node"),
+            ("Arrow keys", "Move focus spatially"),
+            ("Alt+Left / Alt+Right", "Navigate history back / forward"),
+            ("Home", "Reset camera to fit all nodes"),
+            ("End", "Frame the focused node"),
+            ("Scroll", "Zoom in / out at cursor"),
+            ("Click", "Set focus"),
+            ("Drag", "Pan the view"),
+            ("Ctrl+P", "Open file palette"),
+            ("Ctrl+T", "Open symbol palette"),
+            ("Ctrl+Shift+E", "Open focused file in file manager"),
+        ];
+
+        let rows: Vec<_> = keybindings.iter().map(|(key, action)| {
+            div()
+                .flex()
+                .flex_row()
+                .py(px(3.0))
+                .child(
+                    div()
+                        .w(px(200.0))
+                        .text_size(px(12.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(rgb(theme::FOCUS_BORDER))
+                        .child(*key),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_family(theme::FONT_FAMILY_SANS)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(*action),
+                )
+        }).collect();
+
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left(px(left_offset))
+            .w(px(WELCOME_W))
+            .bg(rgb(theme::CODE_BG))
+            .border_1()
+            .border_color(rgb(theme::FOCUS_BORDER))
+            .rounded(px(6.0))
+            .overflow_hidden()
+            .px(px(24.0))
+            .py(px(20.0))
+            // Title
+            .child(
+                div()
+                    .text_size(px(18.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .pb(px(14.0))
+                    .child("Welcome to Outrider"),
+            )
+            // Keybinding rows
+            .children(rows)
+            // Separator
+            .child(div().h(px(1.0)).mt(px(14.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
+            // Buttons row
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.0))
+                    // "Got it" button — dismiss for this session only
+                    .child(
+                        div()
+                            .id(ElementId::Name("welcome-got-it".into()))
+                            .px(px(14.0))
+                            .py(px(7.0))
+                            .bg(rgb(theme::FOCUS_BORDER))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(0x000000_u32))
+                            .child("Got it")
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.show_welcome = false;
+                                cx.notify();
+                            })),
+                    )
+                    // "Don't show again" button — persists to settings
+                    .child(
+                        div()
+                            .id(ElementId::Name("welcome-no-show".into()))
+                            .px(px(14.0))
+                            .py(px(7.0))
+                            .border_1()
+                            .border_color(rgb(theme::TEXT_SECONDARY))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child("Don't show again")
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.show_welcome = false;
+                                this.settings.show_welcome = false;
+                                this.settings.save();
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
 }
 
 /// GPUI render entry point: wires input handlers onto the map canvas and
@@ -999,6 +1123,9 @@ impl Render for TreemapView {
 
         // Build the palette overlay before the map div (while &self is free).
         let palette_overlay = self.palette.is_open().then(|| self.render_palette(vw));
+
+        // Build the welcome overlay (needs cx for click listeners).
+        let welcome_overlay = self.show_welcome.then(|| self.render_welcome(vw, cx));
 
         let title = self.window_title();
         let map = div()
@@ -1097,6 +1224,14 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
+                // While the welcome screen is open, block all keys except Esc.
+                if this.show_welcome {
+                    if e.keystroke.key.as_str() == "escape" {
+                        this.show_welcome = false;
+                        cx.notify();
+                    }
+                    return;
+                }
                 // Ctrl+P / Ctrl+T open the palette regardless of camera state.
                 if e.keystroke.modifiers.control && !e.keystroke.modifiers.shift {
                     match e.keystroke.key.as_str() {
@@ -1517,7 +1652,8 @@ impl Render for TreemapView {
                 )
                 .size_full(),
             )
-            .children(palette_overlay);
+            .children(palette_overlay)
+            .children(welcome_overlay);
 
         div()
             .relative()

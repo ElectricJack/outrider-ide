@@ -59,7 +59,7 @@ fn main() {
                 window_min_size: Some(size(px(480.), px(320.))),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| TreemapView::new(tree, layout, cx)),
+            |_, cx| cx.new(|cx| TreemapView::new(tree, layout, settings, cx)),
         )
         .expect("failed to open window");
         cx.activate(true);
