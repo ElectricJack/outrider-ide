@@ -81,7 +81,7 @@ impl Focus {
     }
 
     /// Update `last_child` for the current node's parent after a move.
-    fn record_visit(&mut self, index: &TreeIndex) {
+    pub(crate) fn record_visit(&mut self, index: &TreeIndex) {
         if let Some(p) = index.parent(&self.current) {
             self.last_child.insert(p.clone(), self.current.clone());
         }

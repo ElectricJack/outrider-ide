@@ -128,6 +128,10 @@ pub struct TreemapView {
     neighbors: Option<(SymbolId, [Option<SymbolId>; 4])>,
     /// Leaf node currently under the mouse cursor (for doc tooltip).
     hover_id: Option<SymbolId>,
+    /// Ordered list of focused SymbolIds visited via Enter/Esc/click (not arrow keys).
+    nav_history: Vec<SymbolId>,
+    /// Index into `nav_history` of the currently displayed location.
+    nav_cursor: usize,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -414,6 +418,27 @@ fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     }
 }
 
+const NAV_HISTORY_CAP: usize = 64;
+
+fn nav_push_to(hist: &mut Vec<SymbolId>, cursor: &mut usize, id: SymbolId) {
+    hist.truncate(*cursor + 1);
+    hist.push(id);
+    *cursor = hist.len() - 1;
+    if hist.len() > NAV_HISTORY_CAP {
+        let excess = hist.len() - NAV_HISTORY_CAP;
+        hist.drain(..excess);
+        *cursor -= excess;
+    }
+}
+
+fn nav_back_cursor(_hist: &[SymbolId], cursor: usize) -> Option<usize> {
+    if cursor == 0 { None } else { Some(cursor - 1) }
+}
+
+fn nav_forward_cursor(hist: &[SymbolId], cursor: usize) -> Option<usize> {
+    if cursor + 1 >= hist.len() { None } else { Some(cursor + 1) }
+}
+
 /// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
     /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
@@ -429,7 +454,7 @@ impl TreemapView {
             home_zoom: 1.0,
             drag_last: None,
             press_origin: None,
-            focus: Focus::new(root_id),
+            focus: Focus::new(root_id.clone()),
             tween: None,
             focus_handle: cx.focus_handle(),
             buffers,
@@ -438,6 +463,8 @@ impl TreemapView {
             bake_pending: false,
             neighbors: None,
             hover_id: None,
+            nav_history: vec![root_id],
+            nav_cursor: 0,
         }
     }
 
@@ -818,7 +845,9 @@ impl Render for TreemapView {
                     if let Some(id) = hit {
                         let index = TreeIndex::new(&this.tree);
                         // click sets focus; camera does NOT move (spec §2)
-                        this.focus.set(id, &index);
+                        if this.focus.set(id, &index) {
+                            nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
+                        }
                         cx.notify();
                     }
                 }),
@@ -887,12 +916,14 @@ impl Render for TreemapView {
                         if !this.focus.step_in(&index) {
                             return;
                         }
+                        nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
                         this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
                     "escape" => {
                         if !this.focus.step_out(&index) {
                             return;
                         }
+                        nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
                         this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
                     "end" => this.layout.rects.get(&this.focus.current).copied().map(|r| {
@@ -906,6 +937,28 @@ impl Render for TreemapView {
                         let c = Camera::fit(this.root_rect(), vw, vh);
                         this.home_zoom = c.zoom;
                         Some(c)
+                    }
+                    "left" if e.keystroke.modifiers.alt => {
+                        let Some(c) = nav_back_cursor(&this.nav_history, this.nav_cursor) else {
+                            return;
+                        };
+                        this.nav_cursor = c;
+                        let id = this.nav_history[c].clone();
+                        this.focus.current = id;
+                        this.focus.record_visit(&index);
+                        this.neighbors = None;
+                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                    }
+                    "right" if e.keystroke.modifiers.alt => {
+                        let Some(c) = nav_forward_cursor(&this.nav_history, this.nav_cursor) else {
+                            return;
+                        };
+                        this.nav_cursor = c;
+                        let id = this.nav_history[c].clone();
+                        this.focus.current = id;
+                        this.focus.record_visit(&index);
+                        this.neighbors = None;
+                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
                     }
                     "up" | "down" | "left" | "right" => {
                         let dir = match e.keystroke.key.as_str() {
@@ -1519,6 +1572,118 @@ mod tests {
     #[test]
     fn wrap_doc_returns_nothing_when_no_room() {
         assert!(wrap_doc("anything", 13.0, 12.0).is_empty());
+    }
+
+    #[test]
+    fn nav_history_push_and_back() {
+        use super::{nav_back_cursor, nav_push_to};
+        let ids: Vec<SymbolId> = (0..4)
+            .map(|i| SymbolId {
+                kind: SymbolKind::File,
+                qualified_path: format!("f{i}.rs"),
+                ordinal: 0,
+            })
+            .collect();
+        let mut hist = vec![ids[0].clone()];
+        let mut cursor: usize = 0;
+
+        // push 3 more
+        for id in &ids[1..] {
+            nav_push_to(&mut hist, &mut cursor, id.clone());
+        }
+        assert_eq!(hist.len(), 4);
+        assert_eq!(cursor, 3);
+
+        // back twice
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(hist[cursor], ids[2]);
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 1);
+
+        // back at beginning is None
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 0);
+        assert!(nav_back_cursor(&hist, cursor).is_none());
+    }
+
+    #[test]
+    fn nav_history_forward_after_back() {
+        use super::{nav_back_cursor, nav_forward_cursor, nav_push_to};
+        let ids: Vec<SymbolId> = (0..3)
+            .map(|i| SymbolId {
+                kind: SymbolKind::File,
+                qualified_path: format!("f{i}.rs"),
+                ordinal: 0,
+            })
+            .collect();
+        let mut hist = vec![ids[0].clone()];
+        let mut cursor: usize = 0;
+        for id in &ids[1..] {
+            nav_push_to(&mut hist, &mut cursor, id.clone());
+        }
+        // back to f1
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        assert_eq!(hist[cursor], ids[1]);
+        // forward to f2
+        cursor = nav_forward_cursor(&hist, cursor).unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(hist[cursor], ids[2]);
+        // forward at end is None
+        assert!(nav_forward_cursor(&hist, cursor).is_none());
+    }
+
+    #[test]
+    fn nav_history_push_truncates_forward() {
+        use super::{nav_back_cursor, nav_push_to};
+        let ids: Vec<SymbolId> = (0..4)
+            .map(|i| SymbolId {
+                kind: SymbolKind::File,
+                qualified_path: format!("f{i}.rs"),
+                ordinal: 0,
+            })
+            .collect();
+        let mut hist = vec![ids[0].clone()];
+        let mut cursor: usize = 0;
+        for id in &ids[1..3] {
+            nav_push_to(&mut hist, &mut cursor, id.clone());
+        }
+        // back to f0
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        cursor = nav_back_cursor(&hist, cursor).unwrap();
+        // push f3 — truncates f1, f2
+        nav_push_to(&mut hist, &mut cursor, ids[3].clone());
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0], ids[0]);
+        assert_eq!(hist[1], ids[3]);
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn nav_history_caps_at_64() {
+        use super::nav_push_to;
+        let mut hist = vec![SymbolId {
+            kind: SymbolKind::File,
+            qualified_path: "f0.rs".into(),
+            ordinal: 0,
+        }];
+        let mut cursor: usize = 0;
+        for i in 1..=70 {
+            nav_push_to(
+                &mut hist,
+                &mut cursor,
+                SymbolId {
+                    kind: SymbolKind::File,
+                    qualified_path: format!("f{i}.rs"),
+                    ordinal: 0,
+                },
+            );
+        }
+        assert_eq!(hist.len(), 64);
+        // cursor points to the most recent entry
+        assert_eq!(cursor, 63);
+        // oldest was dropped — first entry is no longer f0
+        assert_ne!(hist[0].qualified_path, "f0.rs");
     }
 
 }
