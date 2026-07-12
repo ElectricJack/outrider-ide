@@ -22,10 +22,14 @@ const TITLE_FG: u32 = 0x9a9aa4;
 const BTN_HOVER: u32 = 0x2a2a30;
 const CLOSE_HOVER: u32 = 0xc42b1c;
 
-/// The client-side titlebar: title text on the left, minimize / maximize
-/// (restore) / close buttons on the right. Dragging the body moves the
-/// window; double-clicking the body toggles maximize.
-pub fn titlebar(title: impl Into<SharedString>, window: &Window) -> impl IntoElement {
+/// The client-side titlebar: title text on the left, optional menu items in
+/// the middle, minimize / maximize / close buttons on the right. Dragging
+/// the body moves the window; double-clicking toggles maximize.
+pub fn titlebar(
+    title: impl Into<SharedString>,
+    menu: impl IntoElement,
+    window: &Window,
+) -> impl IntoElement {
     let maximize_glyph = if window.is_maximized() { "❐" } else { "□" };
     div()
         .flex()
@@ -47,6 +51,7 @@ pub fn titlebar(title: impl Into<SharedString>, window: &Window) -> impl IntoEle
                 .text_color(rgb(TITLE_FG))
                 .text_size(px(13.))
                 .child(title.into())
+                .child(menu)
                 .on_mouse_down(MouseButton::Left, |e, window, _cx| {
                     if e.click_count >= 2 {
                         window.zoom_window();
@@ -59,6 +64,10 @@ pub fn titlebar(title: impl Into<SharedString>, window: &Window) -> impl IntoEle
         .child(control_btn(maximize_glyph, BTN_HOVER, |window, _cx| window.zoom_window()))
         .child(control_btn("✕", CLOSE_HOVER, |_window, cx| cx.quit()))
 }
+
+/// Hover background for titlebar menu items — re-exported so the main
+/// view can style inline menu buttons consistently.
+pub const MENU_HOVER: u32 = BTN_HOVER;
 
 /// One window-control button: centered glyph, hover fill, press action.
 /// The glyph is chosen by the caller (e.g. maximize vs. restore), so no

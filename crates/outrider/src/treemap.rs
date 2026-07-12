@@ -1038,7 +1038,7 @@ impl TreemapView {
     fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let menu = self.context_menu.as_ref()?;
         let x = f32::from(menu.position.x);
-        let y = f32::from(menu.position.y);
+        let y = f32::from(menu.position.y) - chrome::TITLEBAR_H as f32;
         let target = menu.target.clone();
 
         // Resolve display name and path for this target.
@@ -1442,6 +1442,82 @@ impl Render for TreemapView {
         let context_menu_overlay = self.render_context_menu(cx);
 
         let title = self.window_title();
+        let file_menu = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h_full()
+            .ml(px(12.0))
+            .gap(px(2.0))
+            .child(
+                div()
+                    .id(ElementId::Name("menu-open-folder".into()))
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .text_size(px(12.))
+                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
+                    .child("Open Folder")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Open Project Folder")
+                            .pick_folder()
+                        {
+                            this.settings = crate::settings::Settings::load();
+                            match outrider_index::index_repo(
+                                &folder,
+                                &this.settings.filter_extensions,
+                                &this.settings.filter_folders,
+                            ) {
+                                Ok(tree) => {
+                                    let layout =
+                                        outrider_layout::pack(&tree, &world::pack_config());
+                                    this.file_symbols = collect_file_symbols(&tree);
+                                    this.buffers = BufferManager::new(tree.repo_root.clone());
+                                    this.textures =
+                                        TextureCache::new(rasterize::MAX_BYTES);
+                                    let root_id = tree.root.id.clone();
+                                    this.focus = Focus::new(root_id.clone());
+                                    this.nav_history = vec![root_id];
+                                    this.nav_cursor = 0;
+                                    this.neighbors = None;
+                                    this.hover_id = None;
+                                    this.camera = None;
+                                    this.palette = palette::Palette::new();
+                                    this.tree = tree;
+                                    this.layout = layout;
+                                }
+                                Err(e) => eprintln!("open folder failed: {e:#}"),
+                            }
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name("menu-settings".into()))
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .text_size(px(12.))
+                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
+                    .child("Settings")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.settings_open = !this.settings_open;
+                        if this.settings_open {
+                            this.palette.close();
+                            this.show_welcome = false;
+                            this.context_menu = None;
+                        }
+                        cx.notify();
+                    })),
+            );
         let map = div()
             .flex_grow(1.)
             .w_full()
@@ -1451,12 +1527,7 @@ impl Render for TreemapView {
             .track_focus(&self.focus_handle)
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseDownEvent, _w, cx| {
-                    // Dismiss context menu on any left-click.
-                    if this.context_menu.is_some() {
-                        this.context_menu = None;
-                        cx.notify();
-                    }
+                cx.listener(|this, e: &gpui::MouseDownEvent, _w, _cx| {
                     this.drag_last = Some(e.position);
                     this.press_origin = Some(e.position);
                 }),
@@ -1486,6 +1557,13 @@ impl Render for TreemapView {
                 gpui::MouseButton::Left,
                 cx.listener(|this, e: &gpui::MouseUpEvent, w, cx| {
                     this.drag_last = None;
+                    // Dismiss context menu on left-click release (after on_click
+                    // handlers on menu items have already fired).
+                    if this.context_menu.is_some() {
+                        this.context_menu = None;
+                        cx.notify();
+                        return;
+                    }
                     let Some(origin) = this.press_origin.take() else { return };
                     let slop = f64::from(e.position.x - origin.x)
                         .abs()
@@ -2031,7 +2109,7 @@ impl Render for TreemapView {
             .flex()
             .flex_col()
             .bg(rgb(theme::BG))
-            .child(chrome::titlebar(title, window))
+            .child(chrome::titlebar(title, file_menu, window))
             .child(map)
             .children(chrome::resize_rim(window))
     }
