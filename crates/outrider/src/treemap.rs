@@ -17,6 +17,7 @@ use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
+use crate::palette;
 use crate::chrome;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
@@ -132,6 +133,8 @@ pub struct TreemapView {
     nav_history: Vec<SymbolId>,
     /// Index into `nav_history` of the currently displayed location.
     nav_cursor: usize,
+    /// Search palette (Ctrl+P = file mode, Ctrl+T = symbol mode).
+    palette: palette::Palette,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -465,6 +468,7 @@ impl TreemapView {
             hover_id: None,
             nav_history: vec![root_id],
             nav_cursor: 0,
+            palette: palette::Palette::new(),
         }
     }
 
@@ -784,6 +788,58 @@ impl TreemapView {
         };
         (out, doc_panel)
     }
+
+    /// Build the palette overlay div (absolutely positioned, centered horizontally).
+    /// `map_w` is the map viewport width in logical pixels, used for centering.
+    fn render_palette(&self, map_w: f64) -> gpui::Div {
+        const PALETTE_W: f32 = 500.0;
+        let left_offset = ((map_w as f32 - PALETTE_W) / 2.0).max(0.0);
+        let mode_label = match self.palette.mode {
+            palette::PaletteMode::File => "File",
+            palette::PaletteMode::Symbol => "Symbol",
+        };
+        let index = TreeIndex::new(&self.tree);
+        div()
+            .absolute()
+            .top(px(60.0))
+            .left(px(left_offset))
+            .w(px(PALETTE_W))
+            .bg(rgb(theme::CODE_BG))
+            .border_1()
+            .border_color(rgb(theme::FOCUS_BORDER))
+            .rounded(px(4.0))
+            .overflow_hidden()
+            .child(
+                // Query input row
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(14.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .child(format!("[{mode_label}] {}│", self.palette.query)),
+            )
+            .children(
+                self.palette.results.iter().enumerate().map(|(i, id)| {
+                    let node = index.node(id);
+                    let name = node.map(|n| n.name.as_str()).unwrap_or("?");
+                    let path = &id.qualified_path;
+                    let selected = i == self.palette.selection;
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_size(px(13.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(if selected {
+                            rgb(theme::TEXT_PRIMARY)
+                        } else {
+                            rgb(theme::TEXT_SECONDARY)
+                        })
+                        .when(selected, |d| d.bg(rgb(0x2a2d32_u32)))
+                        .child(format!("{name}  {path}"))
+                }),
+            )
+    }
 }
 
 /// GPUI render entry point: wires input handlers onto the map canvas and
@@ -806,6 +862,9 @@ impl Render for TreemapView {
 
         let max_zoom = camera::MAX_ZOOM;
         let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+
+        // Build the palette overlay before the map div (while &self is free).
+        let palette_overlay = self.palette.is_open().then(|| self.render_palette(vw));
 
         let title = self.window_title();
         let map = div()
@@ -904,6 +963,77 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
+                // Ctrl+P / Ctrl+T open the palette regardless of camera state.
+                if e.keystroke.modifiers.control && !e.keystroke.modifiers.shift {
+                    match e.keystroke.key.as_str() {
+                        "p" => {
+                            this.palette.open(palette::PaletteMode::File, &this.tree);
+                            cx.notify();
+                            return;
+                        }
+                        "t" => {
+                            this.palette.open(palette::PaletteMode::Symbol, &this.tree);
+                            cx.notify();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // While the palette is open, all keys route to it.
+                if this.palette.is_open() {
+                    match e.keystroke.key.as_str() {
+                        "escape" => {
+                            this.palette.close();
+                            cx.notify();
+                        }
+                        "enter" => {
+                            if let Some(id) = this.palette.confirm() {
+                                this.palette.close();
+                                let index = TreeIndex::new(&this.tree);
+                                if this.focus.set(id, &index) {
+                                    nav_push_to(
+                                        &mut this.nav_history,
+                                        &mut this.nav_cursor,
+                                        this.focus.current.clone(),
+                                    );
+                                }
+                                let (vw, vh) = Self::map_viewport(w);
+                                let max_zoom = camera::MAX_ZOOM;
+                                let min_zoom = (this.home_zoom * 0.5).min(camera::MAX_ZOOM);
+                                if let Some(to) =
+                                    this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                                {
+                                    this.start_tween(to);
+                                }
+                            }
+                            cx.notify();
+                        }
+                        "up" => {
+                            this.palette.move_selection(-1);
+                            cx.notify();
+                        }
+                        "down" => {
+                            this.palette.move_selection(1);
+                            cx.notify();
+                        }
+                        "backspace" => {
+                            this.palette.backspace(&this.tree);
+                            cx.notify();
+                        }
+                        _ => {
+                            // Single printable character → type into palette.
+                            if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
+                                let mut chars = s.chars();
+                                let c = chars.next()?;
+                                if chars.next().is_none() { Some(c) } else { None }
+                            }) {
+                                this.palette.type_char(ch, &this.tree);
+                                cx.notify();
+                            }
+                        }
+                    }
+                    return;
+                }
                 if this.camera.is_none() {
                     return;
                 }
@@ -1244,7 +1374,8 @@ impl Render for TreemapView {
                     },
                 )
                 .size_full(),
-            );
+            )
+            .children(palette_overlay);
 
         div()
             .relative()
