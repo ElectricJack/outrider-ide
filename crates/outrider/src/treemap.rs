@@ -817,19 +817,46 @@ impl TreemapView {
         (out, doc_panel)
     }
 
+    /// Find a node in the tree by its ID (recursive depth-first search).
+    /// Returns a reference to the node if found, None otherwise.
+    fn find_node<'a>(root: &'a SymbolNode, id: &SymbolId) -> Option<&'a SymbolNode> {
+        if root.id == *id {
+            return Some(root);
+        }
+        root.children.iter().find_map(|c| Self::find_node(c, id))
+    }
+
     /// Build the palette overlay div (absolutely positioned, centered horizontally).
     /// `map_w` is the map viewport width in logical pixels, used for centering.
+    /// Includes an optional preview panel to the right showing metadata for the selected node.
     fn render_palette(&self, map_w: f64) -> gpui::Div {
         const PALETTE_W: f32 = 500.0;
-        let left_offset = ((map_w as f32 - PALETTE_W) / 2.0).max(0.0);
+        const PREVIEW_W: f32 = 300.0;
+        const GAP: f32 = 4.0;
+
+        let selected_node = self
+            .palette
+            .results
+            .get(self.palette.selection)
+            .and_then(|id| Self::find_node(&self.tree.root, id));
+
+        let has_preview = selected_node.is_some_and(|n| {
+            n.signature.is_some() || n.doc.is_some() || n.churn_count > 0
+        });
+
+        let total_w = if has_preview {
+            PALETTE_W + GAP + PREVIEW_W
+        } else {
+            PALETTE_W
+        };
+        let left_offset = ((map_w as f32 - total_w) / 2.0).max(0.0);
+
         let mode_label = match self.palette.mode {
             palette::PaletteMode::File => "File",
             palette::PaletteMode::Symbol => "Symbol",
         };
-        div()
-            .absolute()
-            .top(px(60.0))
-            .left(px(left_offset))
+
+        let list_div = div()
             .w(px(PALETTE_W))
             .bg(rgb(theme::CODE_BG))
             .border_1()
@@ -863,7 +890,89 @@ impl TreemapView {
                         .when(selected, |d| d.bg(rgb(0x2a2d32_u32)))
                         .child(format!("{name}  {path}"))
                 }),
-            )
+            );
+
+        let preview_div = selected_node
+            .filter(|_| has_preview)
+            .map(|node| {
+                let mut preview = div()
+                    .w(px(PREVIEW_W))
+                    .bg(rgb(theme::CODE_BG))
+                    .border_1()
+                    .border_color(rgb(theme::FOCUS_BORDER))
+                    .rounded(px(4.0))
+                    .overflow_hidden()
+                    .px(px(10.0))
+                    .py(px(8.0));
+
+                // Kind label
+                preview = preview.child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .pb(px(4.0))
+                        .child(node.id.kind.label().to_uppercase()),
+                );
+
+                // Signature
+                if let Some(sig) = &node.signature {
+                    preview = preview.child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_family(theme::FONT_FAMILY)
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .pb(px(6.0))
+                            .child(sig.clone()),
+                    );
+                }
+
+                // Doc
+                if let Some(doc) = &node.doc {
+                    preview = preview.child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_family(theme::FONT_FAMILY)
+                            .text_color(rgb(theme::DOC_COLOR))
+                            .pb(px(6.0))
+                            .child(doc.clone()),
+                    );
+                }
+
+                // Stats line: lines + churn
+                let mut stats = Vec::new();
+                if node.measure > 0 {
+                    stats.push(format!("{} lines", node.measure));
+                }
+                if node.churn_count > 0 {
+                    stats.push(format!(
+                        "{} commits (p{})",
+                        node.churn_count,
+                        (node.churn * 100.0).round() as u32
+                    ));
+                }
+                if !stats.is_empty() {
+                    preview = preview.child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_family(theme::FONT_FAMILY)
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child(stats.join(" · ")),
+                    );
+                }
+
+                preview
+            });
+
+        div()
+            .absolute()
+            .top(px(60.0))
+            .left(px(left_offset))
+            .flex()
+            .flex_row()
+            .gap(px(GAP))
+            .child(list_div)
+            .children(preview_div)
     }
 }
 
