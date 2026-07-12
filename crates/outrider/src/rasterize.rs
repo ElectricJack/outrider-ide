@@ -406,6 +406,11 @@ impl TextureCache {
         }
     }
 
+    /// True if a texture for `id` is already cached (does not queue).
+    pub fn contains(&self, id: &SymbolId) -> bool {
+        self.entries.contains_key(id)
+    }
+
     /// Cache lookup. A hit refreshes LRU recency; a miss queues the leaf
     /// for `bake_queued` at the end of the frame.
     pub fn get(&mut self, id: &SymbolId, screen_area: f64) -> Option<&LeafTexture> {

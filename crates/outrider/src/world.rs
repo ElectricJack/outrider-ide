@@ -150,15 +150,20 @@ pub struct DrawItem<'a> {
 /// Returns visible nodes in pre-order (parents before children =
 /// painter's order). Children are strictly inside their parents, so an
 /// off-screen or sub-merge node prunes its whole subtree.
+///
+/// `has_thumbnail` reports whether a container's folder texture is cached.
+/// Card-rung containers only prune their subtree when the thumbnail is
+/// ready, avoiding a blank flash before the texture appears.
 pub fn visible_nodes<'a>(
     tree: &'a SymbolTree,
     pack: &outrider_layout::PackLayout,
     camera: &Camera,
     vw: f64,
     vh: f64,
+    has_thumbnail: impl Fn(&outrider_index::SymbolId) -> bool,
 ) -> Vec<DrawItem<'a>> {
     let mut out = Vec::new();
-    walk(&tree.root, pack, camera, vw, vh, 0, &mut out);
+    walk(&tree.root, pack, camera, vw, vh, 0, &has_thumbnail, &mut out);
     out
 }
 
@@ -170,6 +175,7 @@ fn walk<'a>(
     vw: f64,
     vh: f64,
     level: u8,
+    has_thumbnail: &dyn Fn(&outrider_index::SymbolId) -> bool,
     out: &mut Vec<DrawItem<'a>>,
 ) {
     let Some(r) = pack.rects.get(&node.id) else { return };
@@ -206,13 +212,17 @@ fn walk<'a>(
         left: sx,
         full_h: ph,
     });
-    // Containers at Dot/Label/Card are too small for meaningful child
-    // rendering — skip recursion. Card-rung containers get a pre-baked
-    // thumbnail texture in the paint path instead.
-    let prune = matches!(draw, Draw::Container(Rung::Dot | Rung::Label | Rung::Card));
+    // Dot/Label containers are too small for meaningful children — always
+    // prune. Card containers prune only when a thumbnail texture is already
+    // cached so children remain visible until the thumbnail pops in.
+    let prune = match draw {
+        Draw::Container(Rung::Dot | Rung::Label) => true,
+        Draw::Container(Rung::Card) => has_thumbnail(&node.id),
+        _ => false,
+    };
     if !prune {
         for child in &node.children {
-            walk(child, pack, camera, vw, vh, level.saturating_add(1), out);
+            walk(child, pack, camera, vw, vh, level.saturating_add(1), has_thumbnail, out);
         }
     }
 }
@@ -332,7 +342,7 @@ mod tests {
         let (tree, p) = packed_example();
         // zoom 1.0 centered on g's page center (744, 355.4)
         let cam = Camera { center_x: 744.0, center_y: 355.4, zoom: 1.0 };
-        let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
+        let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
         use LeafDraw::{Label, Text};
@@ -383,7 +393,7 @@ mod tests {
         // Zoomed far out: root at Dot rung (width < LABEL_MIN_W) does
         // not recurse into children — only the root itself appears.
         let cam = Camera { center_x: 500.0, center_y: 819.6, zoom: 0.03 };
-        let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
+        let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec![""]);
         assert!(matches!(items[0].draw, Draw::Container(Rung::Dot)));
@@ -393,12 +403,12 @@ mod tests {
     fn packed_walk_prunes_offscreen_subtrees() {
         let (tree, p) = packed_example();
         let cam = Camera { center_x: 100_000.0, center_y: 100_000.0, zoom: 1.0 };
-        assert!(visible_nodes(&tree, &p, &cam, 800.0, 600.0).is_empty());
+        assert!(visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false).is_empty());
         // panned right so only b.rs's column of the map remains: a.rs's
         // right edge (488) is left of the viewport's world-left edge
         // (900 − 400 = 500) → a.rs pruned, b.rs subtree survives
         let cam = Camera { center_x: 900.0, center_y: 293.0, zoom: 1.0 };
-        let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0);
+        let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "b.rs", "f", "g"]);
     }

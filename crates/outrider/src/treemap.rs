@@ -677,7 +677,10 @@ impl TreemapView {
                 Some((focus_id.clone(), focus::neighbors(&focus_id, &self.layout, &index)));
         }
         let (_, neighbor_ids) = self.neighbors.clone().unwrap();
-        let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
+        let items = world::visible_nodes(
+            &self.tree, &self.layout, &camera, vw, vh,
+            |id| self.textures.contains(id),
+        );
         let mut out = Vec::with_capacity(items.len());
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
         let mut panel_doc: Option<(String, f32, f32, f32, f32)> = None;
@@ -1667,7 +1670,10 @@ impl Render for TreemapView {
                 cx.listener(|this, e: &gpui::MouseDownEvent, w, cx| {
                     let Some(cam) = this.camera else { return };
                     let (vw, vh) = Self::map_viewport(w);
-                    let items = world::visible_nodes(&this.tree, &this.layout, &cam, vw, vh);
+                    let items = world::visible_nodes(
+                        &this.tree, &this.layout, &cam, vw, vh,
+                        |id| this.textures.contains(id),
+                    );
                     let (mx, my) = (
                         f64::from(e.position.x),
                         f64::from(e.position.y) - chrome::TITLEBAR_H,
@@ -1703,7 +1709,10 @@ impl Render for TreemapView {
                     }
                     let Some(cam) = this.camera else { return };
                     let (vw, vh) = Self::map_viewport(w);
-                    let items = world::visible_nodes(&this.tree, &this.layout, &cam, vw, vh);
+                    let items = world::visible_nodes(
+                        &this.tree, &this.layout, &cam, vw, vh,
+                        |id| this.textures.contains(id),
+                    );
                     // the map canvas sits below the titlebar; shift window
                     // coords up by its height to get canvas coords
                     let (mx, my) =
@@ -1734,7 +1743,10 @@ impl Render for TreemapView {
                 } else {
                     let Some(cam) = this.camera else { return };
                     let (vw, vh) = Self::map_viewport(w);
-                    let items = world::visible_nodes(&this.tree, &this.layout, &cam, vw, vh);
+                    let items = world::visible_nodes(
+                        &this.tree, &this.layout, &cam, vw, vh,
+                        |id| this.textures.contains(id),
+                    );
                     let (mx, my) = (
                         f64::from(e.position.x),
                         f64::from(e.position.y) - chrome::TITLEBAR_H,
