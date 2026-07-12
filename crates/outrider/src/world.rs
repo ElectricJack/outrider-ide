@@ -212,12 +212,11 @@ fn walk<'a>(
         left: sx,
         full_h: ph,
     });
-    // Dot/Label containers are too small for meaningful children — always
-    // prune. Card containers prune only when a thumbnail texture is already
-    // cached so children remain visible until the thumbnail pops in.
+    // Containers only prune their subtree when a folder thumbnail is cached,
+    // so children stay visible until the thumbnail is ready to replace them.
+    // Children below MERGE_PX are individually culled by rung_for/leaf_draw.
     let prune = match draw {
-        Draw::Container(Rung::Dot | Rung::Label) => true,
-        Draw::Container(Rung::Card) => has_thumbnail(&node.id),
+        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => has_thumbnail(&node.id),
         _ => false,
     };
     if !prune {
@@ -388,15 +387,22 @@ mod tests {
     }
 
     #[test]
-    fn packed_walk_prunes_dot_containers() {
+    fn packed_walk_shows_children_until_thumbnail_ready() {
         let (tree, p) = packed_example();
-        // Zoomed far out: root at Dot rung (width < LABEL_MIN_W) does
-        // not recurse into children — only the root itself appears.
+        // Zoomed far out: root at Dot rung. Without a cached thumbnail,
+        // children above MERGE_PX still appear (a.rs ~48px, b.rs ~10px).
         let cam = Camera { center_x: 500.0, center_y: 819.6, zoom: 0.03 };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
-        assert_eq!(names, vec![""]);
+        assert!(names.contains(&""));
+        assert!(names.contains(&"a.rs"));
         assert!(matches!(items[0].draw, Draw::Container(Rung::Dot)));
+
+        // With a thumbnail cached for root, children are pruned.
+        let root_id = tree.root.id.clone();
+        let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |id| *id == root_id);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        assert_eq!(names, vec![""]);
     }
 
     #[test]
