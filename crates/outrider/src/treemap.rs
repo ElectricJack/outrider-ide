@@ -442,6 +442,34 @@ fn nav_forward_cursor(hist: &[SymbolId], cursor: usize) -> Option<usize> {
     if cursor + 1 >= hist.len() { None } else { Some(cursor + 1) }
 }
 
+fn resolve_fs_path(id: &SymbolId, repo_root: &std::path::Path) -> std::path::PathBuf {
+    let rel = match id.kind {
+        SymbolKind::Folder => id.qualified_path.as_str(),
+        _ => crate::buffers::BufferManager::file_path_of(&id.qualified_path),
+    };
+    repo_root.join(rel)
+}
+
+fn open_in_file_manager(path: &std::path::Path) {
+    use std::process::Command;
+
+    if cfg!(target_os = "windows") {
+        let arg = if path.is_dir() {
+            format!("{}", path.display())
+        } else {
+            format!("/select,\"{}\"", path.display())
+        };
+        let _ = Command::new("explorer.exe").arg(&arg).spawn();
+    } else {
+        let dir = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        let _ = Command::new("xdg-open").arg(&dir).spawn();
+    }
+}
+
 /// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
     /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
@@ -977,6 +1005,14 @@ impl Render for TreemapView {
                             return;
                         }
                         _ => {}
+                    }
+                }
+                // Ctrl+Shift+E: open focused file in system file manager.
+                if e.keystroke.modifiers.control && e.keystroke.modifiers.shift {
+                    if e.keystroke.key.as_str() == "e" {
+                        let path = resolve_fs_path(&this.focus.current, &this.tree.repo_root);
+                        open_in_file_manager(&path);
+                        return;
                     }
                 }
                 // While the palette is open, all keys route to it.
@@ -1817,4 +1853,52 @@ mod tests {
         assert_ne!(hist[0].qualified_path, "f0.rs");
     }
 
+
+    #[test]
+    fn resolve_fs_path_file_node() {
+        let root = std::path::Path::new("/home/user/project");
+        let id = SymbolId {
+            kind: SymbolKind::File,
+            qualified_path: "src/main.rs".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/home/user/project/src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_fs_path_item_node() {
+        let root = std::path::Path::new("/home/user/project");
+        let id = SymbolId {
+            kind: SymbolKind::Item { label: "fn".into() },
+            qualified_path: "src/lib.rs::Point::norm".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/home/user/project/src/lib.rs"));
+    }
+
+    #[test]
+    fn resolve_fs_path_chunk_node() {
+        let root = std::path::Path::new("/repo");
+        let id = SymbolId {
+            kind: SymbolKind::Chunk,
+            qualified_path: "BIG.md#2".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/repo/BIG.md"));
+    }
+
+    #[test]
+    fn resolve_fs_path_folder_node() {
+        let root = std::path::Path::new("/repo");
+        let id = SymbolId {
+            kind: SymbolKind::Folder,
+            qualified_path: "src/utils".into(),
+            ordinal: 0,
+        };
+        let path = super::resolve_fs_path(&id, root);
+        assert_eq!(path, std::path::PathBuf::from("/repo/src/utils"));
+    }
 }
