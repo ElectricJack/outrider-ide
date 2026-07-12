@@ -147,6 +147,8 @@ pub struct TreemapView {
     /// The four beam-cast arrow targets of the focused node (Left, Right,
     /// Up, Down), cached because layout is immutable per session.
     neighbors: Option<(SymbolId, [Option<SymbolId>; 4])>,
+    /// Leaf node currently under the mouse cursor (for doc tooltip).
+    hover_id: Option<SymbolId>,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -461,6 +463,7 @@ impl TreemapView {
             textures: TextureCache::new(rasterize::MAX_BYTES),
             bake_pending: false,
             neighbors: None,
+            hover_id: None,
         }
     }
 
@@ -600,7 +603,7 @@ impl TreemapView {
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh);
         let mut out = Vec::with_capacity(items.len());
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
-        let mut focus_doc: Option<(String, f32, f32, f32, f32)> = None;
+        let mut panel_doc: Option<(String, f32, f32, f32, f32)> = None;
         for item in items {
             while let Some(&(lvl, _)) = header_stack.last() {
                 if lvl >= item.level {
@@ -701,10 +704,19 @@ impl TreemapView {
                 }
             }
             let is_focused = item.node.id == focus_id;
-            if is_focused && is_leaf {
-                if let Some(doc) = &item.node.doc {
-                    focus_doc = Some((
-                        doc.clone(),
+            let is_hovered = self.hover_id.as_ref() == Some(&item.node.id);
+            if is_leaf && item.node.doc.is_some() {
+                if is_hovered {
+                    panel_doc = Some((
+                        item.node.doc.clone().unwrap(),
+                        item.px.x as f32,
+                        item.px.y as f32,
+                        item.px.w as f32,
+                        item.px.h as f32,
+                    ));
+                } else if is_focused && panel_doc.is_none() {
+                    panel_doc = Some((
+                        item.node.doc.clone().unwrap(),
                         item.px.x as f32,
                         item.px.y as f32,
                         item.px.w as f32,
@@ -735,9 +747,8 @@ impl TreemapView {
                 tex,
             });
         }
-        let doc_panel = focus_doc.and_then(|(doc, fx, fy, fw, fh)| {
-            let panel_x = fx + fw + 4.0;
-            let panel_w = DOC_PANEL_W as f32;
+        let doc_panel = panel_doc.and_then(|(doc, fx, fy, fw, _fh)| {
+            let panel_w = fw.max(DOC_PANEL_W as f32);
             let wrapped = wrap_doc(&doc, (panel_w as f64) - 2.0 * BODY_PAD, FONT_PX);
             if wrapped.is_empty() {
                 return None;
@@ -746,11 +757,11 @@ impl TreemapView {
             let mut y = fy + BODY_PAD as f32;
             for text in wrapped {
                 let runs = vec![(text.len(), theme::DOC_COLOR)];
-                rows.push(BodyText { x: panel_x + BODY_PAD as f32, y, text, runs });
+                rows.push(BodyText { x: fx + BODY_PAD as f32, y, text, runs });
                 y += LINE_STEP as f32;
             }
             let panel_h = y - fy + BODY_PAD as f32;
-            Some(DocPanel { x: panel_x, y: fy, w: panel_w, h: panel_h.min(fh), rows })
+            Some(DocPanel { x: fx, y: fy, w: panel_w, h: panel_h, rows })
         });
         self.bake_pending = if self.textures.has_queued() {
             let index = TreeIndex::new(&self.tree);
@@ -843,19 +854,33 @@ impl Render for TreemapView {
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _w, cx| {
-                if e.pressed_button != Some(gpui::MouseButton::Left) {
-                    return;
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, w, cx| {
+                if e.pressed_button == Some(gpui::MouseButton::Left) {
+                    let Some(last) = this.drag_last else { return };
+                    this.cancel_tween();
+                    let dx = f64::from(e.position.x - last.x);
+                    let dy = f64::from(e.position.y - last.y);
+                    if let Some(cam) = this.camera.as_mut() {
+                        cam.pan(dx, dy);
+                    }
+                    this.drag_last = Some(e.position);
+                    cx.notify();
+                } else {
+                    let Some(cam) = this.camera else { return };
+                    let (vw, vh) = Self::map_viewport(w);
+                    let items = world::visible_nodes(&this.tree, &this.layout, &cam, vw, vh);
+                    let (mx, my) = (
+                        f64::from(e.position.x),
+                        f64::from(e.position.y) - chrome::TITLEBAR_H,
+                    );
+                    let hit = world::hit_test(&items, mx, my)
+                        .filter(|i| matches!(i.draw, Draw::Leaf(_)))
+                        .map(|i| i.node.id.clone());
+                    if hit != this.hover_id {
+                        this.hover_id = hit;
+                        cx.notify();
+                    }
                 }
-                let Some(last) = this.drag_last else { return };
-                this.cancel_tween();
-                let dx = f64::from(e.position.x - last.x);
-                let dy = f64::from(e.position.y - last.y);
-                if let Some(cam) = this.camera.as_mut() {
-                    cam.pan(dx, dy);
-                }
-                this.drag_last = Some(e.position);
-                cx.notify();
             }))
             .on_scroll_wheel(cx.listener(move |this, e: &gpui::ScrollWheelEvent, w, cx| {
                 this.cancel_tween();
