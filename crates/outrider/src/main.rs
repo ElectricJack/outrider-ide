@@ -26,10 +26,16 @@ use crate::treemap::TreemapView;
 /// Index the repo passed as `argv[1]` (or cwd), pack the layout, and open
 /// the main treemap window.
 fn main() {
-    let repo = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().expect("no working directory"));
+    let repo = match std::env::args().nth(1).map(PathBuf::from) {
+        Some(p) => p,
+        None => match rfd::FileDialog::new()
+            .set_title("Open Project Folder")
+            .pick_folder()
+        {
+            Some(p) => p,
+            None => return, // user cancelled
+        },
+    };
     let settings = settings::Settings::load();
     eprintln!("indexing {}…", repo.display());
     let tree = match outrider_index::index_repo(&repo, &settings.filter_extensions, &settings.filter_folders) {
