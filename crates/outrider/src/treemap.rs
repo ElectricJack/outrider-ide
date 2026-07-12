@@ -471,12 +471,24 @@ fn open_in_file_manager(path: &std::path::Path) {
     use std::process::Command;
 
     if cfg!(target_os = "windows") {
-        let arg = if path.is_dir() {
-            format!("{}", path.display())
+        if path.is_dir() {
+            let _ = Command::new("explorer.exe").arg(path).spawn();
         } else {
-            format!("/select,\"{}\"", path.display())
-        };
-        let _ = Command::new("explorer.exe").arg(&arg).spawn();
+            let _ = Command::new("explorer.exe")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+        }
+    } else if std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists() {
+        if let Ok(output) = Command::new("wslpath").arg("-w").arg(path).output() {
+            let win_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_dir() {
+                let _ = Command::new("explorer.exe").arg(&win_path).spawn();
+            } else {
+                let _ = Command::new("explorer.exe")
+                    .arg(format!("/select,{win_path}"))
+                    .spawn();
+            }
+        }
     } else {
         let dir = if path.is_dir() {
             path.to_path_buf()
@@ -1051,9 +1063,23 @@ impl TreemapView {
             .unwrap_or(&fs_path)
             .to_string_lossy()
             .into_owned();
-        let copy_path_str = rel_path.clone();
+        let copy_rel_str = rel_path.clone();
+        let copy_abs_str = fs_path.to_string_lossy().into_owned();
         let copy_name_str = node_name.clone();
         let open_path = fs_path.clone();
+
+        let row = |id: &'static str, label: &'static str| {
+            div()
+                .id(ElementId::Name(id.into()))
+                .px(px(12.0))
+                .py(px(7.0))
+                .text_size(px(13.0))
+                .font_family(theme::FONT_FAMILY_SANS)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(0x2a3040_u32)))
+                .child(label)
+        };
 
         let menu_div = div()
             .absolute()
@@ -1066,54 +1092,32 @@ impl TreemapView {
             .rounded(px(4.0))
             .overflow_hidden()
             .shadow_lg()
-            // "Open in File Manager" row
             .child(
-                div()
-                    .id(ElementId::Name("ctx-open-fm".into()))
-                    .px(px(12.0))
-                    .py(px(7.0))
-                    .text_size(px(13.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::TEXT_PRIMARY))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(0x2a3040_u32)))
-                    .child("Open in File Manager")
+                row("ctx-open-fm", "Open File Location")
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         open_in_file_manager(&open_path);
                         this.context_menu = None;
                         cx.notify();
                     })),
             )
-            // "Copy Path" row
             .child(
-                div()
-                    .id(ElementId::Name("ctx-copy-path".into()))
-                    .px(px(12.0))
-                    .py(px(7.0))
-                    .text_size(px(13.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::TEXT_PRIMARY))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(0x2a3040_u32)))
-                    .child("Copy Path")
+                row("ctx-copy-rel", "Copy Relative Path")
                     .on_click(cx.listener(move |this, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_path_str.clone()));
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_rel_str.clone()));
                         this.context_menu = None;
                         cx.notify();
                     })),
             )
-            // "Copy Name" row
             .child(
-                div()
-                    .id(ElementId::Name("ctx-copy-name".into()))
-                    .px(px(12.0))
-                    .py(px(7.0))
-                    .text_size(px(13.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::TEXT_PRIMARY))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(0x2a3040_u32)))
-                    .child("Copy Name")
+                row("ctx-copy-abs", "Copy Absolute Path")
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_abs_str.clone()));
+                        this.context_menu = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                row("ctx-copy-name", "Copy Name")
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_name_str.clone()));
                         this.context_menu = None;
