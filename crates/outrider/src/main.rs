@@ -8,6 +8,7 @@ mod chrome;
 mod content;
 mod focus;
 mod rasterize;
+mod palette;
 mod theme;
 mod treemap;
 mod world;
