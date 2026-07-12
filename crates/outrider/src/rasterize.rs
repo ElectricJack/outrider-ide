@@ -1,6 +1,9 @@
 //! Bakes far-zoom leaf source text into low-res BGRA images with a CPU
 //! mip chain (spec: docs/superpowers/specs/2026-07-11-texture-leaf-rendering-design.md).
 
+use std::hash::{Hash, Hasher};
+use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
@@ -236,13 +239,15 @@ use std::collections::HashMap;
 /// Maximum pixel dimension (longer side) for a folder thumbnail texture.
 const FOLDER_TEX_MAX: f64 = 256.0;
 
-/// Rasterize a container's subtree as colored rectangles into a mipped texture.
-/// No text — just the box layout with theme-correct fills and borders.
+/// Rasterize a container's subtree into a mipped texture. Leaf children
+/// with an already-cached text texture get composited at the target
+/// resolution; others fall back to themed colored rectangles.
 pub fn bake_folder(
     node: &SymbolNode,
     container_rect: Rect,
     layout: &PackLayout,
     base_level: u8,
+    leaf_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
 ) -> LeafTexture {
     if node.children.is_empty() || container_rect.w < 1.0 || container_rect.h < 1.0 {
         return LeafTexture { levels: Vec::new(), bytes: 0 };
@@ -257,7 +262,7 @@ pub fn bake_folder(
     let sy = th as f64 / container_rect.h;
 
     let mut rgba = vec![0u8; (tw as usize) * (th as usize) * 4];
-    folder_fill(node, &container_rect, layout, sx, sy, tw, th, &mut rgba, base_level + 1);
+    folder_fill(node, &container_rect, layout, sx, sy, tw, th, &mut rgba, base_level + 1, leaf_tex);
 
     for p in rgba.chunks_exact_mut(4) {
         p.swap(0, 2);
@@ -280,6 +285,8 @@ pub fn bake_folder(
 }
 
 /// Recursively fill descendant rectangles into the RGBA buffer.
+/// For leaf children with a cached texture, composites the BGRA pixels
+/// (scaled to fit the destination rect) on top of the fill.
 fn folder_fill(
     node: &SymbolNode,
     root: &Rect,
@@ -290,6 +297,7 @@ fn folder_fill(
     th: u32,
     rgba: &mut [u8],
     level: u8,
+    leaf_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
 ) {
     for child in &node.children {
         let Some(r) = layout.rects.get(&child.id) else { continue };
@@ -344,6 +352,15 @@ fn folder_fill(
             }
         }
 
+        if is_leaf {
+            if let Some(src_bgra) = leaf_tex(&child.id) {
+                composite_leaf(
+                    &src_bgra, pw as u32, ph as u32,
+                    px, py, tw, th, rgba,
+                );
+            }
+        }
+
         if child.churn > 0.0 {
             let heat = theme::churn_heat(child.churn);
             let (hr, hg, hb) = rgb_u8(heat);
@@ -359,7 +376,68 @@ fn folder_fill(
         }
 
         if !child.children.is_empty() {
-            folder_fill(child, root, layout, sx, sy, tw, th, rgba, level.saturating_add(1));
+            folder_fill(child, root, layout, sx, sy, tw, th, rgba, level.saturating_add(1), leaf_tex);
+        }
+    }
+}
+
+/// Nearest-neighbor scale a BGRA source into the destination RGBA buffer,
+/// blending non-transparent pixels via src-over. The source bytes are
+/// from a RenderImage which stores BGRA; we swap channels on read.
+fn composite_leaf(
+    src_bgra: &[u8],
+    dst_w: u32,
+    dst_h: u32,
+    dst_x: i32,
+    dst_y: i32,
+    buf_w: u32,
+    buf_h: u32,
+    rgba: &mut [u8],
+) {
+    if src_bgra.len() < 4 {
+        return;
+    }
+    let src_px = src_bgra.len() / 4;
+    let src_w = (src_px as f64).sqrt().ceil() as u32;
+    let src_h = if src_w > 0 { src_px as u32 / src_w } else { return };
+    if src_w == 0 || src_h == 0 {
+        return;
+    }
+    let inner_x = dst_x + 1;
+    let inner_y = dst_y + 1;
+    let inner_w = (dst_w as i32 - 2).max(0) as u32;
+    let inner_h = (dst_h as i32 - 2).max(0) as u32;
+    if inner_w == 0 || inner_h == 0 {
+        return;
+    }
+    for oy in 0..inner_h {
+        let dy = inner_y + oy as i32;
+        if dy < 0 || dy >= buf_h as i32 {
+            continue;
+        }
+        let sy = (oy as u64 * src_h as u64 / inner_h as u64) as u32;
+        for ox in 0..inner_w {
+            let dx = inner_x + ox as i32;
+            if dx < 0 || dx >= buf_w as i32 {
+                continue;
+            }
+            let sx = (ox as u64 * src_w as u64 / inner_w as u64) as u32;
+            let si = (sy * src_w + sx) as usize * 4;
+            if si + 3 >= src_bgra.len() {
+                continue;
+            }
+            let a = src_bgra[si + 3];
+            if a == 0 {
+                continue;
+            }
+            let di = (dy as u32 * buf_w + dx as u32) as usize * 4;
+            blend(
+                &mut rgba[di..di + 4],
+                src_bgra[si + 2], // B→R (BGRA→RGBA)
+                src_bgra[si + 1],
+                src_bgra[si],     // R→B
+                a,
+            );
         }
     }
 }
@@ -370,8 +448,10 @@ fn rgb_u8(c: u32) -> (u8, u8, u8) {
 
 /// Bakes per frame; keeps zoom-out pop-in bounded without stalling a frame.
 pub const BAKES_PER_FRAME: usize = 4;
-/// Total texture budget across all levels of all cached leaves.
-pub const MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Default in-memory texture budget (256 MB), used by tests; production
+/// reads from `Settings::cache_mb`.
+#[cfg(test)]
+const DEFAULT_CACHE_MB: u32 = 256;
 
 /// Single cache slot: baked texture plus a logical clock tick for LRU ordering.
 struct Entry {
@@ -379,8 +459,70 @@ struct Entry {
     last_used: u64,
 }
 
+fn disk_key(id: &SymbolId) -> String {
+    let mut h = std::hash::DefaultHasher::new();
+    id.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn save_to_disk(dir: &std::path::Path, id: &SymbolId, tex: &LeafTexture) {
+    if tex.levels.is_empty() {
+        return;
+    }
+    let path = dir.join(format!("{}.tex", disk_key(id)));
+    let Ok(mut f) = std::fs::File::create(&path) else { return };
+    let n = tex.levels.len() as u32;
+    let _ = f.write_all(&n.to_le_bytes());
+    for level in &tex.levels {
+        let sz = level.size(0);
+        let w = sz.width.0 as u32;
+        let h = sz.height.0 as u32;
+        let _ = f.write_all(&w.to_le_bytes());
+        let _ = f.write_all(&h.to_le_bytes());
+        if let Some(bytes) = level.as_bytes(0) {
+            let len = bytes.len() as u32;
+            let _ = f.write_all(&len.to_le_bytes());
+            let _ = f.write_all(bytes);
+        } else {
+            let _ = f.write_all(&0u32.to_le_bytes());
+        }
+    }
+}
+
+fn load_from_disk(dir: &std::path::Path, id: &SymbolId) -> Option<LeafTexture> {
+    let path = dir.join(format!("{}.tex", disk_key(id)));
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut buf4 = [0u8; 4];
+    f.read_exact(&mut buf4).ok()?;
+    let n = u32::from_le_bytes(buf4) as usize;
+    if n == 0 || n > 20 {
+        return None;
+    }
+    let mut levels = Vec::with_capacity(n);
+    let mut bytes = 0usize;
+    for _ in 0..n {
+        f.read_exact(&mut buf4).ok()?;
+        let w = u32::from_le_bytes(buf4);
+        f.read_exact(&mut buf4).ok()?;
+        let h = u32::from_le_bytes(buf4);
+        f.read_exact(&mut buf4).ok()?;
+        let len = u32::from_le_bytes(buf4) as usize;
+        if len == 0 || w == 0 || h == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; len];
+        f.read_exact(&mut data).ok()?;
+        bytes += data.len();
+        let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, data)?;
+        levels.push(Arc::new(RenderImage::new(vec![Frame::new(img)])));
+    }
+    Some(LeafTexture { levels, bytes })
+}
+
 /// Per-leaf texture cache: misses queue during the item pass, then
 /// `bake_queued` bakes the largest few and LRU-evicts past the budget.
+/// Textures are persisted to disk so evicted entries can be reloaded
+/// without re-rendering.
 pub struct TextureCache {
     raster: Rasterizer,
     entries: HashMap<SymbolId, Entry>,
@@ -389,12 +531,18 @@ pub struct TextureCache {
     max_bytes: usize,
     queue: Vec<(SymbolId, f64)>,
     retired: Vec<Arc<RenderImage>>,
+    disk_dir: Option<PathBuf>,
 }
 
 /// LRU cache management, miss queuing, and frame-gated baking.
 impl TextureCache {
     /// Create a cache with `max_bytes` total budget across all mip levels.
     pub fn new(max_bytes: usize) -> Self {
+        let disk_dir = dirs::cache_dir().map(|d| {
+            let p = d.join("outrider").join("textures");
+            let _ = std::fs::create_dir_all(&p);
+            p
+        });
         Self {
             raster: Rasterizer::new(),
             entries: HashMap::new(),
@@ -403,6 +551,7 @@ impl TextureCache {
             max_bytes,
             queue: Vec::new(),
             retired: Vec::new(),
+            disk_dir,
         }
     }
 
@@ -411,23 +560,42 @@ impl TextureCache {
         self.entries.contains_key(id)
     }
 
-    /// Cache lookup. A hit refreshes LRU recency; a miss queues the leaf
-    /// for `bake_queued` at the end of the frame.
+    /// Cache lookup. A hit refreshes LRU recency; a miss checks the disk
+    /// cache first, then queues the leaf for `bake_queued`.
     pub fn get(&mut self, id: &SymbolId, screen_area: f64) -> Option<&LeafTexture> {
         self.clock += 1;
         if self.entries.contains_key(id) {
             let e = self.entries.get_mut(id).unwrap();
             e.last_used = self.clock;
-            Some(&e.tex)
-        } else {
-            self.queue.push((id.clone(), screen_area));
-            None
+            return Some(&e.tex);
         }
+        if let Some(dir) = &self.disk_dir {
+            if let Some(tex) = load_from_disk(dir, id) {
+                self.bytes += tex.bytes;
+                self.entries.insert(id.clone(), Entry { tex, last_used: self.clock });
+                return Some(&self.entries.get(id).unwrap().tex);
+            }
+        }
+        self.queue.push((id.clone(), screen_area));
+        None
     }
 
     /// True when at least one miss is queued and `bake_queued` should be called.
     pub fn has_queued(&self) -> bool {
         !self.queue.is_empty()
+    }
+
+    /// Snapshot of the smallest mip-level BGRA bytes for all cached entries.
+    /// Used by `bake_folder` to composite leaf text into folder thumbnails.
+    pub fn leaf_bytes_snapshot(&self) -> HashMap<SymbolId, Vec<u8>> {
+        self.entries
+            .iter()
+            .filter_map(|(id, e)| {
+                let level = e.tex.levels.last()?;
+                let bytes = level.as_bytes(0)?;
+                Some((id.clone(), bytes.to_vec()))
+            })
+            .collect()
     }
 
     /// Bake up to BAKES_PER_FRAME queued items, largest on screen first,
@@ -445,6 +613,9 @@ impl TextureCache {
         for (id, _) in it.by_ref().take(BAKES_PER_FRAME) {
             let tex = bake_fn(&id, &mut self.raster)
                 .unwrap_or_else(|| LeafTexture { levels: Vec::new(), bytes: 0 });
+            if let Some(dir) = &self.disk_dir {
+                save_to_disk(dir, &id, &tex);
+            }
             self.bytes += tex.bytes;
             self.clock += 1;
             self.entries.insert(id, Entry { tex, last_used: self.clock });
@@ -470,6 +641,34 @@ impl TextureCache {
     /// atlas memory is actually reclaimed.
     pub fn take_retired(&mut self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut self.retired)
+    }
+
+    /// Wipe the on-disk texture cache (e.g. when opening a new folder).
+    pub fn clear_disk_cache(&self) {
+        if let Some(dir) = &self.disk_dir {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("tex") {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn new_memory_only(max_bytes: usize) -> Self {
+        Self {
+            raster: Rasterizer::new(),
+            entries: HashMap::new(),
+            clock: 0,
+            bytes: 0,
+            max_bytes,
+            queue: Vec::new(),
+            retired: Vec::new(),
+            disk_dir: None,
+        }
     }
 
     #[cfg(test)]
@@ -585,7 +784,7 @@ mod tests {
 
     #[test]
     fn cache_bakes_largest_first_within_budget() {
-        let mut cache = TextureCache::new(MAX_BYTES);
+        let mut cache = TextureCache::new_memory_only(DEFAULT_CACHE_MB as usize * 1024 * 1024);
         for i in 0..6 {
             assert!(cache.get(&sid(&format!("l{i}")), (i + 1) as f64 * 10.0).is_none());
         }
@@ -603,7 +802,7 @@ mod tests {
 
     #[test]
     fn cache_negative_caches_leaves_without_lines() {
-        let mut cache = TextureCache::new(MAX_BYTES);
+        let mut cache = TextureCache::new_memory_only(DEFAULT_CACHE_MB as usize * 1024 * 1024);
         assert!(cache.get(&sid("nofile"), 1.0).is_none());
         assert!(!cache.bake_queued(|_, _| None));
         let tex = cache.get(&sid("nofile"), 1.0).expect("negative-cached");
@@ -613,7 +812,7 @@ mod tests {
 
     #[test]
     fn cache_evicts_lru_and_retires_images() {
-        let mut cache = TextureCache::new(usize::MAX);
+        let mut cache = TextureCache::new_memory_only(usize::MAX);
         cache.get(&sid("a"), 1.0);
         cache.bake_queued(|_, r| some_tex(4, r));
         let one = cache.get(&sid("a"), 1.0).unwrap().bytes;
@@ -629,7 +828,7 @@ mod tests {
 
     #[test]
     fn cache_hit_refreshes_lru_order() {
-        let mut cache = TextureCache::new(usize::MAX);
+        let mut cache = TextureCache::new_memory_only(usize::MAX);
         cache.get(&sid("a"), 1.0);
         cache.bake_queued(|_, r| some_tex(4, r));
         cache.get(&sid("b"), 1.0);

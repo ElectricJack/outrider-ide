@@ -529,7 +529,7 @@ impl TreemapView {
             focus_handle: cx.focus_handle(),
             buffers,
             file_symbols,
-            textures: TextureCache::new(rasterize::MAX_BYTES),
+            textures: TextureCache::new(settings.cache_mb as usize * 1024 * 1024),
             bake_pending: false,
             neighbors: None,
             hover_id: None,
@@ -855,12 +855,14 @@ impl TreemapView {
             let buffers = &mut self.buffers;
             let file_symbols = &self.file_symbols;
             let layout = &self.layout;
+            let leaf_snap = self.textures.leaf_bytes_snapshot();
             self.textures.bake_queued(|id, rasterizer| {
                 let node = index.node(id)?;
                 if !content::is_leaf_item(node) {
                     let rect = layout.rects.get(id)?;
                     let level = index.depth(id).unwrap_or(0) as u8;
-                    return Some(rasterize::bake_folder(node, *rect, layout, level));
+                    let leaf_tex = |lid: &outrider_index::SymbolId| leaf_snap.get(lid).cloned();
+                    return Some(rasterize::bake_folder(node, *rect, layout, level, &leaf_tex));
                 }
                 let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
                 let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -1065,6 +1067,7 @@ impl TreemapView {
             *r.lock().unwrap() = Some(res.map_err(|e| format!("{e:#}")));
         });
 
+        self.textures.clear_disk_cache();
         self.palette.close();
         self.show_welcome = false;
         self.settings_open = false;
@@ -1084,7 +1087,7 @@ impl TreemapView {
                 let layout = outrider_layout::pack(&tree, &world::pack_config());
                 self.file_symbols = collect_file_symbols(&tree);
                 self.buffers = BufferManager::new(tree.repo_root.clone());
-                self.textures = TextureCache::new(rasterize::MAX_BYTES);
+                self.textures = TextureCache::new(self.settings.cache_mb as usize * 1024 * 1024);
                 let root_id = tree.root.id.clone();
                 self.focus = Focus::new(root_id.clone());
                 self.nav_history = vec![root_id];
@@ -1360,6 +1363,27 @@ impl TreemapView {
                     .flex_wrap()
                     .gap(px(4.0))
                     .children(folder_list),
+            )
+            // Cache Size label
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::FOCUS_BORDER))
+                    .pb(px(4.0))
+                    .child("Texture Cache (MB):"),
+            )
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .mb(px(12.0))
+                    .bg(rgb(0x1a1d21_u32))
+                    .rounded(px(3.0))
+                    .text_size(px(12.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(format!("{}", self.settings.cache_mb)),
             )
             // Settings file path
             .child(

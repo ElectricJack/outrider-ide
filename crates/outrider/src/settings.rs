@@ -6,6 +6,12 @@ pub struct Settings {
     pub filter_extensions: Vec<String>,
     pub filter_folders: Vec<String>,
     pub show_welcome: bool,
+    #[serde(default = "default_cache_mb")]
+    pub cache_mb: u32,
+}
+
+fn default_cache_mb() -> u32 {
+    256
 }
 
 impl Default for Settings {
@@ -29,6 +35,7 @@ impl Default for Settings {
             .map(String::from)
             .collect(),
             show_welcome: true,
+            cache_mb: default_cache_mb(),
         }
     }
 }
