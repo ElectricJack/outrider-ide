@@ -79,6 +79,14 @@ impl Palette {
         self.results.get(self.selection).cloned()
     }
 
+    pub fn name_of(&self, id: &SymbolId) -> &str {
+        self.candidates
+            .iter()
+            .find(|(cid, _)| cid == id)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("?")
+    }
+
     fn refilter(&mut self) {
         self.results = self
             .candidates

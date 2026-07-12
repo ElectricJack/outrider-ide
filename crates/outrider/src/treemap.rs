@@ -826,7 +826,6 @@ impl TreemapView {
             palette::PaletteMode::File => "File",
             palette::PaletteMode::Symbol => "Symbol",
         };
-        let index = TreeIndex::new(&self.tree);
         div()
             .absolute()
             .top(px(60.0))
@@ -838,7 +837,6 @@ impl TreemapView {
             .rounded(px(4.0))
             .overflow_hidden()
             .child(
-                // Query input row
                 div()
                     .px(px(8.0))
                     .py(px(6.0))
@@ -849,8 +847,7 @@ impl TreemapView {
             )
             .children(
                 self.palette.results.iter().enumerate().map(|(i, id)| {
-                    let node = index.node(id);
-                    let name = node.map(|n| n.name.as_str()).unwrap_or("?");
+                    let name = self.palette.name_of(id);
                     let path = &id.qualified_path;
                     let selected = i == self.palette.selection;
                     div()
