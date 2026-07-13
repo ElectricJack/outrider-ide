@@ -736,7 +736,9 @@ impl TreemapView {
                         header_stack
                             .push((item.level, pin_y + header_bg_h as f64));
                     }
-                    if rung == Rung::Card && !item.node.children.is_empty() {
+                    if matches!(rung, Rung::Dot | Rung::Label | Rung::Card)
+                        && !item.node.children.is_empty()
+                    {
                         let area = item.px.w * item.px.h;
                         if let Some(t) = self.textures.get(&item.node.id, area) {
                             if let Some(img) = &t.image {
