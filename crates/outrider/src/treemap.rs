@@ -1053,6 +1053,370 @@ impl TreemapView {
             .children(preview_div)
     }
 
+    fn render_file_menu(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h_full()
+            .ml(px(12.0))
+            .gap(px(2.0))
+            .child(
+                div()
+                    .id(ElementId::Name("menu-open-folder".into()))
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .text_size(px(12.))
+                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
+                    .child("Open Folder")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Open Project Folder")
+                            .pick_folder()
+                        {
+                            this.settings = crate::settings::Settings::load();
+                            this.start_loading(folder);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name("menu-settings".into()))
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .text_size(px(12.))
+                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
+                    .child("Settings")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.settings_open = !this.settings_open;
+                        if this.settings_open {
+                            this.palette.close();
+                            this.show_welcome = false;
+                            this.context_menu = None;
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn on_right_press(&mut self, e: &gpui::MouseDownEvent, window: &Window, cx: &mut Context<Self>) {
+        let Some(cam) = self.camera else { return };
+        let (vw, vh) = Self::map_viewport(window);
+        let items = world::visible_nodes(
+            &self.tree, &self.layout, &cam, vw, vh,
+            |id| self.textures.contains(id),
+        );
+        let (mx, my) = (
+            f64::from(e.position.x),
+            f64::from(e.position.y) - chrome::TITLEBAR_H,
+        );
+        if let Some(hit) = world::hit_test(&items, mx, my) {
+            self.context_menu = Some(ContextMenu {
+                position: e.position,
+                target: hit.node.id.clone(),
+            });
+        } else {
+            self.context_menu = None;
+        }
+        cx.notify();
+    }
+
+    fn on_left_release(&mut self, e: &gpui::MouseUpEvent, window: &Window, cx: &mut Context<Self>) {
+        self.drag_last = None;
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
+        let Some(origin) = self.press_origin.take() else { return };
+        let slop = f64::from(e.position.x - origin.x)
+            .abs()
+            .max(f64::from(e.position.y - origin.y).abs());
+        if slop > 4.0 {
+            return;
+        }
+        let Some(cam) = self.camera else { return };
+        let (vw, vh) = Self::map_viewport(window);
+        let items = world::visible_nodes(
+            &self.tree, &self.layout, &cam, vw, vh,
+            |id| self.textures.contains(id),
+        );
+        let (mx, my) =
+            (f64::from(e.position.x), f64::from(e.position.y) - chrome::TITLEBAR_H);
+        let hit = world::hit_test(&items, mx, my).map(|i| i.node.id.clone());
+        drop(items);
+        if let Some(id) = hit {
+            let index = TreeIndex::new(&self.tree);
+            if self.focus.set(id, &index) {
+                nav_push_to(&mut self.nav_history, &mut self.nav_cursor, self.focus.current.clone());
+            }
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_move(&mut self, e: &gpui::MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        if e.pressed_button == Some(gpui::MouseButton::Left) {
+            let Some(last) = self.drag_last else { return };
+            self.cancel_tween();
+            let dx = f64::from(e.position.x - last.x);
+            let dy = f64::from(e.position.y - last.y);
+            if let Some(cam) = self.camera.as_mut() {
+                cam.pan(dx, dy);
+            }
+            self.drag_last = Some(e.position);
+            cx.notify();
+        } else {
+            let Some(cam) = self.camera else { return };
+            let (vw, vh) = Self::map_viewport(window);
+            let items = world::visible_nodes(
+                &self.tree, &self.layout, &cam, vw, vh,
+                |id| self.textures.contains(id),
+            );
+            let (mx, my) = (
+                f64::from(e.position.x),
+                f64::from(e.position.y) - chrome::TITLEBAR_H,
+            );
+            let hit = world::hit_test(&items, mx, my)
+                .filter(|i| i.node.doc.is_some())
+                .map(|i| i.node.id.clone());
+            if hit != self.hover_id {
+                self.hover_id = hit;
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_scroll(&mut self, e: &gpui::ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        self.cancel_tween();
+        let dy = match e.delta {
+            gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
+            gpui::ScrollDelta::Lines(l) => l.y as f64 * 40.0,
+        };
+        let (vw, vh) = Self::map_viewport(window);
+        let max_zoom = camera::MAX_ZOOM;
+        let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+        if let Some(cam) = self.camera.as_mut() {
+            let factor = (dy * 0.002).exp();
+            cam.zoom_about(
+                f64::from(e.position.x),
+                f64::from(e.position.y) - chrome::TITLEBAR_H,
+                vw,
+                vh,
+                factor,
+                min_zoom,
+                max_zoom,
+            );
+        }
+        cx.notify();
+    }
+
+    fn on_key_down(&mut self, e: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.context_menu.is_some() && e.keystroke.key.as_str() == "escape" {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
+        if self.show_welcome {
+            if e.keystroke.key.as_str() == "escape" {
+                self.show_welcome = false;
+                cx.notify();
+            }
+            return;
+        }
+        if e.keystroke.modifiers.control && !e.keystroke.modifiers.shift {
+            match e.keystroke.key.as_str() {
+                "p" => {
+                    self.palette.open(palette::PaletteMode::File, &self.tree);
+                    self.settings_open = false;
+                    self.context_menu = None;
+                    cx.notify();
+                    return;
+                }
+                "t" => {
+                    self.palette.open(palette::PaletteMode::Symbol, &self.tree);
+                    self.settings_open = false;
+                    self.context_menu = None;
+                    cx.notify();
+                    return;
+                }
+                "," => {
+                    self.settings_open = !self.settings_open;
+                    if self.settings_open {
+                        self.palette.close();
+                        self.show_welcome = false;
+                        self.context_menu = None;
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.settings_open {
+            if e.keystroke.key.as_str() == "escape" {
+                self.settings_open = false;
+                cx.notify();
+            }
+            return;
+        }
+        if e.keystroke.modifiers.control && e.keystroke.modifiers.shift {
+            if e.keystroke.key.as_str() == "e" {
+                let path = resolve_fs_path(&self.focus.current, &self.tree.repo_root);
+                open_in_file_manager(&path);
+                return;
+            }
+        }
+        if self.palette.is_open() {
+            self.on_palette_key(e, window, cx);
+            return;
+        }
+        self.on_nav_key(e, window, cx);
+    }
+
+    fn on_palette_key(&mut self, e: &gpui::KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+        match e.keystroke.key.as_str() {
+            "escape" => {
+                self.palette.close();
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(id) = self.palette.confirm() {
+                    self.palette.close();
+                    let index = TreeIndex::new(&self.tree);
+                    if self.focus.set(id, &index) {
+                        nav_push_to(
+                            &mut self.nav_history,
+                            &mut self.nav_cursor,
+                            self.focus.current.clone(),
+                        );
+                    }
+                    let (vw, vh) = Self::map_viewport(window);
+                    let max_zoom = camera::MAX_ZOOM;
+                    let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+                    if let Some(to) =
+                        self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                    {
+                        self.start_tween(to);
+                    }
+                }
+                cx.notify();
+            }
+            "up" => {
+                self.palette.move_selection(-1);
+                cx.notify();
+            }
+            "down" => {
+                self.palette.move_selection(1);
+                cx.notify();
+            }
+            "backspace" => {
+                self.palette.backspace(&self.tree);
+                cx.notify();
+            }
+            _ => {
+                if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
+                    let mut chars = s.chars();
+                    let c = chars.next()?;
+                    if chars.next().is_none() { Some(c) } else { None }
+                }) {
+                    self.palette.type_char(ch, &self.tree);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn on_nav_key(&mut self, e: &gpui::KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+        if self.camera.is_none() {
+            return;
+        }
+        let (vw, vh) = Self::map_viewport(window);
+        let max_zoom = camera::MAX_ZOOM;
+        let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+        let index = TreeIndex::new(&self.tree);
+        let target = match e.keystroke.key.as_str() {
+            "enter" => {
+                if !self.focus.step_in(&index) {
+                    return;
+                }
+                nav_push_to(&mut self.nav_history, &mut self.nav_cursor, self.focus.current.clone());
+                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+            }
+            "escape" => {
+                if !self.focus.step_out(&index) {
+                    return;
+                }
+                nav_push_to(&mut self.nav_history, &mut self.nav_cursor, self.focus.current.clone());
+                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+            }
+            "end" => self.layout.rects.get(&self.focus.current).copied().map(|r| {
+                self.frame_below_headers(&index, r, vw, vh, |vh_eff| {
+                    camera::frame_rect(
+                        r, vw, vh_eff, camera::END_FRACTION, min_zoom, max_zoom,
+                    )
+                })
+            }),
+            "home" => {
+                let c = Camera::fit(self.root_rect(), vw, vh);
+                self.home_zoom = c.zoom;
+                Some(c)
+            }
+            "left" if e.keystroke.modifiers.alt => {
+                let Some(c) = nav_back_cursor(&self.nav_history, self.nav_cursor) else {
+                    return;
+                };
+                self.nav_cursor = c;
+                let id = self.nav_history[c].clone();
+                self.focus.current = id;
+                self.focus.record_visit(&index);
+                self.neighbors = None;
+                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+            }
+            "right" if e.keystroke.modifiers.alt => {
+                let Some(c) = nav_forward_cursor(&self.nav_history, self.nav_cursor) else {
+                    return;
+                };
+                self.nav_cursor = c;
+                let id = self.nav_history[c].clone();
+                self.focus.current = id;
+                self.focus.record_visit(&index);
+                self.neighbors = None;
+                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+            }
+            "up" | "down" | "left" | "right" => {
+                let dir = match e.keystroke.key.as_str() {
+                    "up" => focus::Dir::Up,
+                    "down" => focus::Dir::Down,
+                    "left" => focus::Dir::Left,
+                    _ => focus::Dir::Right,
+                };
+                let Some(next) =
+                    focus::spatial_step(&self.focus.current, dir, &self.layout, &index)
+                else {
+                    return;
+                };
+                if !self.focus.set(next, &index) {
+                    return;
+                }
+                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+            }
+            _ => return,
+        };
+        if let Some(to) = target {
+            self.start_tween(to);
+            cx.notify();
+        }
+    }
+
     /// Re-run indexing in the background after settings change.
     fn reindex(&mut self) {
         let repo = self.tree.repo_root.clone();
@@ -1633,9 +1997,6 @@ impl Render for TreemapView {
             window.request_animation_frame();
         }
 
-        let max_zoom = camera::MAX_ZOOM;
-        let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
-
         // Build the palette overlay before the map div (while &self is free).
         let palette_overlay = self.palette.is_open().then(|| self.render_palette(vw));
 
@@ -1652,58 +2013,7 @@ impl Render for TreemapView {
         let loading_overlay = is_loading.then(|| self.render_loading(vw));
 
         let title = self.window_title();
-        let file_menu = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .h_full()
-            .ml(px(12.0))
-            .gap(px(2.0))
-            .child(
-                div()
-                    .id(ElementId::Name("menu-open-folder".into()))
-                    .flex()
-                    .items_center()
-                    .h_full()
-                    .px(px(8.0))
-                    .cursor_pointer()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .text_size(px(12.))
-                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
-                    .child("Open Folder")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        if let Some(folder) = rfd::FileDialog::new()
-                            .set_title("Open Project Folder")
-                            .pick_folder()
-                        {
-                            this.settings = crate::settings::Settings::load();
-                            this.start_loading(folder);
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id(ElementId::Name("menu-settings".into()))
-                    .flex()
-                    .items_center()
-                    .h_full()
-                    .px(px(8.0))
-                    .cursor_pointer()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .text_size(px(12.))
-                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
-                    .child("Settings")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.settings_open = !this.settings_open;
-                        if this.settings_open {
-                            this.palette.close();
-                            this.show_welcome = false;
-                            this.context_menu = None;
-                        }
-                        cx.notify();
-                    })),
-            );
+        let file_menu = self.render_file_menu(cx);
         let map = div()
             .flex_grow(1.)
             .w_full()
@@ -1720,319 +2030,15 @@ impl Render for TreemapView {
             )
             .on_mouse_down(
                 gpui::MouseButton::Right,
-                cx.listener(|this, e: &gpui::MouseDownEvent, w, cx| {
-                    let Some(cam) = this.camera else { return };
-                    let (vw, vh) = Self::map_viewport(w);
-                    let items = world::visible_nodes(
-                        &this.tree, &this.layout, &cam, vw, vh,
-                        |id| this.textures.contains(id),
-                    );
-                    let (mx, my) = (
-                        f64::from(e.position.x),
-                        f64::from(e.position.y) - chrome::TITLEBAR_H,
-                    );
-                    if let Some(hit) = world::hit_test(&items, mx, my) {
-                        this.context_menu = Some(ContextMenu {
-                            position: e.position,
-                            target: hit.node.id.clone(),
-                        });
-                    } else {
-                        this.context_menu = None;
-                    }
-                    cx.notify();
-                }),
+                cx.listener(|this, e, w, cx| this.on_right_press(e, w, cx)),
             )
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseUpEvent, w, cx| {
-                    this.drag_last = None;
-                    // Dismiss context menu on left-click release (after on_click
-                    // handlers on menu items have already fired).
-                    if this.context_menu.is_some() {
-                        this.context_menu = None;
-                        cx.notify();
-                        return;
-                    }
-                    let Some(origin) = this.press_origin.take() else { return };
-                    let slop = f64::from(e.position.x - origin.x)
-                        .abs()
-                        .max(f64::from(e.position.y - origin.y).abs());
-                    if slop > 4.0 {
-                        return; // drag, not click
-                    }
-                    let Some(cam) = this.camera else { return };
-                    let (vw, vh) = Self::map_viewport(w);
-                    let items = world::visible_nodes(
-                        &this.tree, &this.layout, &cam, vw, vh,
-                        |id| this.textures.contains(id),
-                    );
-                    // the map canvas sits below the titlebar; shift window
-                    // coords up by its height to get canvas coords
-                    let (mx, my) =
-                        (f64::from(e.position.x), f64::from(e.position.y) - chrome::TITLEBAR_H);
-                    let hit = world::hit_test(&items, mx, my).map(|i| i.node.id.clone());
-                    drop(items);
-                    if let Some(id) = hit {
-                        let index = TreeIndex::new(&this.tree);
-                        // click sets focus; camera does NOT move (spec §2)
-                        if this.focus.set(id, &index) {
-                            nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
-                        }
-                        cx.notify();
-                    }
-                }),
+                cx.listener(|this, e, w, cx| this.on_left_release(e, w, cx)),
             )
-            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, w, cx| {
-                if e.pressed_button == Some(gpui::MouseButton::Left) {
-                    let Some(last) = this.drag_last else { return };
-                    this.cancel_tween();
-                    let dx = f64::from(e.position.x - last.x);
-                    let dy = f64::from(e.position.y - last.y);
-                    if let Some(cam) = this.camera.as_mut() {
-                        cam.pan(dx, dy);
-                    }
-                    this.drag_last = Some(e.position);
-                    cx.notify();
-                } else {
-                    let Some(cam) = this.camera else { return };
-                    let (vw, vh) = Self::map_viewport(w);
-                    let items = world::visible_nodes(
-                        &this.tree, &this.layout, &cam, vw, vh,
-                        |id| this.textures.contains(id),
-                    );
-                    let (mx, my) = (
-                        f64::from(e.position.x),
-                        f64::from(e.position.y) - chrome::TITLEBAR_H,
-                    );
-                    let hit = world::hit_test(&items, mx, my)
-                        .filter(|i| i.node.doc.is_some())
-                        .map(|i| i.node.id.clone());
-                    if hit != this.hover_id {
-                        this.hover_id = hit;
-                        cx.notify();
-                    }
-                }
-            }))
-            .on_scroll_wheel(cx.listener(move |this, e: &gpui::ScrollWheelEvent, w, cx| {
-                this.cancel_tween();
-                let dy = match e.delta {
-                    gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
-                    gpui::ScrollDelta::Lines(l) => l.y as f64 * 40.0,
-                };
-                let (vw, vh) = Self::map_viewport(w);
-                if let Some(cam) = this.camera.as_mut() {
-                    // scroll up (positive dy) zooms in; flip the sign here if
-                    // manual testing shows it inverted on this platform
-                    let factor = (dy * 0.002).exp();
-                    cam.zoom_about(
-                        f64::from(e.position.x),
-                        f64::from(e.position.y) - chrome::TITLEBAR_H,
-                        vw,
-                        vh,
-                        factor,
-                        min_zoom,
-                        max_zoom,
-                    );
-                }
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, w, cx| {
-                // Esc closes context menu if open, consuming the key.
-                if this.context_menu.is_some() && e.keystroke.key.as_str() == "escape" {
-                    this.context_menu = None;
-                    cx.notify();
-                    return;
-                }
-                // While the welcome screen is open, block all keys except Esc.
-                if this.show_welcome {
-                    if e.keystroke.key.as_str() == "escape" {
-                        this.show_welcome = false;
-                        cx.notify();
-                    }
-                    return;
-                }
-                // Ctrl+P / Ctrl+T / Ctrl+Comma — open palette or settings.
-                if e.keystroke.modifiers.control && !e.keystroke.modifiers.shift {
-                    match e.keystroke.key.as_str() {
-                        "p" => {
-                            this.palette.open(palette::PaletteMode::File, &this.tree);
-                            this.settings_open = false;
-                            this.context_menu = None;
-                            cx.notify();
-                            return;
-                        }
-                        "t" => {
-                            this.palette.open(palette::PaletteMode::Symbol, &this.tree);
-                            this.settings_open = false;
-                            this.context_menu = None;
-                            cx.notify();
-                            return;
-                        }
-                        "," => {
-                            this.settings_open = !this.settings_open;
-                            if this.settings_open {
-                                this.palette.close();
-                                this.show_welcome = false;
-                                this.context_menu = None;
-                            }
-                            cx.notify();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // While the settings overlay is open, block all keys except Esc.
-                if this.settings_open {
-                    if e.keystroke.key.as_str() == "escape" {
-                        this.settings_open = false;
-                        cx.notify();
-                    }
-                    return;
-                }
-                // Ctrl+Shift+E: open focused file in system file manager.
-                if e.keystroke.modifiers.control && e.keystroke.modifiers.shift {
-                    if e.keystroke.key.as_str() == "e" {
-                        let path = resolve_fs_path(&this.focus.current, &this.tree.repo_root);
-                        open_in_file_manager(&path);
-                        return;
-                    }
-                }
-                // While the palette is open, all keys route to it.
-                if this.palette.is_open() {
-                    match e.keystroke.key.as_str() {
-                        "escape" => {
-                            this.palette.close();
-                            cx.notify();
-                        }
-                        "enter" => {
-                            if let Some(id) = this.palette.confirm() {
-                                this.palette.close();
-                                let index = TreeIndex::new(&this.tree);
-                                if this.focus.set(id, &index) {
-                                    nav_push_to(
-                                        &mut this.nav_history,
-                                        &mut this.nav_cursor,
-                                        this.focus.current.clone(),
-                                    );
-                                }
-                                let (vw, vh) = Self::map_viewport(w);
-                                let max_zoom = camera::MAX_ZOOM;
-                                let min_zoom = (this.home_zoom * 0.5).min(camera::MAX_ZOOM);
-                                if let Some(to) =
-                                    this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
-                                {
-                                    this.start_tween(to);
-                                }
-                            }
-                            cx.notify();
-                        }
-                        "up" => {
-                            this.palette.move_selection(-1);
-                            cx.notify();
-                        }
-                        "down" => {
-                            this.palette.move_selection(1);
-                            cx.notify();
-                        }
-                        "backspace" => {
-                            this.palette.backspace(&this.tree);
-                            cx.notify();
-                        }
-                        _ => {
-                            // Single printable character → type into palette.
-                            if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
-                                let mut chars = s.chars();
-                                let c = chars.next()?;
-                                if chars.next().is_none() { Some(c) } else { None }
-                            }) {
-                                this.palette.type_char(ch, &this.tree);
-                                cx.notify();
-                            }
-                        }
-                    }
-                    return;
-                }
-                if this.camera.is_none() {
-                    return;
-                }
-                let (vw, vh) = Self::map_viewport(w);
-                let max_zoom = camera::MAX_ZOOM;
-                let min_zoom = (this.home_zoom * 0.5).min(camera::MAX_ZOOM);
-                let index = TreeIndex::new(&this.tree);
-                let target = match e.keystroke.key.as_str() {
-                    "enter" => {
-                        if !this.focus.step_in(&index) {
-                            return;
-                        }
-                        nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
-                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
-                    }
-                    "escape" => {
-                        if !this.focus.step_out(&index) {
-                            return;
-                        }
-                        nav_push_to(&mut this.nav_history, &mut this.nav_cursor, this.focus.current.clone());
-                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
-                    }
-                    "end" => this.layout.rects.get(&this.focus.current).copied().map(|r| {
-                        this.frame_below_headers(&index, r, vw, vh, |vh_eff| {
-                            camera::frame_rect(
-                                r, vw, vh_eff, camera::END_FRACTION, min_zoom, max_zoom,
-                            )
-                        })
-                    }),
-                    "home" => {
-                        let c = Camera::fit(this.root_rect(), vw, vh);
-                        this.home_zoom = c.zoom;
-                        Some(c)
-                    }
-                    "left" if e.keystroke.modifiers.alt => {
-                        let Some(c) = nav_back_cursor(&this.nav_history, this.nav_cursor) else {
-                            return;
-                        };
-                        this.nav_cursor = c;
-                        let id = this.nav_history[c].clone();
-                        this.focus.current = id;
-                        this.focus.record_visit(&index);
-                        this.neighbors = None;
-                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
-                    }
-                    "right" if e.keystroke.modifiers.alt => {
-                        let Some(c) = nav_forward_cursor(&this.nav_history, this.nav_cursor) else {
-                            return;
-                        };
-                        this.nav_cursor = c;
-                        let id = this.nav_history[c].clone();
-                        this.focus.current = id;
-                        this.focus.record_visit(&index);
-                        this.neighbors = None;
-                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
-                    }
-                    "up" | "down" | "left" | "right" => {
-                        let dir = match e.keystroke.key.as_str() {
-                            "up" => focus::Dir::Up,
-                            "down" => focus::Dir::Down,
-                            "left" => focus::Dir::Left,
-                            _ => focus::Dir::Right,
-                        };
-                        let Some(next) =
-                            focus::spatial_step(&this.focus.current, dir, &this.layout, &index)
-                        else {
-                            return;
-                        };
-                        if !this.focus.set(next, &index) {
-                            return;
-                        }
-                        this.frame_focus(&index, vw, vh, min_zoom, max_zoom)
-                    }
-                    // Tab stays disabled — no handler.
-                    _ => return,
-                };
-                if let Some(to) = target {
-                    this.start_tween(to);
-                    cx.notify();
-                }
-            }))
+            .on_mouse_move(cx.listener(|this, e, w, cx| this.on_mouse_move(e, w, cx)))
+            .on_scroll_wheel(cx.listener(|this, e, w, cx| this.on_scroll(e, w, cx)))
+            .on_key_down(cx.listener(|this, e, w, cx| this.on_key_down(e, w, cx)))
             .child(
                 canvas(
                     |_bounds, _window, _cx: &mut App| {},
