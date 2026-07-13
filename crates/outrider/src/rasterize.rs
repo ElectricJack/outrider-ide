@@ -608,6 +608,7 @@ pub fn pre_bake_all(
             continue;
         }
 
+        let mut baked = false;
         if content::is_leaf_item(node) {
             let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
             let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -625,16 +626,13 @@ pub fn pre_bake_all(
                     if !lines.is_empty() {
                         let tex = cache.raster.bake(&lines);
                         cache.insert(node.id.clone(), tex);
-                    } else {
-                        cache.insert(node.id.clone(), NodeTexture::empty());
+                        baked = true;
                     }
-                } else {
-                    cache.insert(node.id.clone(), NodeTexture::empty());
                 }
-            } else {
-                cache.insert(node.id.clone(), NodeTexture::empty());
             }
-        } else if !node.children.is_empty() {
+        }
+
+        if !baked {
             if let Some(rect) = layout.rects.get(&node.id) {
                 let snap = cache.child_bytes_snapshot();
                 let child_lookup = |id: &SymbolId| snap.get(id).cloned();

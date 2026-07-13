@@ -19,12 +19,6 @@ pub const BOTTOM_PAD: f64 = 6.0;
 /// text (the text/texture tier boundary).
 pub const MIN_TEXT_FONT_PX: f64 = 7.0;
 
-/// Font-size range for the Texture↔Text crossfade: text fades in from
-/// FADE_LO to FADE_HI while the baked texture fades out over the same range.
-/// Lower bound of the Text↔Texture crossfade (on-screen font px).
-pub const TEXT_FADE_LO: f64 = 5.0;
-/// Upper bound of the Text↔Texture crossfade; above this text is fully opaque.
-pub const TEXT_FADE_HI: f64 = 9.0;
 
 /// A leaf page: has source bytes, no children, and is not a folder.
 /// Items are code pages; childless files (markdown, TOML, plain text,

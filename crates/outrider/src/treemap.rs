@@ -782,7 +782,6 @@ impl TreemapView {
                             &self.file_symbols,
                         );
                     } else {
-                        body_opacity = 0.0;
                         let (tx, ty, tw, th) =
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
                         if tw >= 1.0 && th >= 1.0 && ty < vh && ty + th > 0.0 {
@@ -795,6 +794,7 @@ impl TreemapView {
                                         h: th as f32,
                                         image: img.clone(),
                                     });
+                                    body_opacity = 0.0;
                                 }
                             }
                         }
