@@ -1,6 +1,7 @@
 //! Filesystem scanner and symbol-tree assembler.
 //! `scan_files` discovers repo source files (respecting .gitignore); `build_tree`
-//! wires them together with parsed items into the folder/file/item `SymbolTree`.
+//! is the legacy pure structural assembler. The normal `index_repo*` pipeline
+//! uses materialized `IndexedFile` values for parsing, docs, and chunks.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -9,7 +10,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use ignore::WalkBuilder;
 
-use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
 pub use crate::types::ParsedFile;
 use crate::types::{finalize_children, IndexedFile, SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
@@ -147,7 +147,9 @@ pub(crate) fn build_indexed_tree(repo_root: &Path, files: &[IndexedFile]) -> Sym
     }
 }
 
-/// Compatibility wrapper for callers that separately scan and parse files.
+/// Compatibility assembler for callers that separately scan and parse files.
+/// This function is pure over its arguments and never accesses the filesystem;
+/// use `index_repo*` for the full parse/docs/chunk pipeline.
 pub fn build_tree(
     repo_root: &Path,
     files: &[ScannedFile],
@@ -169,13 +171,12 @@ pub fn build_tree(
         })
         .collect();
     SymbolTree {
-        root: build_legacy_folder(repo_root, &root_name, "", &decomposed, parsed_children),
+        root: build_legacy_folder(&root_name, "", &decomposed, parsed_children),
         repo_root: repo_root.to_path_buf(),
     }
 }
 
 fn build_legacy_folder(
-    repo_root: &Path,
     name: &str,
     qualified: &str,
     entries: &[(Vec<String>, &ScannedFile)],
@@ -191,7 +192,7 @@ fn build_legacy_folder(
                     .get(&file.rel_path)
                     .cloned()
                     .unwrap_or_default();
-                let mut node = SymbolNode {
+                let node = SymbolNode {
                     id: SymbolId {
                         kind: SymbolKind::File,
                         qualified_path: qualified_path.clone(),
@@ -206,38 +207,6 @@ fn build_legacy_folder(
                     churn_count: 0,
                     children: parsed.items,
                 };
-                if node.children.is_empty() && file.lines > CHUNK_MAX_LINES as u64 {
-                    if let Ok(text) = std::fs::read_to_string(repo_root.join(&file.rel_path)) {
-                        let extension = file
-                            .rel_path
-                            .extension()
-                            .and_then(|extension| extension.to_str())
-                            .unwrap_or("");
-                        let chunks = strategy_for(extension).chunks(&text);
-                        if chunks.len() > 1 {
-                            node.children = chunks
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, chunk)| SymbolNode {
-                                    id: SymbolId {
-                                        kind: SymbolKind::Chunk,
-                                        qualified_path: format!("{qualified_path}#{index}"),
-                                        ordinal: 0,
-                                    },
-                                    name: chunk.label,
-                                    byte_range: Some(chunk.start_byte..chunk.end_byte),
-                                    signature: None,
-                                    doc: None,
-                                    measure: (chunk.end_line - chunk.start_line) as u64,
-                                    churn: 0.0,
-                                    churn_count: 0,
-                                    children: vec![],
-                                })
-                                .collect();
-                            finalize_children(&mut node.children);
-                        }
-                    }
-                }
                 children.push(node);
             }
             [folder, ..] => by_subfolder
@@ -250,7 +219,6 @@ fn build_legacy_folder(
     for (folder_name, sub_entries) in &by_subfolder {
         let qualified_path = join_path(qualified, folder_name);
         children.push(build_legacy_folder(
-            repo_root,
             folder_name,
             &qualified_path,
             sub_entries,
@@ -356,7 +324,6 @@ fn join_path(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SymbolKind;
 
     fn scan_tree(dir: &std::path::Path) -> SymbolTree {
         let files = scan_files(dir, &[], &[]).unwrap();
@@ -368,44 +335,6 @@ mod tests {
             .iter()
             .find(|c| c.name == name)
             .expect("child present")
-    }
-
-    #[test]
-    fn large_markdown_file_becomes_a_chunk_container() {
-        let dir = tempfile::tempdir().unwrap();
-        // 3 headed sections, each long enough to be its own chunk.
-        let mut text = String::new();
-        for h in ["Alpha", "Beta", "Gamma"] {
-            text.push_str(&format!("# {h}\n"));
-            for i in 0..25 {
-                text.push_str(&format!("line {i}\n"));
-            }
-        }
-        std::fs::write(dir.path().join("BIG.md"), &text).unwrap();
-        let tree = scan_tree(dir.path());
-        let f = child(&tree.root, "BIG.md");
-        assert_eq!(f.id.kind, SymbolKind::File);
-        assert_eq!(f.children.len(), 3);
-        assert!(f.children.iter().all(|c| c.id.kind == SymbolKind::Chunk));
-        // byte ranges are contiguous and cover the whole file, in source order
-        let mut sorted: Vec<&SymbolNode> = f.children.iter().collect();
-        sorted.sort_by_key(|c| c.byte_range.as_ref().unwrap().start);
-        assert_eq!(sorted[0].byte_range.as_ref().unwrap().start, 0);
-        assert_eq!(
-            sorted.last().unwrap().byte_range.as_ref().unwrap().end,
-            text.len()
-        );
-        for w in sorted.windows(2) {
-            assert_eq!(
-                w[0].byte_range.as_ref().unwrap().end,
-                w[1].byte_range.as_ref().unwrap().start
-            );
-        }
-        // chunk qualified_path is "{file}#{i}"
-        assert!(f
-            .children
-            .iter()
-            .all(|c| c.id.qualified_path.starts_with("BIG.md#")));
     }
 
     #[test]

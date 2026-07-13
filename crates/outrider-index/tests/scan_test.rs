@@ -78,3 +78,23 @@ fn legacy_scanned_file_and_parsed_file_paths_remain_constructible() {
     assert_eq!(tree.root.children[0].name, "legacy.rs");
     assert_eq!(tree.root.children[0].measure, 2);
 }
+
+#[test]
+fn legacy_build_tree_is_a_pure_structural_assembler() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.md");
+    let text = (0..100)
+        .map(|line| format!("# Section {line}\nbody\n"))
+        .collect::<String>();
+    std::fs::write(&path, text).unwrap();
+    let files = scan_files(dir.path(), &[], &[]).unwrap();
+
+    let while_readable = build_tree(dir.path(), &files, &BTreeMap::new());
+    assert!(while_readable.root.children[0].children.is_empty());
+
+    std::fs::remove_file(path).unwrap();
+    let after_removal = build_tree(dir.path(), &files, &BTreeMap::new());
+    assert_eq!(after_removal.root.children[0].name, "large.md");
+    assert_eq!(after_removal.root.children[0].measure, 200);
+    assert!(after_removal.root.children[0].children.is_empty());
+}

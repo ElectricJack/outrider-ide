@@ -553,6 +553,32 @@ mod tests {
     }
 
     #[test]
+    fn normal_indexed_pipeline_materializes_markdown_chunks_from_one_read() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut text = String::new();
+        for heading in ["Alpha", "Beta", "Gamma"] {
+            text.push_str(&format!("# {heading}\n"));
+            for line in 0..25 {
+                text.push_str(&format!("line {line}\n"));
+            }
+        }
+        let source = ProbeSource {
+            bytes: text.into_bytes(),
+            max_inspected: Arc::new(AtomicUsize::new(0)),
+            opens: Arc::clone(&opens),
+        };
+
+        let indexed = index_discovered_files(&source, &[PathBuf::from("BIG.md")], None).unwrap();
+
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        let chunks = indexed[0].chunks.as_ref().expect("markdown chunks");
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.id.kind == SymbolKind::Chunk));
+    }
+
+    #[test]
     fn bounded_stream_metrics_preserve_line_count_semantics() {
         for (bytes, expected_lines) in [
             (b"".as_slice(), 0),
