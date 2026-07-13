@@ -71,6 +71,26 @@ pub struct SymbolTree {
     pub repo_root: PathBuf,
 }
 
+/// Parsed products derived from one retained source buffer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedFile {
+    pub items: Vec<SymbolNode>,
+    pub doc: Option<String>,
+}
+
+/// All products needed to assemble one file node without reopening the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedFile {
+    pub rel_path: PathBuf,
+    pub lines: u64,
+    pub bytes: u64,
+    /// Stable FNV-1a hash of retained source contents. Large or unsupported
+    /// files that are only stream-counted intentionally have no fingerprint.
+    pub source_fingerprint: Option<u64>,
+    pub parsed: ParsedFile,
+    pub chunks: Option<Vec<SymbolNode>>,
+}
+
 /// Sort children byte-wise by name; assign ordinals within same-name runs in
 /// prior (source) order. Final order is (name, ordinal) — spec §4.1, §6.3.
 pub fn finalize_children(children: &mut [SymbolNode]) {

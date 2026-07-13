@@ -8,23 +8,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use ignore::WalkBuilder;
 
-use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
-use crate::types::{finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
+use crate::types::{
+    finalize_children, IndexedFile, ParsedFile, SymbolId, SymbolKind, SymbolNode, SymbolTree,
+};
 
-/// Parsed per-file payload: item nodes plus the file's `//!` doc block.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ParsedFile {
-    pub items: Vec<SymbolNode>,
-    pub doc: Option<String>,
-}
-
-/// A discovered source file: its repo-relative path and raw size metrics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScannedFile {
-    pub rel_path: PathBuf,
-    pub lines: u64,
-    pub bytes: u64,
-}
+/// Compatibility name retained for callers of the original scan/build API.
+pub type ScannedFile = IndexedFile;
 
 /// Walk the repo honoring .gitignore / standard ignore files (spec §5.1).
 /// `require_git(false)` so ignore rules also apply in non-git dirs (fixtures).
@@ -38,6 +27,16 @@ pub fn scan_files(
     filter_extensions: &[String],
     filter_folders: &[String],
 ) -> anyhow::Result<Vec<ScannedFile>> {
+    let paths = discover_files(repo_root, filter_extensions, filter_folders)?;
+    crate::index::index_discovered_files(&crate::index::FsFileSource::new(repo_root), &paths, None)
+}
+
+/// Discover eligible repo-relative paths without reading file contents.
+pub fn discover_files(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(repo_root).require_git(false).build();
     for entry in walker {
@@ -70,29 +69,10 @@ pub fn scan_files(
         }) {
             continue;
         }
-        let bytes = std::fs::read(entry.path())
-            .with_context(|| format!("reading {}", entry.path().display()))?;
-        files.push(ScannedFile {
-            rel_path,
-            lines: count_lines(&bytes),
-            bytes: bytes.len() as u64,
-        });
+        files.push(rel_path);
     }
-    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    files.sort();
     Ok(files)
-}
-
-/// Counts lines in a byte slice, treating a trailing newline as part of the last line.
-fn count_lines(bytes: &[u8]) -> u64 {
-    if bytes.is_empty() {
-        return 0;
-    }
-    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
-    if bytes.ends_with(b"\n") {
-        newlines
-    } else {
-        newlines + 1
-    }
 }
 
 /// Build the folder/file skeleton. `parsed_children` maps a file's rel_path to its
@@ -118,7 +98,7 @@ pub fn build_tree(
             (comps, f)
         })
         .collect();
-    let root = build_folder(repo_root, &root_name, "", &decomposed, parsed_children);
+    let root = build_folder(&root_name, "", &decomposed, parsed_children);
     SymbolTree {
         root,
         repo_root: repo_root.to_path_buf(),
@@ -128,7 +108,6 @@ pub fn build_tree(
 /// Recursively constructs a `Folder` node from a pre-decomposed file list,
 /// injecting parsed items and chunk-splitting large unparsed files.
 fn build_folder(
-    repo_root: &Path,
     name: &str,
     qualified: &str,
     entries: &[(Vec<String>, &ScannedFile)],
@@ -144,7 +123,7 @@ fn build_folder(
                 let parsed = parsed_children
                     .get(&file.rel_path)
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| file.parsed.clone());
                 let mut node = SymbolNode {
                     id: SymbolId {
                         kind: SymbolKind::File,
@@ -160,37 +139,8 @@ fn build_folder(
                     churn_count: 0,
                     children: parsed.items,
                 };
-                if node.children.is_empty() && file.lines > CHUNK_MAX_LINES as u64 {
-                    if let Ok(text) = std::fs::read_to_string(repo_root.join(&file.rel_path)) {
-                        let ext = file
-                            .rel_path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        let chunks = strategy_for(ext).chunks(&text);
-                        if chunks.len() > 1 {
-                            node.children = chunks
-                                .iter()
-                                .enumerate()
-                                .map(|(i, ch)| SymbolNode {
-                                    id: SymbolId {
-                                        kind: SymbolKind::Chunk,
-                                        qualified_path: format!("{qual}#{i}"),
-                                        ordinal: 0,
-                                    },
-                                    name: ch.label.clone(),
-                                    byte_range: Some(ch.start_byte..ch.end_byte),
-                                    signature: None,
-                                    doc: None,
-                                    measure: (ch.end_line - ch.start_line) as u64,
-                                    churn: 0.0,
-                                    churn_count: 0,
-                                    children: vec![],
-                                })
-                                .collect();
-                            finalize_children(&mut node.children);
-                        }
-                    }
+                if node.children.is_empty() {
+                    node.children = file.chunks.clone().unwrap_or_default();
                 }
                 children.push(node);
             }
@@ -207,7 +157,6 @@ fn build_folder(
     for (folder_name, sub_entries) in &by_subfolder {
         let qual = join_path(qualified, folder_name);
         children.push(build_folder(
-            repo_root,
             folder_name,
             &qual,
             sub_entries,

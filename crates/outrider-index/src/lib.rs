@@ -17,3 +17,4 @@ pub use index::{
     index_repo_with_progress_outcome, IndexOutcome, IndexProgress,
 };
 pub use types::{dedupe_ids, finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
+pub use types::{IndexedFile, ParsedFile};
