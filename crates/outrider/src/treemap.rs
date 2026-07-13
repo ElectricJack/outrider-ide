@@ -559,6 +559,13 @@ impl TreemapView {
             .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 })
     }
 
+    fn memory_status(&self) -> String {
+        let bytes = self.textures.used_bytes();
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        let max_mb = self.settings.cache_mb;
+        format!("{mb:.0} / {max_mb} MB")
+    }
+
     /// Window title shown in the client titlebar and taskbar.
     fn window_title(&self) -> String {
         let name = self
@@ -2306,7 +2313,7 @@ impl Render for TreemapView {
             .flex()
             .flex_col()
             .bg(rgb(theme::BG))
-            .child(chrome::titlebar(title, file_menu, window))
+            .child(chrome::titlebar(title, file_menu, self.memory_status(), window))
             .child(map)
             .children(chrome::resize_rim(window))
     }

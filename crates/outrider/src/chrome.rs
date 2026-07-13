@@ -28,6 +28,7 @@ const CLOSE_HOVER: u32 = 0xc42b1c;
 pub fn titlebar(
     title: impl Into<SharedString>,
     menu: impl IntoElement,
+    status: impl Into<SharedString>,
     window: &Window,
 ) -> impl IntoElement {
     let maximize_glyph = if window.is_maximized() { "❐" } else { "□" };
@@ -59,6 +60,16 @@ pub fn titlebar(
                         window.start_window_move();
                     }
                 }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .h_full()
+                .px(px(8.0))
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .text_size(px(11.))
+                .child(status.into()),
         )
         .child(control_btn("–", BTN_HOVER, |window, _cx| window.minimize_window()))
         .child(control_btn(maximize_glyph, BTN_HOVER, |window, _cx| window.zoom_window()))

@@ -442,6 +442,10 @@ impl TextureCache {
         }
     }
 
+    pub fn used_bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub fn contains(&self, id: &SymbolId) -> bool {
         self.entries.contains_key(id)
     }
