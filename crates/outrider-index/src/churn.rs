@@ -199,13 +199,7 @@ fn project_hash(identity: &str) -> String {
 fn git_head(repo_root: &Path) -> Result<Option<String>, String> {
     match git_stdout(repo_root, &["rev-parse", "HEAD"]) {
         Ok(head) => Ok(Some(head.trim().to_string())),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
+        Err(error) if is_git_unavailable(&error) => Ok(None),
         Err(error) => {
             let message = format!("{error:#}");
             if message.contains("not a git repository") {
@@ -225,11 +219,25 @@ fn git_head(repo_root: &Path) -> Result<Option<String>, String> {
     }
 }
 
+fn is_git_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == ErrorKind::NotFound)
+}
+
+fn git_command(repo_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .arg("-C")
+        .arg(repo_root);
+    command
+}
+
 /// Run a git subcommand in `repo_root` and return its UTF-8 stdout, or error on non-zero exit.
 fn git_stdout(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let out = git_command(repo_root)
         .args(args)
         .output()
         .context("spawning git")?;
@@ -369,5 +377,27 @@ mod tests {
     #[test]
     fn project_hash_uses_stable_fnv1a() {
         assert_eq!(project_hash("hello"), "a430d84680aabd0b");
+    }
+
+    #[test]
+    fn git_subprocess_uses_stable_diagnostic_locale() {
+        let command = git_command(Path::new("."));
+        let env = |wanted: &str| {
+            command
+                .get_envs()
+                .find_map(|(name, value)| (name == wanted).then_some(value))
+                .flatten()
+        };
+
+        assert_eq!(env("LC_ALL"), Some(std::ffi::OsStr::new("C")));
+        assert_eq!(env("LANG"), Some(std::ffi::OsStr::new("C")));
+    }
+
+    #[test]
+    fn executable_not_found_is_normal_git_unavailability() {
+        let error =
+            anyhow::Error::new(std::io::Error::from(ErrorKind::NotFound)).context("spawning git");
+
+        assert!(is_git_unavailable(&error));
     }
 }

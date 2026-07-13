@@ -108,6 +108,29 @@ fn unexpected_git_metadata_failure_returns_warning() {
 }
 
 #[test]
+fn ordinary_non_git_directory_has_no_churn_warning() {
+    let repo = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let outcome = churn_counts_with_cache(repo.path(), cache.path()).unwrap();
+
+    assert!(outcome.counts.is_empty());
+    assert_eq!(outcome.warning, None);
+}
+
+#[test]
+fn unborn_repository_has_no_churn_warning() {
+    let repo = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+
+    let outcome = churn_counts_with_cache(repo.path(), cache.path()).unwrap();
+
+    assert!(outcome.counts.is_empty());
+    assert_eq!(outcome.warning, None);
+}
+
+#[test]
 fn index_outcome_retains_churn_warning_after_successful_load() {
     let repo = git_fixture();
     let invalid_cache_root = repo.path().join("regular-file");
