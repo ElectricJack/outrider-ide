@@ -113,18 +113,23 @@ impl TextureStore {
         file.read_exact(&mut bytes)?;
         drop(file);
 
+        self.clock = self.clock.max(header.last_access);
         let access = self.next_access();
         let mut file = OpenOptions::new().write(true).open(&path)?;
         file.seek(SeekFrom::Start(ACCESS_OFFSET))?;
         file.write_all(&access.to_le_bytes())?;
         file.flush()?;
-        self.entries.insert(
+        if let Some(previous) = self.entries.insert(
             *key,
             Metadata {
                 file_bytes: header.file_bytes,
                 last_access: access,
             },
-        );
+        ) {
+            self.used_bytes = self.used_bytes.saturating_sub(previous.file_bytes);
+        }
+        self.used_bytes = self.used_bytes.saturating_add(header.file_bytes);
+        self.evict()?;
         Ok(Some(TexturePayload {
             width: header.width,
             height: header.height,
@@ -133,6 +138,15 @@ impl TextureStore {
     }
 
     pub fn save(&mut self, key: &TextureKey, payload: &TexturePayload) -> io::Result<()> {
+        self.save_with_replace(key, payload, replace_file_atomically)
+    }
+
+    fn save_with_replace(
+        &mut self,
+        key: &TextureKey,
+        payload: &TexturePayload,
+        replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         let payload_len = validate_payload(payload)?;
         let file_bytes = HEADER_LEN as u64 + payload_len;
         if file_bytes > self.max_bytes {
@@ -153,10 +167,7 @@ impl TextureStore {
             file.write_all(&payload.bytes)?;
             file.flush()?;
             file.sync_all()?;
-            if path.exists() {
-                fs::remove_file(&path)?;
-            }
-            fs::rename(&temp, &path)
+            replace(&temp, &path)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp);
@@ -174,6 +185,16 @@ impl TextureStore {
         }
         self.used_bytes = self.used_bytes.saturating_add(file_bytes);
         self.evict()
+    }
+
+    #[cfg(test)]
+    fn save_with_replace_for_test(
+        &mut self,
+        key: &TextureKey,
+        payload: &TexturePayload,
+        replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.save_with_replace(key, payload, replace)
     }
 
     #[allow(dead_code)] // Public store API; UI wiring lands in a later task.
@@ -282,6 +303,56 @@ impl TextureStore {
             .open(self.path(*key))?
             .write_all(bytes)
     }
+}
+
+#[cfg(unix)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that remain
+    // alive for the duration of the call.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    if destination.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic file replacement is unsupported on this platform",
+        ));
+    }
+    fs::rename(source, destination)
 }
 
 struct Header {
@@ -535,6 +606,44 @@ mod tests {
         assert!(store.load(&key("old.rs", 1)).unwrap().is_none());
         assert!(store.load(&key("new.rs", 1)).unwrap().is_some());
         assert!(store.used_bytes() <= limit);
+    }
+
+    #[test]
+    fn failed_atomic_replacement_preserves_old_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TextureStore::open_at(dir.path(), "project", 1024).unwrap();
+        let cache_key = key("a.rs", 1);
+        let old = payload(16);
+        let new = payload(20);
+        store.save(&cache_key, &old).unwrap();
+
+        let result = store.save_with_replace_for_test(&cache_key, &new, |_, _| {
+            Err(std::io::Error::other("injected replacement failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(store.load(&cache_key).unwrap(), Some(old));
+        store.save(&cache_key, &new).unwrap();
+        assert_eq!(store.load(&cache_key).unwrap(), Some(new));
+    }
+
+    #[test]
+    fn load_of_entry_created_after_open_updates_actual_usage_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let mut one = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        let mut two = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        let external = key("external.rs", 1);
+        two.save(&external, &payload(16)).unwrap();
+
+        assert!(one.load(&external).unwrap().is_some());
+        assert_eq!(one.used_bytes(), entry_bytes);
+
+        let local = key("local.rs", 1);
+        one.save(&local, &payload(16)).unwrap();
+        assert!(one.used_bytes() <= entry_bytes);
+        assert!(one.load(&external).unwrap().is_none());
+        assert!(one.load(&local).unwrap().is_some());
     }
 
     #[test]

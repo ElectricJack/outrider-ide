@@ -447,12 +447,7 @@ impl TextureCache {
     }
 
     fn disk_key(&self, id: &SymbolId) -> Option<TextureKey> {
-        let relative_path = id
-            .qualified_path
-            .split("::")
-            .next()
-            .unwrap_or(&id.qualified_path)
-            .replace('\\', "/");
+        let relative_path = BufferManager::file_path_of(&id.qualified_path).replace('\\', "/");
         let source_fingerprint = *self.source_fingerprints.get(&relative_path)?;
         Some(TextureKey::new(
             &relative_path,
@@ -831,5 +826,24 @@ mod tests {
         assert!(cache.get(&sid("a"), 1.0).is_some());
         assert!(cache.get(&sid("b"), 1.0).is_none());
         assert!(cache.get(&sid("c"), 1.0).is_some());
+    }
+
+    #[test]
+    fn chunk_disk_key_uses_its_source_file_fingerprint() {
+        let mut cache = TextureCache::new_memory_only(usize::MAX);
+        cache.source_fingerprints.insert("BIG.md".into(), 42);
+        let chunk = SymbolId {
+            qualified_path: "BIG.md#2".into(),
+            kind: SymbolKind::Chunk,
+            ordinal: 0,
+        };
+        assert!(cache.disk_key(&chunk).is_some());
+
+        let missing = SymbolId {
+            qualified_path: "MISSING.md#2".into(),
+            kind: SymbolKind::Chunk,
+            ordinal: 0,
+        };
+        assert!(cache.disk_key(&missing).is_none());
     }
 }
