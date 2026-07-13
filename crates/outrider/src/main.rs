@@ -1,6 +1,6 @@
 //! Application entry point for the outrider treemap visualizer.
-//! Indexes the target repository, runs the shelf-pack layout pass, then
-//! opens a GPUI window hosting `TreemapView` with client-side decorations.
+//! Opens a GPUI window immediately, then indexes the target repository on a
+//! background thread while the loading shell remains responsive.
 
 mod buffers;
 mod camera;
@@ -8,6 +8,7 @@ mod chrome;
 mod content;
 mod focus;
 mod palette;
+mod project_loader;
 mod rasterize;
 mod settings;
 mod texture_store;
@@ -24,36 +25,20 @@ use gpui_platform::application;
 
 use crate::treemap::TreemapView;
 
-/// Index the repo passed as `argv[1]` (or cwd), pack the layout, and open
-/// the main treemap window.
+/// Resolve the repo passed as `argv[1]` (or chosen interactively) and open the
+/// main treemap window before starting background indexing.
 fn main() {
     let repo = match std::env::args().nth(1).map(PathBuf::from) {
-        Some(p) => p,
+        Some(path) => path,
         None => match rfd::FileDialog::new()
             .set_title("Open Project Folder")
             .pick_folder()
         {
-            Some(p) => p,
-            None => return, // user cancelled
+            Some(path) => path,
+            None => return,
         },
     };
     let settings = settings::Settings::load();
-    eprintln!("indexing {}…", repo.display());
-    let outcome = match outrider_index::index_repo_outcome(
-        &repo,
-        &settings.filter_extensions,
-        &settings.filter_folders,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            std::process::exit(1);
-        }
-    };
-    let tree = outcome.tree;
-    let source_fingerprints = outcome.source_fingerprints;
-    let layout = outrider_layout::pack(&tree, &world::pack_config());
-    eprintln!("{} symbols packed", layout.rects.len());
 
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
@@ -66,7 +51,7 @@ fn main() {
                 window_min_size: Some(size(px(480.), px(320.))),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| TreemapView::new(tree, layout, source_fingerprints, settings, cx)),
+            |_, cx| cx.new(|cx| TreemapView::loading_shell(repo, settings, cx)),
         )
         .expect("failed to open window");
         cx.activate(true);

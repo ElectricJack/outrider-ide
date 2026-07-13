@@ -4,7 +4,8 @@
 //! (quads, text runs, and baked texture quads) via a static canvas closure.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, BorderStyle,
@@ -21,6 +22,7 @@ use crate::chrome;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
 use crate::palette;
+use crate::project_loader::{LoadProgress, LoadResult, LoaderPoll, ProjectLoader};
 use crate::rasterize::{self, TextureCache};
 use crate::settings;
 use crate::theme;
@@ -295,21 +297,9 @@ pub struct TreemapView {
     settings_notification: Option<String>,
     /// Right-click context menu, if currently open.
     context_menu: Option<ContextMenu>,
-    /// Background indexing in progress (Open Folder or re-index).
-    loading: Option<LoadingState>,
-}
-
-/// Tracks a background indexing thread and its progress.
-struct LoadedProject {
-    tree: outrider_index::SymbolTree,
-    layout: outrider_layout::PackLayout,
-    textures: TextureCache,
-}
-
-struct LoadingState {
-    folder_name: String,
-    progress: Arc<outrider_index::IndexProgress>,
-    result: Arc<Mutex<Option<Result<LoadedProject, String>>>>,
+    /// Background indexing controller (Open Folder, startup, or re-index).
+    loader: ProjectLoader,
+    load_progress: Option<LoadProgress>,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -680,6 +670,44 @@ fn open_in_file_manager(path: &std::path::Path) {
 
 /// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
+    /// Construct a responsive shell and begin indexing only after GPUI has
+    /// entered its application callback.
+    pub fn loading_shell(
+        project_root: PathBuf,
+        loaded_settings: settings::SettingsLoad,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let project_name = project_root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| project_root.to_string_lossy().into_owned());
+        let root = SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Folder,
+                qualified_path: String::new(),
+                ordinal: 0,
+            },
+            name: project_name,
+            byte_range: None,
+            signature: None,
+            doc: None,
+            measure: 0,
+            churn: 0.0,
+            churn_count: 0,
+            children: Vec::new(),
+        };
+        let tree = SymbolTree {
+            root,
+            repo_root: project_root.clone(),
+        };
+        let layout = outrider_layout::pack(&tree, &world::pack_config());
+        let mut view = Self::new(tree, layout, BTreeMap::new(), loaded_settings, cx);
+        let show_welcome = view.show_welcome;
+        view.start_loading(project_root);
+        view.show_welcome = show_welcome;
+        view
+    }
+
     /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
     /// camera is deferred until the first render supplies a viewport.
     pub fn new(
@@ -724,7 +752,8 @@ impl TreemapView {
             settings_draft: None,
             settings_notification,
             context_menu: None,
-            loading: None,
+            loader: ProjectLoader::new(),
+            load_progress: None,
         }
     }
 
@@ -1724,103 +1753,78 @@ impl TreemapView {
 
     /// Spawn a background thread to index `folder` and compute its layout.
     fn start_loading(&mut self, folder: std::path::PathBuf) {
-        let folder_name = folder
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| folder.to_string_lossy().into_owned());
-        let progress = Arc::new(outrider_index::IndexProgress::new());
-        let result: Arc<Mutex<Option<Result<LoadedProject, String>>>> = Arc::new(Mutex::new(None));
-
-        let p = Arc::clone(&progress);
-        let r = Arc::clone(&result);
-        let exts = self.settings.filter_extensions.clone();
-        let dirs = self.settings.filter_folders.clone();
-        let cache_bytes = self.settings.cache_mb as usize * 1024 * 1024;
-        let disk_cache_bytes = self.settings.disk_cache_bytes(&folder);
-        std::thread::spawn(move || {
-            let outcome =
-                match outrider_index::index_repo_with_progress_outcome(&folder, &exts, &dirs, &p) {
-                    Ok(outcome) => outcome,
-                    Err(e) => {
-                        *r.lock().unwrap() = Some(Err(format!("{e:#}")));
-                        return;
-                    }
-                };
-            let tree = outcome.tree;
-            let layout = outrider_layout::pack(&tree, &world::pack_config());
-            let textures = TextureCache::new(
-                &folder,
-                outcome.source_fingerprints,
-                cache_bytes,
-                disk_cache_bytes,
-            );
-            *r.lock().unwrap() = Some(Ok(LoadedProject {
-                tree,
-                layout,
-                textures,
-            }));
-        });
-
+        self.loader.start(folder, self.settings.clone());
         self.palette.close();
         self.show_welcome = false;
         self.settings_draft = None;
         self.context_menu = None;
-        self.loading = Some(LoadingState {
-            folder_name,
-            progress,
-            result,
-        });
+        self.load_progress = None;
     }
 
     /// Check if background indexing completed; if so, apply the result.
     fn poll_loading(&mut self) -> bool {
-        let Some(state) = &self.loading else {
-            return false;
-        };
-        let mut guard = state.result.lock().unwrap();
-        let Some(result) = guard.take() else {
-            return false;
-        };
-        drop(guard);
-        let loading = self.loading.take().unwrap();
-        match result {
-            Ok(project) => {
-                self.file_symbols = collect_file_symbols(&project.tree);
-                self.buffers = BufferManager::new(project.tree.repo_root.clone());
-                let root_id = project.tree.root.id.clone();
-                self.focus = Focus::new(root_id.clone());
-                self.nav_history = vec![root_id];
-                self.nav_cursor = 0;
-                self.neighbors = None;
-                self.hover_id = None;
-                self.camera = None;
-                self.context_menu = None;
-                self.palette = palette::Palette::new();
-                self.tree = project.tree;
-                self.layout = project.layout;
-                self.textures = project.textures;
+        match self.loader.poll() {
+            LoaderPoll::Idle => false,
+            LoaderPoll::Loading(progress) => {
+                let changed = self.load_progress.as_ref() != Some(&progress);
+                self.load_progress = Some(progress);
+                changed
             }
-            Err(e) => eprintln!("open folder failed: {e}"),
+            LoaderPoll::Ready(result) => match *result {
+                Ok(project) => {
+                    self.install_project(project);
+                    self.load_progress = None;
+                    true
+                }
+                Err(error) => {
+                    self.load_progress = None;
+                    self.settings_notification = Some(format!("Could not open project: {error}"));
+                    true
+                }
+            },
         }
-        drop(loading);
-        true
+    }
+
+    fn install_project(&mut self, project: LoadResult) {
+        let LoadResult {
+            generation,
+            project_root,
+            tree,
+            layout,
+            warnings,
+            source_fingerprints,
+        } = project;
+        debug_assert!(self.loader.accepts(generation));
+        self.file_symbols = collect_file_symbols(&tree);
+        self.buffers = BufferManager::new(project_root.clone());
+        let root_id = tree.root.id.clone();
+        self.focus = Focus::new(root_id.clone());
+        self.nav_history = vec![root_id];
+        self.nav_cursor = 0;
+        self.neighbors = None;
+        self.hover_id = None;
+        self.camera = None;
+        self.context_menu = None;
+        self.palette = palette::Palette::new();
+        self.tree = tree;
+        self.layout = layout;
+        self.textures = TextureCache::new(
+            &project_root,
+            source_fingerprints,
+            self.settings.cache_mb as usize * 1024 * 1024,
+            self.settings.disk_cache_bytes(&project_root),
+        );
+        if !warnings.is_empty() {
+            self.settings_notification = Some(warnings.join("; "));
+        }
     }
 
     /// Render the loading progress overlay.
     fn render_loading(&self, vw: f64) -> gpui::Div {
-        let state = self.loading.as_ref().unwrap();
-        let phase = state
-            .progress
-            .phase
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let total = state
-            .progress
-            .files_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let parsed = state
-            .progress
-            .files_parsed
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let state = self.load_progress.as_ref().unwrap();
+        let phase = state.phase;
+        let total = state.files_total;
+        let parsed = state.files_parsed;
 
         let (status_text, fraction) = match phase {
             0 => ("Scanning files…".to_string(), 0.0_f32),
@@ -1833,14 +1837,6 @@ impl TreemapView {
                 }
             }
             2 => ("Building symbol tree…".to_string(), 1.0),
-            4 => {
-                if total > 0 {
-                    let frac = parsed as f32 / total as f32;
-                    (format!("Baking textures {parsed}/{total}…"), frac)
-                } else {
-                    ("Baking textures…".to_string(), 0.0)
-                }
-            }
             _ => ("Done".to_string(), 1.0),
         };
 
@@ -2368,7 +2364,7 @@ impl Render for TreemapView {
         }
 
         let (vw, vh) = Self::map_viewport(window);
-        let is_loading = self.loading.is_some();
+        let is_loading = self.loader.is_loading();
 
         let (items, doc_panel) = self.paint_items(vw, vh);
 
