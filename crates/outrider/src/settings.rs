@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_DISK_CACHE_BYTES: u64 = 1_073_741_824;
+pub(crate) const MAX_CACHE_MB: u32 = u32::MAX / (1024 * 1024);
 
 #[derive(Debug)]
 pub enum SettingsLoad {
@@ -100,7 +101,11 @@ impl Settings {
     }
 
     fn set_disk_cache_bytes_for_key(&mut self, key: String, bytes: u64) {
-        self.disk_cache_bytes.insert(key, bytes);
+        if bytes == 0 {
+            self.disk_cache_bytes.remove(&key);
+        } else {
+            self.disk_cache_bytes.insert(key, bytes);
+        }
     }
 
     pub fn load() -> SettingsLoad {
@@ -127,7 +132,7 @@ impl Settings {
             }
         };
         match serde_json::from_str(&json) {
-            Ok(settings) => SettingsLoad::Loaded(settings),
+            Ok(settings) => Self::sanitize_loaded(settings),
             Err(error) => {
                 let invalid_path = path.with_file_name("settings.invalid.json");
                 let preservation = std::fs::rename(path, &invalid_path)
@@ -141,6 +146,31 @@ impl Settings {
                         "Settings were invalid ({error}); using defaults.{preservation}"
                     ),
                 }
+            }
+        }
+    }
+
+    fn sanitize_loaded(mut settings: Self) -> SettingsLoad {
+        let mut warnings = Vec::new();
+        if settings.cache_mb == 0 || settings.cache_mb > MAX_CACHE_MB {
+            settings.cache_mb = default_cache_mb();
+            warnings.push(format!(
+                "cache_mb was outside the safe range 1..={MAX_CACHE_MB}; restored the default"
+            ));
+        }
+        let original_disk_entries = settings.disk_cache_bytes.len();
+        settings.disk_cache_bytes.retain(|_, bytes| *bytes != 0);
+        if settings.disk_cache_bytes.len() != original_disk_entries {
+            warnings.push(
+                "invalid zero-byte project disk cache values were restored to defaults".into(),
+            );
+        }
+        if warnings.is_empty() {
+            SettingsLoad::Loaded(settings)
+        } else {
+            SettingsLoad::Recovered {
+                settings,
+                warning: warnings.join("; "),
             }
         }
     }
@@ -214,6 +244,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.disk_cache_bytes_for_key("repo"), 1_073_741_824);
+    }
+
+    #[test]
+    fn zero_memory_cache_recovers_to_safe_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"filter_extensions":[],"filter_folders":[],"show_welcome":false,"cache_mb":0}"#,
+        )
+        .unwrap();
+
+        let SettingsLoad::Recovered { settings, warning } = Settings::load_from_path(&path) else {
+            panic!("zero cache must be recovered");
+        };
+
+        assert_eq!(settings.cache_mb, 256);
+        assert!(warning.contains("cache_mb"));
+    }
+
+    #[test]
+    fn oversized_memory_cache_recovers_to_safe_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"filter_extensions":[],"filter_folders":[],"show_welcome":false,"cache_mb":4294967295}"#,
+        )
+        .unwrap();
+
+        let SettingsLoad::Recovered { settings, warning } = Settings::load_from_path(&path) else {
+            panic!("unsafe cache size must be recovered");
+        };
+
+        assert_eq!(settings.cache_mb, 256);
+        assert!(warning.contains("cache_mb"));
+    }
+
+    #[test]
+    fn zero_project_disk_cache_recovers_to_project_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"filter_extensions":[],"filter_folders":[],"show_welcome":false,"cache_mb":128,"disk_cache_bytes":{"repo":0}}"#,
+        )
+        .unwrap();
+
+        let SettingsLoad::Recovered { settings, warning } = Settings::load_from_path(&path) else {
+            panic!("zero disk allowance must be recovered");
+        };
+
+        assert_eq!(settings.disk_cache_bytes_for_key("repo"), 1_073_741_824);
+        assert!(warning.contains("disk cache"));
     }
 
     #[test]

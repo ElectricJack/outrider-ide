@@ -139,16 +139,11 @@ struct SettingsDraft {
 
 impl SettingsDraft {
     fn from_settings(s: &settings::Settings, project: &std::path::Path) -> Self {
-        let disk_gb =
-            s.disk_cache_bytes(project) as f64 / settings::DEFAULT_DISK_CACHE_BYTES as f64;
         Self {
             filter_extensions: s.filter_extensions.join(", "),
             filter_folders: s.filter_folders.join(", "),
             cache_mb: s.cache_mb.to_string(),
-            disk_cache_gb: format!("{disk_gb:.3}")
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string(),
+            disk_cache_gb: format_gibibytes(s.disk_cache_bytes(project)),
             notification: None,
             active: SettingsField::Extensions,
         }
@@ -178,16 +173,31 @@ impl SettingsDraft {
             self.cache_mb.trim().parse::<u32>().map_err(|_| {
                 "Texture cache must be a whole number of MB within range".to_string()
             })?;
-        if cache_mb == 0 {
-            return Err("Texture cache must be greater than zero MB".into());
+        if cache_mb == 0 || cache_mb > settings::MAX_CACHE_MB {
+            return Err(format!(
+                "Texture cache must be between 1 and {} MB",
+                settings::MAX_CACHE_MB
+            ));
         }
         let disk_cache_bytes = parse_gibibytes(&self.disk_cache_gb)?;
         settings.filter_extensions = parse_list(&self.filter_extensions);
         settings.filter_folders = parse_list(&self.filter_folders);
+        settings.show_welcome = false;
         settings.cache_mb = cache_mb;
         settings.set_disk_cache_bytes(project, disk_cache_bytes);
         Ok(())
     }
+}
+
+fn format_gibibytes(bytes: u64) -> String {
+    let whole = bytes / settings::DEFAULT_DISK_CACHE_BYTES;
+    let remainder = bytes % settings::DEFAULT_DISK_CACHE_BYTES;
+    if remainder == 0 {
+        return whole.to_string();
+    }
+    let fraction = u128::from(remainder) * 5_u128.pow(30);
+    let fraction = format!("{fraction:030}");
+    format!("{whole}.{}", fraction.trim_end_matches('0'))
 }
 
 fn parse_gibibytes(input: &str) -> Result<u64, String> {
@@ -2726,6 +2736,32 @@ mod tests {
             settings.disk_cache_bytes(two),
             2 * crate::settings::DEFAULT_DISK_CACHE_BYTES
         );
+    }
+
+    #[test]
+    fn unchanged_disk_text_round_trips_exact_stored_bytes() {
+        let project = std::path::Path::new("D:/exact");
+        for bytes in [1, crate::settings::DEFAULT_DISK_CACHE_BYTES, u64::MAX] {
+            let mut settings = crate::settings::Settings::default();
+            settings.set_disk_cache_bytes(project, bytes);
+            let draft = SettingsDraft::from_settings(&settings, project);
+
+            draft.apply_to(&mut settings, project).unwrap();
+
+            assert_eq!(settings.disk_cache_bytes(project), bytes);
+        }
+    }
+
+    #[test]
+    fn saving_settings_still_disables_the_welcome_screen() {
+        let project = std::path::Path::new("D:/repo");
+        let mut settings = crate::settings::Settings::default();
+        assert!(settings.show_welcome);
+        let draft = SettingsDraft::from_settings(&settings, project);
+
+        draft.apply_to(&mut settings, project).unwrap();
+
+        assert!(!settings.show_welcome);
     }
 
     use std::collections::BTreeMap;
