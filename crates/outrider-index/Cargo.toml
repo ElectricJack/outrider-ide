@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+dirs = "6"
 ignore = "0.4.27"
 rayon = "1.7"
 ropey = "1.6"

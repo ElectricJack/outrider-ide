@@ -4,8 +4,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use outrider_index::churn::churn_counts;
-use outrider_index::index_repo;
+use outrider_index::churn::churn_counts_with_cache;
+use outrider_index::{index_repo, index_repo_outcome_with_cache};
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -44,27 +44,81 @@ fn git_fixture() -> tempfile::TempDir {
 }
 
 #[test]
-fn churn_counts_real_repo_writes_and_reuses_cache() {
+fn churn_counts_are_correct_and_reuse_head_keyed_cache() {
     let dir = git_fixture();
     let p = dir.path();
+    let cache_root = tempfile::tempdir().unwrap();
 
-    let counts = churn_counts(p).unwrap();
-    assert_eq!(counts.get("src/lib.rs"), Some(&3));
-    assert_eq!(counts.get("README.md"), Some(&1));
+    let outcome = churn_counts_with_cache(p, cache_root.path()).unwrap();
+    assert_eq!(outcome.counts.get("src/lib.rs"), Some(&3));
+    assert_eq!(outcome.counts.get("README.md"), Some(&1));
+    assert_eq!(outcome.warning, None);
 
-    let cache = p.join(".outrider/churn-cache.json");
-    assert!(cache.exists(), "cache written");
+    let cache = fs::read_dir(cache_root.path())
+        .unwrap()
+        .next()
+        .expect("project cache directory")
+        .unwrap()
+        .path()
+        .join("churn-cache.json");
+    assert!(cache.exists(), "cache written outside the repository");
 
-    // poison the cache counts but keep the HEAD key valid? No — prove reuse
-    // by asserting a second call returns identical data with the cache intact.
-    let mtime = fs::metadata(&cache).unwrap().modified().unwrap();
-    let again = churn_counts(p).unwrap();
-    assert_eq!(again, counts);
-    assert_eq!(
-        fs::metadata(&cache).unwrap().modified().unwrap(),
-        mtime,
-        "cache not rewritten"
-    );
+    // Poison a count while retaining the valid HEAD to prove the cache is reused.
+    let mut cached: serde_json::Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    cached["counts"]["src/lib.rs"] = 99.into();
+    fs::write(&cache, serde_json::to_vec_pretty(&cached).unwrap()).unwrap();
+    let again = churn_counts_with_cache(p, cache_root.path()).unwrap();
+    assert_eq!(again.counts.get("src/lib.rs"), Some(&99));
+    assert_eq!(again.warning, None);
+}
+
+#[test]
+fn churn_cache_is_not_written_inside_repository() {
+    let repo = git_fixture();
+    let cache = tempfile::tempdir().unwrap();
+
+    let outcome = churn_counts_with_cache(repo.path(), cache.path()).unwrap();
+
+    assert!(!outcome.counts.is_empty());
+    assert!(!repo.path().join(".outrider").exists());
+}
+
+#[test]
+fn unwritable_cache_still_returns_counts() {
+    let repo = git_fixture();
+    let invalid_cache_root = repo.path().join("regular-file");
+    fs::write(&invalid_cache_root, b"x").unwrap();
+
+    let outcome = churn_counts_with_cache(repo.path(), &invalid_cache_root).unwrap();
+
+    assert!(!outcome.counts.is_empty());
+    assert!(outcome.warning.is_some());
+}
+
+#[test]
+fn unexpected_git_metadata_failure_returns_warning() {
+    let repo = git_fixture();
+    let cache = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join(".git/config"), b"[invalid").unwrap();
+
+    let outcome = churn_counts_with_cache(repo.path(), cache.path()).unwrap();
+
+    assert!(outcome.counts.is_empty());
+    assert!(outcome.warning.is_some());
+}
+
+#[test]
+fn index_outcome_retains_churn_warning_after_successful_load() {
+    let repo = git_fixture();
+    let invalid_cache_root = repo.path().join("regular-file");
+    fs::write(&invalid_cache_root, b"x").unwrap();
+
+    let outcome = index_repo_outcome_with_cache(repo.path(), &[], &[], &invalid_cache_root)
+        .expect("cache failure must not fail indexing");
+
+    assert!(outcome.tree.root.churn_count > 0);
+    assert_eq!(outcome.warnings.len(), 1);
+    assert!(outcome.warnings[0].contains("churn cache"));
 }
 
 #[test]

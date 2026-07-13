@@ -40,19 +40,79 @@ impl Default for IndexProgress {
     }
 }
 
+/// A successfully indexed tree plus non-fatal warnings collected while loading it.
+pub struct IndexOutcome {
+    pub tree: SymbolTree,
+    pub warnings: Vec<String>,
+}
+
 /// Full indexing pipeline: scan → parse → assemble → dedupe → churn annotate.
 pub fn index_repo(
     repo_root: &Path,
     filter_extensions: &[String],
     filter_folders: &[String],
 ) -> anyhow::Result<SymbolTree> {
+    Ok(index_repo_outcome(repo_root, filter_extensions, filter_folders)?.tree)
+}
+
+/// Full indexing pipeline that retains non-fatal churn warnings.
+pub fn index_repo_outcome(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+) -> anyhow::Result<IndexOutcome> {
+    index_repo_outcome_impl(repo_root, filter_extensions, filter_folders, None, None)
+}
+
+/// Full indexing pipeline with an explicit application cache root.
+pub fn index_repo_outcome_with_cache(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+    cache_root: &Path,
+) -> anyhow::Result<IndexOutcome> {
+    index_repo_outcome_impl(
+        repo_root,
+        filter_extensions,
+        filter_folders,
+        None,
+        Some(cache_root),
+    )
+}
+
+fn index_repo_outcome_impl(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+    progress: Option<&IndexProgress>,
+    cache_root: Option<&Path>,
+) -> anyhow::Result<IndexOutcome> {
+    if let Some(progress) = progress {
+        progress.phase.store(0, Ordering::Relaxed);
+    }
     let files = scan_files(repo_root, filter_extensions, filter_folders)?;
-    let parsed_children = parse_all(repo_root, &files, None)?;
+    if let Some(progress) = progress {
+        progress.files_total.store(files.len(), Ordering::Relaxed);
+        progress.phase.store(1, Ordering::Relaxed);
+    }
+    let parsed_children = parse_all(repo_root, &files, progress)?;
+    if let Some(progress) = progress {
+        progress.phase.store(2, Ordering::Relaxed);
+    }
     let mut tree = build_tree(repo_root, &files, &parsed_children);
     dedupe_ids(&mut tree.root);
-    let counts = crate::churn::churn_counts(repo_root)?;
-    crate::churn::annotate(&mut tree, &counts);
-    Ok(tree)
+    let churn = match cache_root {
+        Some(cache_root) => crate::churn::churn_counts_with_cache(repo_root, cache_root)?,
+        None => crate::churn::churn_outcome(repo_root)?,
+    };
+    crate::churn::annotate(&mut tree, &churn.counts);
+    if let Some(progress) = progress {
+        progress.phase.store(3, Ordering::Relaxed);
+    }
+    Ok(IndexOutcome {
+        tree,
+        warnings: churn.warning.into_iter().collect(),
+    })
 }
 
 /// Full indexing pipeline with atomic progress reporting.
@@ -62,18 +122,26 @@ pub fn index_repo_with_progress(
     filter_folders: &[String],
     progress: &IndexProgress,
 ) -> anyhow::Result<SymbolTree> {
-    progress.phase.store(0, Ordering::Relaxed);
-    let files = scan_files(repo_root, filter_extensions, filter_folders)?;
-    progress.files_total.store(files.len(), Ordering::Relaxed);
-    progress.phase.store(1, Ordering::Relaxed);
-    let parsed_children = parse_all(repo_root, &files, Some(progress))?;
-    progress.phase.store(2, Ordering::Relaxed);
-    let mut tree = build_tree(repo_root, &files, &parsed_children);
-    dedupe_ids(&mut tree.root);
-    let counts = crate::churn::churn_counts(repo_root)?;
-    crate::churn::annotate(&mut tree, &counts);
-    progress.phase.store(3, Ordering::Relaxed);
-    Ok(tree)
+    Ok(
+        index_repo_with_progress_outcome(repo_root, filter_extensions, filter_folders, progress)?
+            .tree,
+    )
+}
+
+/// Full indexing pipeline with progress reporting and retained non-fatal warnings.
+pub fn index_repo_with_progress_outcome(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+    progress: &IndexProgress,
+) -> anyhow::Result<IndexOutcome> {
+    index_repo_outcome_impl(
+        repo_root,
+        filter_extensions,
+        filter_folders,
+        Some(progress),
+        None,
+    )
 }
 
 /// Parse source files in parallel. Dispatches to the correct parser based on
