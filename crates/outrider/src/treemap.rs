@@ -157,10 +157,16 @@ pub struct TreemapView {
 }
 
 /// Tracks a background indexing thread and its progress.
+struct LoadedProject {
+    tree: outrider_index::SymbolTree,
+    layout: outrider_layout::PackLayout,
+    textures: TextureCache,
+}
+
 struct LoadingState {
     folder_name: String,
     progress: Arc<outrider_index::IndexProgress>,
-    result: Arc<Mutex<Option<Result<outrider_index::SymbolTree, String>>>>,
+    result: Arc<Mutex<Option<Result<LoadedProject, String>>>>,
 }
 
 /// One shaped body/code line: canvas position, text, and colored runs.
@@ -230,7 +236,7 @@ struct PaintItem {
 
 /// Full-coverage colored runs for the first `len` bytes of a line from its
 /// highlight spans; gaps paint TEXT_PRIMARY. Run lengths sum exactly to `len`.
-fn runs_from_spans(len: usize, spans: &[HighlightSpan]) -> Vec<(usize, u32)> {
+pub(crate) fn runs_from_spans(len: usize, spans: &[HighlightSpan]) -> Vec<(usize, u32)> {
     let mut runs = Vec::new();
     let mut pos = 0;
     for s in spans {
@@ -733,13 +739,15 @@ impl TreemapView {
                     if rung == Rung::Card && !item.node.children.is_empty() {
                         let area = item.px.w * item.px.h;
                         if let Some(t) = self.textures.get(&item.node.id, area) {
-                            tex = t.level_for(item.px.h as f32).map(|img| TexQuad {
-                                x: item.px.x as f32,
-                                y: item.px.y as f32,
-                                w: item.px.w as f32,
-                                h: item.px.h as f32,
-                                image: img.clone(),
-                            });
+                            if let Some(img) = &t.image {
+                                tex = Some(TexQuad {
+                                    x: item.px.x as f32,
+                                    y: item.px.y as f32,
+                                    w: item.px.w as f32,
+                                    h: item.px.h as f32,
+                                    image: img.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -755,13 +763,15 @@ impl TreemapView {
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
                         if tw >= 1.0 && th >= 1.0 && ty < vh && ty + th > 0.0 {
                             if let Some(t) = self.textures.get(&item.node.id, tw * th) {
-                                tex = t.level_for(th as f32).map(|img| TexQuad {
-                                    x: tx as f32,
-                                    y: ty as f32,
-                                    w: tw as f32,
-                                    h: th as f32,
-                                    image: img.clone(),
-                                });
+                                if let Some(img) = &t.image {
+                                    tex = Some(TexQuad {
+                                        x: tx as f32,
+                                        y: ty as f32,
+                                        w: tw as f32,
+                                        h: th as f32,
+                                        image: img.clone(),
+                                    });
+                                }
                             }
                         }
                         if font > content::TEXT_FADE_LO {
@@ -855,14 +865,14 @@ impl TreemapView {
             let buffers = &mut self.buffers;
             let file_symbols = &self.file_symbols;
             let layout = &self.layout;
-            let leaf_snap = self.textures.leaf_bytes_snapshot();
+            let child_snap = self.textures.child_bytes_snapshot();
             self.textures.bake_queued(|id, rasterizer| {
                 let node = index.node(id)?;
                 if !content::is_leaf_item(node) {
                     let rect = layout.rects.get(id)?;
                     let level = index.depth(id).unwrap_or(0) as u8;
-                    let leaf_tex = |lid: &outrider_index::SymbolId| leaf_snap.get(lid).cloned();
-                    return Some(rasterize::bake_folder(node, *rect, layout, level, &leaf_tex));
+                    let child_tex = |cid: &outrider_index::SymbolId| child_snap.get(cid).cloned();
+                    return Some(rasterize::bake_container(node, *rect, layout, level, &child_tex));
                 }
                 let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
                 let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -1048,23 +1058,34 @@ impl TreemapView {
         self.start_loading(repo);
     }
 
-    /// Spawn a background thread to index `folder`, showing a progress overlay.
+    /// Spawn a background thread to index `folder`, compute layout, and
+    /// pre-bake all textures bottom-up so the view opens fully textured.
     fn start_loading(&mut self, folder: std::path::PathBuf) {
         let folder_name = folder
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| folder.to_string_lossy().into_owned());
         let progress = Arc::new(outrider_index::IndexProgress::new());
-        let result: Arc<Mutex<Option<Result<outrider_index::SymbolTree, String>>>> =
+        let result: Arc<Mutex<Option<Result<LoadedProject, String>>>> =
             Arc::new(Mutex::new(None));
 
         let p = Arc::clone(&progress);
         let r = Arc::clone(&result);
         let exts = self.settings.filter_extensions.clone();
         let dirs = self.settings.filter_folders.clone();
+        let cache_bytes = self.settings.cache_mb as usize * 1024 * 1024;
         std::thread::spawn(move || {
-            let res = outrider_index::index_repo_with_progress(&folder, &exts, &dirs, &p);
-            *r.lock().unwrap() = Some(res.map_err(|e| format!("{e:#}")));
+            let tree = match outrider_index::index_repo_with_progress(&folder, &exts, &dirs, &p) {
+                Ok(t) => t,
+                Err(e) => {
+                    *r.lock().unwrap() = Some(Err(format!("{e:#}")));
+                    return;
+                }
+            };
+            let layout = outrider_layout::pack(&tree, &world::pack_config());
+            let mut textures = TextureCache::new(cache_bytes);
+            rasterize::pre_bake_all(&tree, &layout, &mut textures, &p);
+            *r.lock().unwrap() = Some(Ok(LoadedProject { tree, layout, textures }));
         });
 
         self.textures.clear_disk_cache();
@@ -1083,12 +1104,10 @@ impl TreemapView {
         drop(guard);
         let loading = self.loading.take().unwrap();
         match result {
-            Ok(tree) => {
-                let layout = outrider_layout::pack(&tree, &world::pack_config());
-                self.file_symbols = collect_file_symbols(&tree);
-                self.buffers = BufferManager::new(tree.repo_root.clone());
-                self.textures = TextureCache::new(self.settings.cache_mb as usize * 1024 * 1024);
-                let root_id = tree.root.id.clone();
+            Ok(project) => {
+                self.file_symbols = collect_file_symbols(&project.tree);
+                self.buffers = BufferManager::new(project.tree.repo_root.clone());
+                let root_id = project.tree.root.id.clone();
                 self.focus = Focus::new(root_id.clone());
                 self.nav_history = vec![root_id];
                 self.nav_cursor = 0;
@@ -1097,8 +1116,9 @@ impl TreemapView {
                 self.camera = None;
                 self.context_menu = None;
                 self.palette = palette::Palette::new();
-                self.tree = tree;
-                self.layout = layout;
+                self.tree = project.tree;
+                self.layout = project.layout;
+                self.textures = project.textures;
             }
             Err(e) => eprintln!("open folder failed: {e}"),
         }
@@ -1124,6 +1144,14 @@ impl TreemapView {
                 }
             }
             2 => ("Building symbol tree…".to_string(), 1.0),
+            4 => {
+                if total > 0 {
+                    let frac = parsed as f32 / total as f32;
+                    (format!("Baking textures {parsed}/{total}…"), frac)
+                } else {
+                    ("Baking textures…".to_string(), 0.0)
+                }
+            }
             _ => ("Done".to_string(), 1.0),
         };
 
@@ -2290,7 +2318,7 @@ mod tests {
 
     use super::{
         code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
-        truncate_to_width, wrap_doc, BODY_PAD, HEADER, LINE_STEP,
+        truncate_to_width, wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};

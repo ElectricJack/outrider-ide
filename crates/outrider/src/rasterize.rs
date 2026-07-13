@@ -1,6 +1,7 @@
-//! Bakes far-zoom leaf source text into low-res BGRA images with a CPU
-//! mip chain (spec: docs/superpowers/specs/2026-07-11-texture-leaf-rendering-design.md).
+//! Bakes node textures: leaf text via cosmic-text, containers by compositing
+//! cached child textures. One texture per node, GPU handles scaling.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
@@ -10,88 +11,35 @@ use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Sw
 use gpui::RenderImage;
 use image::{Frame, ImageBuffer, Rgba};
 
-use crate::content::LINE_STEP;
+use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
+use outrider_layout::{PackLayout, Rect};
+
+use crate::buffers::{collect_file_symbols, BufferManager};
+use crate::content::{self, LINE_STEP};
 use crate::theme;
 use crate::treemap::BODY_PAD;
 use crate::world;
 
-/// Master mip level line height, px. Raise for crisper near-threshold text.
+/// Master texture line height, px.
 pub const MASTER_LINE_PX: f64 = 4.0;
 /// Master texture height cap; taller leaves stride rows to fit.
 pub const MAX_TEX_H: usize = 1024;
-/// Downsample until a level is at most this tall.
-pub const MIN_LEVEL_H: i32 = 8;
+/// Maximum pixel dimension (longer side) for a container thumbnail.
+const CONTAINER_TEX_MAX: f64 = 256.0;
 
-/// One source line: text plus colored runs (byte length, 0xRRGGBB) — the
-/// same shape `treemap::runs_from_spans` produces for the Text tier.
+/// One source line: text plus colored runs (byte length, 0xRRGGBB).
 pub type Line = (String, Vec<(usize, u32)>);
 
-/// A baked leaf: mip levels ordered largest→smallest, plus byte total for
-/// cache accounting. Empty when the leaf had no source lines.
-pub struct LeafTexture {
-    pub levels: Vec<Arc<RenderImage>>,
+/// A baked node texture: single image, no mip chain. GPU handles scaling.
+pub struct NodeTexture {
+    pub image: Option<Arc<RenderImage>>,
     pub bytes: usize,
 }
 
-/// Mip-level selection and empty-check helpers.
-impl LeafTexture {
-    /// The level to paint at `screen_h` on-screen pixels, or None if empty.
-    pub fn level_for(&self, screen_h: f32) -> Option<&Arc<RenderImage>> {
-        if self.levels.is_empty() {
-            return None;
-        }
-        let heights: Vec<u32> =
-            self.levels.iter().map(|l| l.size(0).height.0 as u32).collect();
-        Some(&self.levels[pick_level(&heights, screen_h)])
+impl NodeTexture {
+    pub fn empty() -> Self {
+        Self { image: None, bytes: 0 }
     }
-}
-
-/// Index of the smallest level (heights ordered largest→smallest) whose
-/// height still covers `screen_h`; clamps to the last level below that.
-pub fn pick_level(heights: &[u32], screen_h: f32) -> usize {
-    let mut best = 0;
-    for (i, &lh) in heights.iter().enumerate() {
-        if lh as f32 >= screen_h {
-            best = i;
-        } else {
-            break;
-        }
-    }
-    best
-}
-
-/// Alpha-weighted 2×2 box downsample of a straight-alpha RGBA buffer.
-/// Weighting by alpha avoids transparent texels dragging colors dark.
-#[allow(clippy::manual_checked_ops)] // guard pattern is clearer than checked_div
-pub(crate) fn downsample(src: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
-    let nw = (w / 2).max(1);
-    let nh = (h / 2).max(1);
-    let mut out = vec![0u8; (nw * nh) as usize * 4];
-    for oy in 0..nh {
-        for ox in 0..nw {
-            let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let sx = (ox * 2 + dx).min(w - 1);
-                    let sy = (oy * 2 + dy).min(h - 1);
-                    let i = ((sy * w + sx) * 4) as usize;
-                    let pa = src[i + 3] as u32;
-                    r += src[i] as u32 * pa;
-                    g += src[i + 1] as u32 * pa;
-                    b += src[i + 2] as u32 * pa;
-                    a += pa;
-                }
-            }
-            let o = ((oy * nw + ox) * 4) as usize;
-            if a > 0 {
-                out[o] = (r / a) as u8;
-                out[o + 1] = (g / a) as u8;
-                out[o + 2] = (b / a) as u8;
-            }
-            out[o + 3] = (a / 4) as u8;
-        }
-    }
-    (nw, nh, out)
 }
 
 /// Straight-alpha src-over blend of one RGBA pixel.
@@ -111,25 +59,21 @@ fn blend(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     dst[3] = oa as u8;
 }
 
-/// CPU rasterizer: holds a `cosmic-text` font system and glyph cache,
-/// reused across bake calls to avoid per-frame font loading overhead.
+/// CPU rasterizer: holds a `cosmic-text` font system and glyph cache.
 pub struct Rasterizer {
     font_system: FontSystem,
     swash: SwashCache,
 }
 
-/// Construction and the `bake` pipeline.
 impl Rasterizer {
-    /// Create a rasterizer with a fresh font system; loads system fonts lazily.
     pub fn new() -> Self {
         Self { font_system: FontSystem::new(), swash: SwashCache::new() }
     }
 
-    /// Rasterize `lines` at MASTER_LINE_PX per line (strided so the master
-    /// never exceeds MAX_TEX_H), then box-downsample the mip chain.
-    pub fn bake(&mut self, lines: &[Line]) -> LeafTexture {
+    /// Rasterize `lines` into a single BGRA texture.
+    pub fn bake(&mut self, lines: &[Line]) -> NodeTexture {
         if lines.is_empty() {
-            return LeafTexture { levels: Vec::new(), bytes: 0 };
+            return NodeTexture::empty();
         }
         let stride = lines.len().div_ceil(MAX_TEX_H).max(1);
         let rows: Vec<&Line> = lines.iter().step_by(stride).collect();
@@ -139,9 +83,6 @@ impl Rasterizer {
         let pad = (BODY_PAD / LINE_STEP * l).round() as i32;
         let font_size = (l / 1.3) as f32;
 
-        // One cosmic buffer holds every row, newline-separated; runs map
-        // 1:1 onto rich-text spans. Runs from runs_from_spans always cover
-        // the full line, but clamp defensively for hand-built inputs.
         let mut text = String::new();
         let mut spans: Vec<(usize, usize, Option<u32>)> = Vec::new();
         for (line, runs) in &rows {
@@ -202,27 +143,16 @@ impl Rasterizer {
             },
         );
 
-        let mut levels = Vec::new();
-        let mut bytes = 0usize;
-        let (mut cw, mut ch, mut cur) = (w, h, rgba);
-        loop {
-            let mut bgra = cur.clone();
-            for p in bgra.chunks_exact_mut(4) {
-                p.swap(0, 2);
-            }
-            bytes += bgra.len();
-            let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(cw, ch, bgra)
-                .expect("buffer sized to cw*ch*4");
-            levels.push(Arc::new(RenderImage::new(vec![Frame::new(img)])));
-            if ch as i32 <= MIN_LEVEL_H || cw <= 1 {
-                break;
-            }
-            (cw, ch, cur) = {
-                let (nw, nh, next) = downsample(&cur, cw, ch);
-                (nw, nh, next)
-            };
+        for p in rgba.chunks_exact_mut(4) {
+            p.swap(0, 2);
         }
-        LeafTexture { levels, bytes }
+        let bytes = rgba.len();
+        let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, rgba)
+            .expect("buffer sized to w*h*4");
+        NodeTexture {
+            image: Some(Arc::new(RenderImage::new(vec![Frame::new(img)]))),
+            bytes,
+        }
     }
 }
 
@@ -231,63 +161,45 @@ fn ct_color(c: u32) -> Color {
     Color::rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
-use outrider_index::{SymbolId, SymbolKind, SymbolNode};
-use outrider_layout::{PackLayout, Rect};
-
-use std::collections::HashMap;
-
-/// Maximum pixel dimension (longer side) for a folder thumbnail texture.
-const FOLDER_TEX_MAX: f64 = 256.0;
-
-/// Rasterize a container's subtree into a mipped texture. Leaf children
-/// with an already-cached text texture get composited at the target
-/// resolution; others fall back to themed colored rectangles.
-pub fn bake_folder(
+/// Rasterize a container's subtree into a single texture. Composites
+/// cached child textures where available, falls back to colored rects.
+pub fn bake_container(
     node: &SymbolNode,
     container_rect: Rect,
     layout: &PackLayout,
     base_level: u8,
-    leaf_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
-) -> LeafTexture {
+    child_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
+) -> NodeTexture {
     if node.children.is_empty() || container_rect.w < 1.0 || container_rect.h < 1.0 {
-        return LeafTexture { levels: Vec::new(), bytes: 0 };
+        return NodeTexture::empty();
     }
     let aspect = container_rect.w / container_rect.h;
     let (tw, th) = if aspect >= 1.0 {
-        (FOLDER_TEX_MAX as u32, (FOLDER_TEX_MAX / aspect).ceil().max(1.0) as u32)
+        (CONTAINER_TEX_MAX as u32, (CONTAINER_TEX_MAX / aspect).ceil().max(1.0) as u32)
     } else {
-        ((FOLDER_TEX_MAX * aspect).ceil().max(1.0) as u32, FOLDER_TEX_MAX as u32)
+        ((CONTAINER_TEX_MAX * aspect).ceil().max(1.0) as u32, CONTAINER_TEX_MAX as u32)
     };
     let sx = tw as f64 / container_rect.w;
     let sy = th as f64 / container_rect.h;
 
     let mut rgba = vec![0u8; (tw as usize) * (th as usize) * 4];
-    folder_fill(node, &container_rect, layout, sx, sy, tw, th, &mut rgba, base_level + 1, leaf_tex);
+    container_fill(node, &container_rect, layout, sx, sy, tw, th, &mut rgba, base_level + 1, child_tex);
 
     for p in rgba.chunks_exact_mut(4) {
         p.swap(0, 2);
     }
-
-    let mut levels = Vec::new();
-    let mut bytes = 0usize;
-    let (mut cw, mut ch, mut cur) = (tw, th, rgba);
-    loop {
-        bytes += cur.len();
-        let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(cw, ch, cur.clone())
-            .expect("buffer sized to cw*ch*4");
-        levels.push(Arc::new(RenderImage::new(vec![Frame::new(img)])));
-        if ch as i32 <= MIN_LEVEL_H || cw <= 1 {
-            break;
-        }
-        (cw, ch, cur) = downsample(&cur, cw, ch);
+    let bytes = rgba.len();
+    let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(tw, th, rgba)
+        .expect("buffer sized to tw*th*4");
+    NodeTexture {
+        image: Some(Arc::new(RenderImage::new(vec![Frame::new(img)]))),
+        bytes,
     }
-    LeafTexture { levels, bytes }
 }
 
-/// Recursively fill descendant rectangles into the RGBA buffer.
-/// For leaf children with a cached texture, composites the BGRA pixels
-/// (scaled to fit the destination rect) on top of the fill.
-fn folder_fill(
+/// Recursively fill descendant rectangles into the RGBA buffer, compositing
+/// cached child textures on top of themed fills.
+fn container_fill(
     node: &SymbolNode,
     root: &Rect,
     layout: &PackLayout,
@@ -297,7 +209,7 @@ fn folder_fill(
     th: u32,
     rgba: &mut [u8],
     level: u8,
-    leaf_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
+    child_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
 ) {
     for child in &node.children {
         let Some(r) = layout.rects.get(&child.id) else { continue };
@@ -316,20 +228,7 @@ fn folder_fill(
         } else {
             theme::BoxKind::File
         };
-        let tint = match &child.id.kind {
-            SymbolKind::Folder => match child.name.as_str() {
-                "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
-                "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
-                _ => theme::BoxTint::Normal,
-            },
-            SymbolKind::Item { label } => match label.as_str() {
-                "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef" => {
-                    theme::BoxTint::TypeDef
-                }
-                _ => theme::BoxTint::Normal,
-            },
-            _ => theme::BoxTint::Normal,
-        };
+        let tint = classify_tint_node(child);
         let fill = theme::box_fill(kind, level, tint);
         let border = theme::border_for(fill);
         let (fr, fg, fb) = rgb_u8(fill);
@@ -352,13 +251,10 @@ fn folder_fill(
             }
         }
 
-        if is_leaf {
-            if let Some(src_bgra) = leaf_tex(&child.id) {
-                composite_leaf(
-                    &src_bgra, pw as u32, ph as u32,
-                    px, py, tw, th, rgba,
-                );
-            }
+        if let Some(src_bgra) = child_tex(&child.id) {
+            composite_bgra(&src_bgra, pw as u32, ph as u32, px, py, tw, th, rgba);
+        } else if !child.children.is_empty() {
+            container_fill(child, root, layout, sx, sy, tw, th, rgba, level.saturating_add(1), child_tex);
         }
 
         if child.churn > 0.0 {
@@ -374,17 +270,29 @@ fn folder_fill(
                 }
             }
         }
-
-        if !child.children.is_empty() {
-            folder_fill(child, root, layout, sx, sy, tw, th, rgba, level.saturating_add(1), leaf_tex);
-        }
     }
 }
 
-/// Nearest-neighbor scale a BGRA source into the destination RGBA buffer,
-/// blending non-transparent pixels via src-over. The source bytes are
-/// from a RenderImage which stores BGRA; we swap channels on read.
-fn composite_leaf(
+fn classify_tint_node(node: &SymbolNode) -> theme::BoxTint {
+    match &node.id.kind {
+        SymbolKind::Folder => match node.name.as_str() {
+            "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
+            "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
+            _ => theme::BoxTint::Normal,
+        },
+        SymbolKind::Item { label } => match label.as_str() {
+            "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef" => {
+                theme::BoxTint::TypeDef
+            }
+            _ => theme::BoxTint::Normal,
+        },
+        _ => theme::BoxTint::Normal,
+    }
+}
+
+/// Nearest-neighbor scale BGRA source into destination RGBA buffer via
+/// src-over blend. Insets by 1px to avoid overwriting borders.
+fn composite_bgra(
     src_bgra: &[u8],
     dst_w: u32,
     dst_h: u32,
@@ -421,8 +329,8 @@ fn composite_leaf(
             if dx < 0 || dx >= buf_w as i32 {
                 continue;
             }
-            let sx = (ox as u64 * src_w as u64 / inner_w as u64) as u32;
-            let si = (sy * src_w + sx) as usize * 4;
+            let sxx = (ox as u64 * src_w as u64 / inner_w as u64) as u32;
+            let si = (sy * src_w + sxx) as usize * 4;
             if si + 3 >= src_bgra.len() {
                 continue;
             }
@@ -446,16 +354,15 @@ fn rgb_u8(c: u32) -> (u8, u8, u8) {
     ((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
-/// Bakes per frame; keeps zoom-out pop-in bounded without stalling a frame.
+// ── Texture cache ────────────────────────────────────────────────────
+
+/// Bakes per frame for on-demand misses.
 pub const BAKES_PER_FRAME: usize = 4;
-/// Default in-memory texture budget (256 MB), used by tests; production
-/// reads from `Settings::cache_mb`.
 #[cfg(test)]
 const DEFAULT_CACHE_MB: u32 = 256;
 
-/// Single cache slot: baked texture plus a logical clock tick for LRU ordering.
 struct Entry {
-    tex: LeafTexture,
+    tex: NodeTexture,
     last_used: u64,
 }
 
@@ -465,64 +372,46 @@ fn disk_key(id: &SymbolId) -> String {
     format!("{:016x}", h.finish())
 }
 
-fn save_to_disk(dir: &std::path::Path, id: &SymbolId, tex: &LeafTexture) {
-    if tex.levels.is_empty() {
-        return;
-    }
+fn save_to_disk(dir: &std::path::Path, id: &SymbolId, tex: &NodeTexture) {
+    let Some(img) = &tex.image else { return };
     let path = dir.join(format!("{}.tex", disk_key(id)));
     let Ok(mut f) = std::fs::File::create(&path) else { return };
-    let n = tex.levels.len() as u32;
-    let _ = f.write_all(&n.to_le_bytes());
-    for level in &tex.levels {
-        let sz = level.size(0);
-        let w = sz.width.0 as u32;
-        let h = sz.height.0 as u32;
-        let _ = f.write_all(&w.to_le_bytes());
-        let _ = f.write_all(&h.to_le_bytes());
-        if let Some(bytes) = level.as_bytes(0) {
-            let len = bytes.len() as u32;
-            let _ = f.write_all(&len.to_le_bytes());
-            let _ = f.write_all(bytes);
-        } else {
-            let _ = f.write_all(&0u32.to_le_bytes());
-        }
+    let sz = img.size(0);
+    let w = sz.width.0 as u32;
+    let h = sz.height.0 as u32;
+    let _ = f.write_all(&w.to_le_bytes());
+    let _ = f.write_all(&h.to_le_bytes());
+    if let Some(bytes) = img.as_bytes(0) {
+        let len = bytes.len() as u32;
+        let _ = f.write_all(&len.to_le_bytes());
+        let _ = f.write_all(bytes);
     }
 }
 
-fn load_from_disk(dir: &std::path::Path, id: &SymbolId) -> Option<LeafTexture> {
+fn load_from_disk(dir: &std::path::Path, id: &SymbolId) -> Option<NodeTexture> {
     let path = dir.join(format!("{}.tex", disk_key(id)));
     let mut f = std::fs::File::open(&path).ok()?;
     let mut buf4 = [0u8; 4];
     f.read_exact(&mut buf4).ok()?;
-    let n = u32::from_le_bytes(buf4) as usize;
-    if n == 0 || n > 20 {
+    let w = u32::from_le_bytes(buf4);
+    f.read_exact(&mut buf4).ok()?;
+    let h = u32::from_le_bytes(buf4);
+    f.read_exact(&mut buf4).ok()?;
+    let len = u32::from_le_bytes(buf4) as usize;
+    if len == 0 || w == 0 || h == 0 {
         return None;
     }
-    let mut levels = Vec::with_capacity(n);
-    let mut bytes = 0usize;
-    for _ in 0..n {
-        f.read_exact(&mut buf4).ok()?;
-        let w = u32::from_le_bytes(buf4);
-        f.read_exact(&mut buf4).ok()?;
-        let h = u32::from_le_bytes(buf4);
-        f.read_exact(&mut buf4).ok()?;
-        let len = u32::from_le_bytes(buf4) as usize;
-        if len == 0 || w == 0 || h == 0 {
-            return None;
-        }
-        let mut data = vec![0u8; len];
-        f.read_exact(&mut data).ok()?;
-        bytes += data.len();
-        let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, data)?;
-        levels.push(Arc::new(RenderImage::new(vec![Frame::new(img)])));
-    }
-    Some(LeafTexture { levels, bytes })
+    let mut data = vec![0u8; len];
+    f.read_exact(&mut data).ok()?;
+    let bytes = data.len();
+    let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, data)?;
+    Some(NodeTexture {
+        image: Some(Arc::new(RenderImage::new(vec![Frame::new(img)]))),
+        bytes,
+    })
 }
 
-/// Per-leaf texture cache: misses queue during the item pass, then
-/// `bake_queued` bakes the largest few and LRU-evicts past the budget.
-/// Textures are persisted to disk so evicted entries can be reloaded
-/// without re-rendering.
+/// Per-node texture cache with LRU eviction and disk persistence.
 pub struct TextureCache {
     raster: Rasterizer,
     entries: HashMap<SymbolId, Entry>,
@@ -534,9 +423,7 @@ pub struct TextureCache {
     disk_dir: Option<PathBuf>,
 }
 
-/// LRU cache management, miss queuing, and frame-gated baking.
 impl TextureCache {
-    /// Create a cache with `max_bytes` total budget across all mip levels.
     pub fn new(max_bytes: usize) -> Self {
         let disk_dir = dirs::cache_dir().map(|d| {
             let p = d.join("outrider").join("textures");
@@ -555,14 +442,12 @@ impl TextureCache {
         }
     }
 
-    /// True if a texture for `id` is already cached (does not queue).
     pub fn contains(&self, id: &SymbolId) -> bool {
         self.entries.contains_key(id)
     }
 
-    /// Cache lookup. A hit refreshes LRU recency; a miss checks the disk
-    /// cache first, then queues the leaf for `bake_queued`.
-    pub fn get(&mut self, id: &SymbolId, screen_area: f64) -> Option<&LeafTexture> {
+    /// Cache lookup. Hit refreshes LRU; miss checks disk, then queues.
+    pub fn get(&mut self, id: &SymbolId, screen_area: f64) -> Option<&NodeTexture> {
         self.clock += 1;
         if self.entries.contains_key(id) {
             let e = self.entries.get_mut(id).unwrap();
@@ -580,39 +465,32 @@ impl TextureCache {
         None
     }
 
-    /// True when at least one miss is queued and `bake_queued` should be called.
     pub fn has_queued(&self) -> bool {
         !self.queue.is_empty()
     }
 
-    /// Snapshot of the smallest mip-level BGRA bytes for all cached entries.
-    /// Used by `bake_folder` to composite leaf text into folder thumbnails.
-    pub fn leaf_bytes_snapshot(&self) -> HashMap<SymbolId, Vec<u8>> {
+    /// BGRA bytes snapshot for compositing into parent textures.
+    pub fn child_bytes_snapshot(&self) -> HashMap<SymbolId, Vec<u8>> {
         self.entries
             .iter()
             .filter_map(|(id, e)| {
-                let level = e.tex.levels.last()?;
-                let bytes = level.as_bytes(0)?;
+                let img = e.tex.image.as_ref()?;
+                let bytes = img.as_bytes(0)?;
                 Some((id.clone(), bytes.to_vec()))
             })
             .collect()
     }
 
-    /// Bake up to BAKES_PER_FRAME queued items, largest on screen first,
-    /// then evict LRU entries past the byte budget. The callback receives
-    /// the `SymbolId` and a `&mut Rasterizer` and returns a ready-to-cache
-    /// `LeafTexture` (or `None` for negative caching). Returns whether
-    /// misses remain (the caller schedules a repaint so they bake next frame).
+    /// Bake up to BAKES_PER_FRAME queued items, evict past budget.
     pub fn bake_queued(
         &mut self,
-        mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<LeafTexture>,
+        mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
     ) -> bool {
         self.queue.sort_by(|a, b| b.1.total_cmp(&a.1));
         let queue = std::mem::take(&mut self.queue);
         let mut it = queue.into_iter();
         for (id, _) in it.by_ref().take(BAKES_PER_FRAME) {
-            let tex = bake_fn(&id, &mut self.raster)
-                .unwrap_or_else(|| LeafTexture { levels: Vec::new(), bytes: 0 });
+            let tex = bake_fn(&id, &mut self.raster).unwrap_or_else(NodeTexture::empty);
             if let Some(dir) = &self.disk_dir {
                 save_to_disk(dir, &id, &tex);
             }
@@ -621,6 +499,21 @@ impl TextureCache {
             self.entries.insert(id, Entry { tex, last_used: self.clock });
         }
         let remaining = it.next().is_some();
+        self.evict();
+        remaining
+    }
+
+    /// Insert a pre-baked texture (used by the bulk pre-bake pass).
+    pub fn insert(&mut self, id: SymbolId, tex: NodeTexture) {
+        if let Some(dir) = &self.disk_dir {
+            save_to_disk(dir, &id, &tex);
+        }
+        self.bytes += tex.bytes;
+        self.clock += 1;
+        self.entries.insert(id, Entry { tex, last_used: self.clock });
+    }
+
+    fn evict(&mut self) {
         while self.bytes > self.max_bytes {
             let Some(victim) = self
                 .entries
@@ -632,18 +525,16 @@ impl TextureCache {
             };
             let e = self.entries.remove(&victim).unwrap();
             self.bytes -= e.tex.bytes;
-            self.retired.extend(e.tex.levels);
+            if let Some(img) = e.tex.image {
+                self.retired.push(img);
+            }
         }
-        remaining
     }
 
-    /// Evicted images, for the caller to hand to `window.drop_image` so
-    /// atlas memory is actually reclaimed.
     pub fn take_retired(&mut self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut self.retired)
     }
 
-    /// Wipe the on-disk texture cache (e.g. when opening a new folder).
     pub fn clear_disk_cache(&self) {
         if let Some(dir) = &self.disk_dir {
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -677,6 +568,83 @@ impl TextureCache {
     }
 }
 
+// ── Pre-bake all textures bottom-up ──────────────────────────────────
+
+use crate::treemap::runs_from_spans;
+
+/// Bake every node in the tree bottom-up: leaves first, then containers
+/// compositing their children's cached textures. Called on the background
+/// thread at the end of indexing so the view opens fully textured.
+pub fn pre_bake_all(
+    tree: &SymbolTree,
+    layout: &PackLayout,
+    cache: &mut TextureCache,
+    progress: &outrider_index::IndexProgress,
+) {
+    progress.phase.store(4, std::sync::atomic::Ordering::Relaxed);
+    let file_symbols = collect_file_symbols(tree);
+    let mut buffers = BufferManager::new(tree.repo_root.clone());
+
+    let mut order: Vec<(&SymbolNode, u8)> = Vec::new();
+    fn collect_nodes<'a>(node: &'a SymbolNode, depth: u8, out: &mut Vec<(&'a SymbolNode, u8)>) {
+        for child in &node.children {
+            collect_nodes(child, depth.saturating_add(1), out);
+        }
+        out.push((node, depth));
+    }
+    collect_nodes(&tree.root, 0, &mut order);
+
+    let total = order.len();
+    progress.files_total.store(total, std::sync::atomic::Ordering::Relaxed);
+    progress.files_parsed.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    for (i, &(node, depth)) in order.iter().enumerate() {
+        if cache.contains(&node.id) {
+            progress.files_parsed.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+
+        if content::is_leaf_item(node) {
+            let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
+            let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
+            if let Some(m) = buffers.get(&rel, syms) {
+                if let Some(start) = m.symbol_start_line(&node.id) {
+                    let count = (node.measure as usize)
+                        .min(m.buffer.len_lines().saturating_sub(start));
+                    let mut lines: Vec<Line> = Vec::with_capacity(count);
+                    for j in 0..count {
+                        if let Some((text, spans)) = m.buffer.line(start + j) {
+                            let runs = runs_from_spans(text.len(), spans);
+                            lines.push((text, runs));
+                        }
+                    }
+                    if !lines.is_empty() {
+                        let tex = cache.raster.bake(&lines);
+                        cache.insert(node.id.clone(), tex);
+                    } else {
+                        cache.insert(node.id.clone(), NodeTexture::empty());
+                    }
+                } else {
+                    cache.insert(node.id.clone(), NodeTexture::empty());
+                }
+            } else {
+                cache.insert(node.id.clone(), NodeTexture::empty());
+            }
+        } else if !node.children.is_empty() {
+            if let Some(rect) = layout.rects.get(&node.id) {
+                let snap = cache.child_bytes_snapshot();
+                let child_lookup = |id: &SymbolId| snap.get(id).cloned();
+                let tex = bake_container(node, *rect, layout, depth, &child_lookup);
+                cache.insert(node.id.clone(), tex);
+            }
+        }
+
+        progress.files_parsed.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,53 +654,28 @@ mod tests {
     }
 
     #[test]
-    fn pick_level_takes_smallest_covering_height() {
-        let heights = [40, 20, 10, 5];
-        assert_eq!(pick_level(&heights, 50.0), 0); // bigger than all: master
-        assert_eq!(pick_level(&heights, 12.0), 1); // 20 covers, 10 doesn't
-        assert_eq!(pick_level(&heights, 10.0), 2); // exact cover
-        assert_eq!(pick_level(&heights, 3.0), 3);  // smaller than all: last
-    }
-
-    #[test]
-    fn downsample_is_alpha_weighted_2x2_average() {
-        // 2x2 RGBA: one opaque red pixel, three transparent.
-        let src = [255, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let (w, h, out) = downsample(&src, 2, 2);
-        assert_eq!((w, h), (1, 1));
-        // Color is alpha-weighted (pure red survives), alpha is the mean.
-        assert_eq!(&out, &[255, 0, 0, 63]);
-    }
-
-    #[test]
-    fn bake_dimensions_and_mip_chain() {
+    fn bake_dimensions_single_image() {
         let lines: Vec<Line> = (0..10).map(|_| plain("fn foo() {}")).collect();
         let tex = Rasterizer::new().bake(&lines);
-        // L=4 → 40px tall; width = round(PAGE_W/LINE_STEP*4) = 123.
-        let dims: Vec<(i32, i32)> = tex
-            .levels
-            .iter()
-            .map(|l| (l.size(0).width.0, l.size(0).height.0))
-            .collect();
-        assert_eq!(dims, vec![(123, 40), (61, 20), (30, 10), (15, 5)]);
-        assert_eq!(tex.bytes, (123 * 40 + 61 * 20 + 30 * 10 + 15 * 5) * 4);
+        let img = tex.image.as_ref().unwrap();
+        assert_eq!(img.size(0).width.0, 123);
+        assert_eq!(img.size(0).height.0, 40);
+        assert_eq!(tex.bytes, 123 * 40 * 4);
     }
 
     #[test]
     fn bake_strides_huge_leaves_to_height_cap() {
         let lines: Vec<Line> = (0..3000).map(|_| plain("x")).collect();
         let tex = Rasterizer::new().bake(&lines);
-        // stride = ceil(3000/1024) = 3 → 1000 rows; L = 1024/1000 = 1.024.
-        assert_eq!(tex.levels[0].size(0).height.0, 1024);
+        assert_eq!(tex.image.unwrap().size(0).height.0, 1024);
     }
 
     #[test]
     fn bake_renders_glyphs_in_bgra() {
-        // Red runs; if the font resolved and channels are BGRA, every
-        // covered pixel is red-dominant: byte[2] (R) >= byte[0] (B).
         let lines: Vec<Line> = (0..8).map(|_| plain("MMMMMMMMMM")).collect();
         let tex = Rasterizer::new().bake(&lines);
-        let bytes = tex.levels[0].as_bytes(0).unwrap();
+        let img = tex.image.unwrap();
+        let bytes = img.as_bytes(0).unwrap();
         let covered: Vec<&[u8]> =
             bytes.chunks_exact(4).filter(|p| p[3] > 0).collect();
         assert!(!covered.is_empty(), "no glyph coverage — font not found?");
@@ -744,27 +687,17 @@ mod tests {
         let lines: Vec<Line> = (0..5).map(|_| plain("let x = 1;")).collect();
         let a = Rasterizer::new().bake(&lines);
         let b = Rasterizer::new().bake(&lines);
-        assert_eq!(a.levels.len(), b.levels.len());
-        for (la, lb) in a.levels.iter().zip(&b.levels) {
-            assert_eq!(la.as_bytes(0), lb.as_bytes(0));
-        }
+        assert_eq!(
+            a.image.unwrap().as_bytes(0),
+            b.image.unwrap().as_bytes(0),
+        );
     }
 
     #[test]
     fn empty_lines_produce_empty_texture() {
         let tex = Rasterizer::new().bake(&[]);
-        assert!(tex.levels.is_empty());
+        assert!(tex.image.is_none());
         assert_eq!(tex.bytes, 0);
-    }
-
-    #[test]
-    fn level_for_picks_by_screen_height() {
-        let lines: Vec<Line> = (0..10).map(|_| plain("y")).collect();
-        let tex = Rasterizer::new().bake(&lines);
-        assert_eq!(tex.level_for(35.0).unwrap().size(0).height.0, 40);
-        assert_eq!(tex.level_for(12.0).unwrap().size(0).height.0, 20);
-        assert_eq!(tex.level_for(2.0).unwrap().size(0).height.0, 5);
-        assert!(Rasterizer::new().bake(&[]).level_for(10.0).is_none());
     }
 
     use outrider_index::{SymbolId, SymbolKind};
@@ -777,7 +710,7 @@ mod tests {
         }
     }
 
-    fn some_tex(n: usize, raster: &mut Rasterizer) -> Option<LeafTexture> {
+    fn some_tex(n: usize, raster: &mut Rasterizer) -> Option<NodeTexture> {
         let lines: Vec<Line> = (0..n).map(|_| plain("let x = 1;")).collect();
         Some(raster.bake(&lines))
     }
@@ -806,7 +739,7 @@ mod tests {
         assert!(cache.get(&sid("nofile"), 1.0).is_none());
         assert!(!cache.bake_queued(|_, _| None));
         let tex = cache.get(&sid("nofile"), 1.0).expect("negative-cached");
-        assert!(tex.levels.is_empty());
+        assert!(tex.image.is_none());
         assert!(!cache.has_queued());
     }
 
@@ -822,7 +755,7 @@ mod tests {
         assert!(cache.get(&sid("b"), 1.0).is_some());
         assert!(cache.get(&sid("a"), 1.0).is_none());
         let retired = cache.take_retired();
-        assert!(!retired.is_empty(), "evicted levels are retired");
+        assert!(!retired.is_empty(), "evicted image is retired");
         assert!(cache.take_retired().is_empty(), "drained");
     }
 
