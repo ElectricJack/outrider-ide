@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, Bounds,
-    BorderStyle, ContentMask, Context, Corners, ElementId, FocusHandle, Pixels, RenderImage,
-    TextAlign, TextRun, Window,
+    canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, BorderStyle,
+    Bounds, ContentMask, Context, Corners, ElementId, FocusHandle, Pixels, RenderImage, TextAlign,
+    TextRun, Window,
 };
 use outrider_index::buffer::HighlightSpan;
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
@@ -17,12 +17,12 @@ use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
-use crate::palette;
 use crate::chrome;
-use crate::settings;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
+use crate::palette;
 use crate::rasterize::{self, TextureCache};
+use crate::settings;
 use crate::theme;
 use crate::world::{self, Draw, LeafDraw, Rung};
 
@@ -82,7 +82,11 @@ fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
             if wlen == 0 {
                 continue;
             }
-            let need = if line_len == 0 { wlen } else { line_len + 1 + wlen };
+            let need = if line_len == 0 {
+                wlen
+            } else {
+                line_len + 1 + wlen
+            };
             if need > budget {
                 rows.push(std::mem::take(&mut line));
                 line.push_str(word);
@@ -314,7 +318,11 @@ fn code_line(
 ) -> Option<(String, Vec<(usize, u32)>)> {
     let shown = truncate_to_width(text, w, font_px)?;
     let truncated = shown != text;
-    let kept = if truncated { shown.len() - '…'.len_utf8() } else { shown.len() };
+    let kept = if truncated {
+        shown.len() - '…'.len_utf8()
+    } else {
+        shown.len()
+    };
     let mut runs = runs_from_spans(kept, spans);
     if truncated {
         runs.push(('…'.len_utf8(), theme::TEXT_PRIMARY));
@@ -398,7 +406,12 @@ fn leaf_text_body(
                 }
                 if let Some((text, spans)) = m.buffer.line(start + j) {
                     if let Some((shown, runs)) = code_line(&text, spans, label_w as f32, font) {
-                        out.push(BodyText { x, y: y as f32, text: shown, runs });
+                        out.push(BodyText {
+                            x,
+                            y: y as f32,
+                            text: shown,
+                            runs,
+                        });
                     }
                 }
             }
@@ -420,7 +433,12 @@ fn leaf_text_body(
         };
         if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
             let len = shown.len();
-            out.push(BodyText { x, y: y as f32, text: shown, runs: vec![(len, color)] });
+            out.push(BodyText {
+                x,
+                y: y as f32,
+                text: shown,
+                runs: vec![(len, color)],
+            });
         }
     }
     out
@@ -465,7 +483,9 @@ fn pinned_stack_h(
         if index.node(anc).is_none_or(|n| n.name.is_empty()) {
             continue;
         }
-        let Some(r) = layout.rects.get(anc) else { continue };
+        let Some(r) = layout.rects.get(anc) else {
+            continue;
+        };
         let (_, sy) = cam.world_to_screen(r.x, r.y, vw, vh);
         bottom = sy.max(0.0).max(bottom) + hdr;
     }
@@ -483,20 +503,17 @@ fn inset_top(mut cam: Camera, r: Rect, inset: f64, vh: f64) -> Camera {
 /// Map a symbol node to the semantic tint for its box background.
 fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     match &node.id.kind {
-        SymbolKind::Folder => {
-            match node.name.as_str() {
-                "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
-                "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
-                _ => theme::BoxTint::Normal,
+        SymbolKind::Folder => match node.name.as_str() {
+            "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
+            "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
+            _ => theme::BoxTint::Normal,
+        },
+        SymbolKind::Item { label } => match label.as_str() {
+            "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef" => {
+                theme::BoxTint::TypeDef
             }
-        }
-        SymbolKind::Item { label } => {
-            match label.as_str() {
-                "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef"
-                    => theme::BoxTint::TypeDef,
-                _ => theme::BoxTint::Normal,
-            }
-        }
+            _ => theme::BoxTint::Normal,
+        },
         _ => theme::BoxTint::Normal,
     }
 }
@@ -515,11 +532,19 @@ fn nav_push_to(hist: &mut Vec<SymbolId>, cursor: &mut usize, id: SymbolId) {
 }
 
 fn nav_back_cursor(_hist: &[SymbolId], cursor: usize) -> Option<usize> {
-    if cursor == 0 { None } else { Some(cursor - 1) }
+    if cursor == 0 {
+        None
+    } else {
+        Some(cursor - 1)
+    }
 }
 
 fn nav_forward_cursor(hist: &[SymbolId], cursor: usize) -> Option<usize> {
-    if cursor + 1 >= hist.len() { None } else { Some(cursor + 1) }
+    if cursor + 1 >= hist.len() {
+        None
+    } else {
+        Some(cursor + 1)
+    }
 }
 
 fn resolve_fs_path(id: &SymbolId, repo_root: &std::path::Path) -> std::path::PathBuf {
@@ -566,7 +591,12 @@ fn open_in_file_manager(path: &std::path::Path) {
 impl TreemapView {
     /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
     /// camera is deferred until the first render supplies a viewport.
-    pub fn new(tree: SymbolTree, layout: PackLayout, settings: settings::Settings, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        tree: SymbolTree,
+        layout: PackLayout,
+        settings: settings::Settings,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let root_id = tree.root.id.clone();
         let file_symbols = collect_file_symbols(&tree);
         let buffers = BufferManager::new(tree.repo_root.clone());
@@ -604,7 +634,12 @@ impl TreemapView {
             .rects
             .get(&self.tree.root.id)
             .copied()
-            .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 })
+            .unwrap_or(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            })
     }
 
     fn memory_status(&self) -> String {
@@ -630,7 +665,10 @@ impl TreemapView {
     /// by `chrome::TITLEBAR_H` in window coordinates.
     fn map_viewport(window: &Window) -> (f64, f64) {
         let vp = window.viewport_size();
-        (f64::from(vp.width), f64::from(vp.height) - chrome::TITLEBAR_H)
+        (
+            f64::from(vp.width),
+            f64::from(vp.height) - chrome::TITLEBAR_H,
+        )
     }
 
     /// Frame the focused rect below the pinned ancestor-header stack: frame
@@ -666,7 +704,9 @@ impl TreemapView {
         max_zoom: f64,
     ) -> Option<Camera> {
         let r = *self.layout.rects.get(&self.focus.current)?;
-        let leaf = index.node(&self.focus.current).is_some_and(content::is_leaf_item);
+        let leaf = index
+            .node(&self.focus.current)
+            .is_some_and(content::is_leaf_item);
         Some(self.frame_below_headers(index, r, vw, vh, |vh_eff| {
             if leaf {
                 camera::frame_page(r, vw, vh_eff, min_zoom, max_zoom)
@@ -710,7 +750,12 @@ impl TreemapView {
         } else {
             pin_y + 4.0
         };
-        Some(NameRow { x: (item.px.x + BODY_PAD) as f32, y: y as f32, font_px: font, text })
+        Some(NameRow {
+            x: (item.px.x + BODY_PAD) as f32,
+            y: y as f32,
+            font_px: font,
+            text,
+        })
     }
 
     /// Advance the tween, materialize buffers/textures, and build the
@@ -734,14 +779,15 @@ impl TreemapView {
         let stale = !matches!(&self.neighbors, Some((k, _)) if k == &focus_id);
         if stale {
             let index = TreeIndex::new(&self.tree);
-            self.neighbors =
-                Some((focus_id.clone(), focus::neighbors(&focus_id, &self.layout, &index)));
+            self.neighbors = Some((
+                focus_id.clone(),
+                focus::neighbors(&focus_id, &self.layout, &index),
+            ));
         }
         let (_, neighbor_ids) = self.neighbors.clone().unwrap();
-        let items = world::visible_nodes(
-            &self.tree, &self.layout, &camera, vw, vh,
-            |id| self.textures.contains(id),
-        );
+        let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh, |id| {
+            self.textures.contains(id)
+        });
         let mut out = Vec::with_capacity(items.len());
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
         let mut panel_doc: Option<(String, f32, f32, f32, f32)> = None;
@@ -773,23 +819,18 @@ impl TreemapView {
             let mut tex: Option<TexQuad> = None;
             match item.draw {
                 Draw::Container(rung) => {
-                    let stack_bottom =
-                        header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
+                    let stack_bottom = header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
                     let pin_y = item.px.y.max(stack_bottom);
-                    let ch_px =
-                        (HEADER + 2.0 * LINE_STEP) * camera.zoom;
+                    let ch_px = (HEADER + 2.0 * LINE_STEP) * camera.zoom;
                     if rung != Rung::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
                     }
-                    body = container_body(
-                        item.node, rung, &item.px, item.label_w, vh, pin_y, ch_px,
-                    );
+                    body =
+                        container_body(item.node, rung, &item.px, item.label_w, vh, pin_y, ch_px);
                     if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
-                        header_bg_h = (HEADER + body.len() as f64 * LINE_STEP)
-                            .min(ch_px) as f32;
+                        header_bg_h = (HEADER + body.len() as f64 * LINE_STEP).min(ch_px) as f32;
                         header_bg_y = pin_y as f32;
-                        header_stack
-                            .push((item.level, pin_y + header_bg_h as f64));
+                        header_stack.push((item.level, pin_y + header_bg_h as f64));
                     }
                     if matches!(rung, Rung::Dot | Rung::Label | Rung::Card)
                         && !item.node.children.is_empty()
@@ -815,8 +856,8 @@ impl TreemapView {
                     if tier != LeafDraw::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, false, item.px.y);
                     }
-                    let use_text = font >= content::MIN_TEXT_FONT_PX
-                        && item.label_w >= world::CODE_MIN_W;
+                    let use_text =
+                        font >= content::MIN_TEXT_FONT_PX && item.label_w >= world::CODE_MIN_W;
                     if use_text {
                         tex_opacity = 0.0;
                         body = leaf_text_body(
@@ -851,24 +892,14 @@ impl TreemapView {
             }
             let is_focused = item.node.id == focus_id;
             let is_hovered = self.hover_id.as_ref() == Some(&item.node.id);
-            if item.node.doc.is_some() {
-                if is_hovered {
-                    panel_doc = Some((
-                        item.node.doc.clone().unwrap(),
-                        item.px.x as f32,
-                        item.px.y as f32,
-                        item.px.w as f32,
-                        item.px.h as f32,
-                    ));
-                } else if is_focused && panel_doc.is_none() {
-                    panel_doc = Some((
-                        item.node.doc.clone().unwrap(),
-                        item.px.x as f32,
-                        item.px.y as f32,
-                        item.px.w as f32,
-                        item.px.h as f32,
-                    ));
-                }
+            if item.node.doc.is_some() && (is_hovered || (is_focused && panel_doc.is_none())) {
+                panel_doc = Some((
+                    item.node.doc.clone().unwrap(),
+                    item.px.x as f32,
+                    item.px.y as f32,
+                    item.px.w as f32,
+                    item.px.h as f32,
+                ));
             }
             out.push(PaintItem {
                 x: item.px.x as f32,
@@ -879,8 +910,7 @@ impl TreemapView {
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
                 focused: is_focused,
-                neighbor: !is_focused
-                    && neighbor_ids.iter().flatten().any(|n| *n == item.node.id),
+                neighbor: !is_focused && neighbor_ids.iter().flatten().any(|n| *n == item.node.id),
                 body_font_px,
                 header_bg_h,
                 header_bg_y,
@@ -904,10 +934,21 @@ impl TreemapView {
             let mut y = panel_y + BODY_PAD as f32;
             for text in wrapped {
                 let runs = vec![(text.len(), theme::DOC_COLOR)];
-                rows.push(BodyText { x: fx + BODY_PAD as f32, y, text, runs });
+                rows.push(BodyText {
+                    x: fx + BODY_PAD as f32,
+                    y,
+                    text,
+                    runs,
+                });
                 y += LINE_STEP as f32;
             }
-            Some(DocPanel { x: fx, y: panel_y, w: panel_w, h: panel_h, rows })
+            Some(DocPanel {
+                x: fx,
+                y: panel_y,
+                w: panel_w,
+                h: panel_h,
+                rows,
+            })
         });
         self.bake_pending = if self.textures.has_queued() {
             let index = TreeIndex::new(&self.tree);
@@ -921,21 +962,26 @@ impl TreemapView {
                     let rect = layout.rects.get(id)?;
                     let level = index.depth(id).unwrap_or(0) as u8;
                     let child_tex = |cid: &outrider_index::SymbolId| child_snap.get(cid).cloned();
-                    return Some(rasterize::bake_container(node, *rect, layout, level, &child_tex));
+                    return Some(rasterize::bake_container(
+                        node, *rect, layout, level, &child_tex,
+                    ));
                 }
                 let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
                 let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
                 let m = buffers.get(&rel, syms)?;
                 let start = m.symbol_start_line(id)?;
-                let count =
-                    (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
+                let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
                 let mut lines: Vec<rasterize::Line> = Vec::with_capacity(count);
                 for j in 0..count {
                     let (text, spans) = m.buffer.line(start + j)?;
                     let runs = runs_from_spans(text.len(), spans);
                     lines.push((text, runs));
                 }
-                if lines.is_empty() { None } else { Some(rasterizer.bake(&lines)) }
+                if lines.is_empty() {
+                    None
+                } else {
+                    Some(rasterizer.bake(&lines))
+                }
             })
         } else {
             false
@@ -966,9 +1012,8 @@ impl TreemapView {
             .get(self.palette.selection)
             .and_then(|id| Self::find_node(&self.tree.root, id));
 
-        let has_preview = selected_node.is_some_and(|n| {
-            n.signature.is_some() || n.doc.is_some() || n.churn_count > 0
-        });
+        let has_preview = selected_node
+            .is_some_and(|n| n.signature.is_some() || n.doc.is_some() || n.churn_count > 0);
 
         let total_w = if has_preview {
             PALETTE_W + GAP + PREVIEW_W
@@ -998,97 +1043,93 @@ impl TreemapView {
                     .text_color(rgb(theme::TEXT_PRIMARY))
                     .child(format!("[{mode_label}] {}│", self.palette.query)),
             )
-            .children(
-                self.palette.results.iter().enumerate().map(|(i, id)| {
-                    let name = self.palette.name_of(id);
-                    let path = &id.qualified_path;
-                    let selected = i == self.palette.selection;
-                    div()
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .text_size(px(13.0))
-                        .font_family(theme::FONT_FAMILY)
-                        .text_color(if selected {
-                            rgb(theme::TEXT_PRIMARY)
-                        } else {
-                            rgb(theme::TEXT_SECONDARY)
-                        })
-                        .when(selected, |d| d.bg(rgb(0x2a2d32_u32)))
-                        .child(format!("{name}  {path}"))
-                }),
+            .children(self.palette.results.iter().enumerate().map(|(i, id)| {
+                let name = self.palette.name_of(id);
+                let path = &id.qualified_path;
+                let selected = i == self.palette.selection;
+                div()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(if selected {
+                        rgb(theme::TEXT_PRIMARY)
+                    } else {
+                        rgb(theme::TEXT_SECONDARY)
+                    })
+                    .when(selected, |d| d.bg(rgb(0x2a2d32_u32)))
+                    .child(format!("{name}  {path}"))
+            }));
+
+        let preview_div = selected_node.filter(|_| has_preview).map(|node| {
+            let mut preview = div()
+                .w(px(PREVIEW_W))
+                .bg(rgb(theme::CODE_BG))
+                .border_1()
+                .border_color(rgb(theme::FOCUS_BORDER))
+                .rounded(px(4.0))
+                .overflow_hidden()
+                .px(px(10.0))
+                .py(px(8.0));
+
+            // Kind label
+            preview = preview.child(
+                div()
+                    .text_size(px(12.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .pb(px(4.0))
+                    .child(node.id.kind.label().to_uppercase()),
             );
 
-        let preview_div = selected_node
-            .filter(|_| has_preview)
-            .map(|node| {
-                let mut preview = div()
-                    .w(px(PREVIEW_W))
-                    .bg(rgb(theme::CODE_BG))
-                    .border_1()
-                    .border_color(rgb(theme::FOCUS_BORDER))
-                    .rounded(px(4.0))
-                    .overflow_hidden()
-                    .px(px(10.0))
-                    .py(px(8.0));
-
-                // Kind label
+            // Signature
+            if let Some(sig) = &node.signature {
                 preview = preview.child(
                     div()
                         .text_size(px(12.0))
                         .font_family(theme::FONT_FAMILY)
-                        .text_color(rgb(theme::TEXT_SECONDARY))
-                        .pb(px(4.0))
-                        .child(node.id.kind.label().to_uppercase()),
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .pb(px(6.0))
+                        .child(sig.clone()),
                 );
+            }
 
-                // Signature
-                if let Some(sig) = &node.signature {
-                    preview = preview.child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_family(theme::FONT_FAMILY)
-                            .text_color(rgb(theme::TEXT_PRIMARY))
-                            .pb(px(6.0))
-                            .child(sig.clone()),
-                    );
-                }
+            // Doc
+            if let Some(doc) = &node.doc {
+                preview = preview.child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(rgb(theme::DOC_COLOR))
+                        .pb(px(6.0))
+                        .child(doc.clone()),
+                );
+            }
 
-                // Doc
-                if let Some(doc) = &node.doc {
-                    preview = preview.child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_family(theme::FONT_FAMILY)
-                            .text_color(rgb(theme::DOC_COLOR))
-                            .pb(px(6.0))
-                            .child(doc.clone()),
-                    );
-                }
+            // Stats line: lines + churn
+            let mut stats = Vec::new();
+            if node.measure > 0 {
+                stats.push(format!("{} lines", node.measure));
+            }
+            if node.churn_count > 0 {
+                stats.push(format!(
+                    "{} commits (p{})",
+                    node.churn_count,
+                    (node.churn * 100.0).round() as u32
+                ));
+            }
+            if !stats.is_empty() {
+                preview = preview.child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(stats.join(" · ")),
+                );
+            }
 
-                // Stats line: lines + churn
-                let mut stats = Vec::new();
-                if node.measure > 0 {
-                    stats.push(format!("{} lines", node.measure));
-                }
-                if node.churn_count > 0 {
-                    stats.push(format!(
-                        "{} commits (p{})",
-                        node.churn_count,
-                        (node.churn * 100.0).round() as u32
-                    ));
-                }
-                if !stats.is_empty() {
-                    preview = preview.child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_family(theme::FONT_FAMILY)
-                            .text_color(rgb(theme::TEXT_SECONDARY))
-                            .child(stats.join(" · ")),
-                    );
-                }
-
-                preview
-            });
+            preview
+        });
 
         div()
             .absolute()
@@ -1119,7 +1160,10 @@ impl TreemapView {
                     .cursor_pointer()
                     .text_color(rgb(theme::TEXT_SECONDARY))
                     .text_size(px(12.))
-                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
+                    .hover(|s| {
+                        s.text_color(rgb(theme::TEXT_PRIMARY))
+                            .bg(rgb(chrome::MENU_HOVER))
+                    })
                     .child("Open Folder")
                     .on_click(cx.listener(|this, _e, _w, cx| {
                         if let Some(folder) = rfd::FileDialog::new()
@@ -1142,13 +1186,17 @@ impl TreemapView {
                     .cursor_pointer()
                     .text_color(rgb(theme::TEXT_SECONDARY))
                     .text_size(px(12.))
-                    .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
+                    .hover(|s| {
+                        s.text_color(rgb(theme::TEXT_PRIMARY))
+                            .bg(rgb(chrome::MENU_HOVER))
+                    })
                     .child("Settings")
                     .on_click(cx.listener(|this, _e, _w, cx| {
                         if this.settings_draft.is_some() {
                             this.settings_draft = None;
                         } else {
-                            this.settings_draft = Some(SettingsDraft::from_settings(&this.settings));
+                            this.settings_draft =
+                                Some(SettingsDraft::from_settings(&this.settings));
                             this.palette.close();
                             this.show_welcome = false;
                             this.context_menu = None;
@@ -1158,13 +1206,17 @@ impl TreemapView {
             )
     }
 
-    fn on_right_press(&mut self, e: &gpui::MouseDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn on_right_press(
+        &mut self,
+        e: &gpui::MouseDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(cam) = self.camera else { return };
         let (vw, vh) = Self::map_viewport(window);
-        let items = world::visible_nodes(
-            &self.tree, &self.layout, &cam, vw, vh,
-            |id| self.textures.contains(id),
-        );
+        let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
+            self.textures.contains(id)
+        });
         let (mx, my) = (
             f64::from(e.position.x),
             f64::from(e.position.y) - chrome::TITLEBAR_H,
@@ -1187,7 +1239,9 @@ impl TreemapView {
             cx.notify();
             return;
         }
-        let Some(origin) = self.press_origin.take() else { return };
+        let Some(origin) = self.press_origin.take() else {
+            return;
+        };
         let slop = f64::from(e.position.x - origin.x)
             .abs()
             .max(f64::from(e.position.y - origin.y).abs());
@@ -1196,18 +1250,23 @@ impl TreemapView {
         }
         let Some(cam) = self.camera else { return };
         let (vw, vh) = Self::map_viewport(window);
-        let items = world::visible_nodes(
-            &self.tree, &self.layout, &cam, vw, vh,
-            |id| self.textures.contains(id),
+        let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
+            self.textures.contains(id)
+        });
+        let (mx, my) = (
+            f64::from(e.position.x),
+            f64::from(e.position.y) - chrome::TITLEBAR_H,
         );
-        let (mx, my) =
-            (f64::from(e.position.x), f64::from(e.position.y) - chrome::TITLEBAR_H);
         let hit = world::hit_test(&items, mx, my).map(|i| i.node.id.clone());
         drop(items);
         if let Some(id) = hit {
             let index = TreeIndex::new(&self.tree);
             if self.focus.set(id, &index) {
-                nav_push_to(&mut self.nav_history, &mut self.nav_cursor, self.focus.current.clone());
+                nav_push_to(
+                    &mut self.nav_history,
+                    &mut self.nav_cursor,
+                    self.focus.current.clone(),
+                );
             }
             cx.notify();
         }
@@ -1227,10 +1286,9 @@ impl TreemapView {
         } else {
             let Some(cam) = self.camera else { return };
             let (vw, vh) = Self::map_viewport(window);
-            let items = world::visible_nodes(
-                &self.tree, &self.layout, &cam, vw, vh,
-                |id| self.textures.contains(id),
-            );
+            let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
+                self.textures.contains(id)
+            });
             let (mx, my) = (
                 f64::from(e.position.x),
                 f64::from(e.position.y) - chrome::TITLEBAR_H,
@@ -1323,12 +1381,18 @@ impl TreemapView {
                         SettingsField::CacheMb => SettingsField::Extensions,
                     };
                 }
-                "backspace" => { draft.active_text_mut().pop(); }
+                "backspace" => {
+                    draft.active_text_mut().pop();
+                }
                 _ => {
                     if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
                         let mut chars = s.chars();
                         let c = chars.next()?;
-                        if chars.next().is_none() { Some(c) } else { None }
+                        if chars.next().is_none() {
+                            Some(c)
+                        } else {
+                            None
+                        }
                     }) {
                         if draft.active == SettingsField::CacheMb {
                             if ch.is_ascii_digit() {
@@ -1343,12 +1407,13 @@ impl TreemapView {
             cx.notify();
             return;
         }
-        if e.keystroke.modifiers.control && e.keystroke.modifiers.shift {
-            if e.keystroke.key.as_str() == "e" {
-                let path = resolve_fs_path(&self.focus.current, &self.tree.repo_root);
-                open_in_file_manager(&path);
-                return;
-            }
+        if e.keystroke.modifiers.control
+            && e.keystroke.modifiers.shift
+            && e.keystroke.key.as_str() == "e"
+        {
+            let path = resolve_fs_path(&self.focus.current, &self.tree.repo_root);
+            open_in_file_manager(&path);
+            return;
         }
         if self.palette.is_open() {
             self.on_palette_key(e, window, cx);
@@ -1377,9 +1442,7 @@ impl TreemapView {
                     let (vw, vh) = Self::map_viewport(window);
                     let max_zoom = camera::MAX_ZOOM;
                     let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
-                    if let Some(to) =
-                        self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
-                    {
+                    if let Some(to) = self.frame_focus(&index, vw, vh, min_zoom, max_zoom) {
                         self.start_tween(to);
                     }
                 }
@@ -1401,7 +1464,11 @@ impl TreemapView {
                 if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
                     let mut chars = s.chars();
                     let c = chars.next()?;
-                    if chars.next().is_none() { Some(c) } else { None }
+                    if chars.next().is_none() {
+                        Some(c)
+                    } else {
+                        None
+                    }
                 }) {
                     self.palette.type_char(ch, &self.tree);
                     cx.notify();
@@ -1423,23 +1490,34 @@ impl TreemapView {
                 if !self.focus.step_in(&index) {
                     return;
                 }
-                nav_push_to(&mut self.nav_history, &mut self.nav_cursor, self.focus.current.clone());
+                nav_push_to(
+                    &mut self.nav_history,
+                    &mut self.nav_cursor,
+                    self.focus.current.clone(),
+                );
                 self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
             }
             "escape" => {
                 if !self.focus.step_out(&index) {
                     return;
                 }
-                nav_push_to(&mut self.nav_history, &mut self.nav_cursor, self.focus.current.clone());
+                nav_push_to(
+                    &mut self.nav_history,
+                    &mut self.nav_cursor,
+                    self.focus.current.clone(),
+                );
                 self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
             }
-            "end" => self.layout.rects.get(&self.focus.current).copied().map(|r| {
-                self.frame_below_headers(&index, r, vw, vh, |vh_eff| {
-                    camera::frame_rect(
-                        r, vw, vh_eff, camera::END_FRACTION, min_zoom, max_zoom,
-                    )
-                })
-            }),
+            "end" => self
+                .layout
+                .rects
+                .get(&self.focus.current)
+                .copied()
+                .map(|r| {
+                    self.frame_below_headers(&index, r, vw, vh, |vh_eff| {
+                        camera::frame_rect(r, vw, vh_eff, camera::END_FRACTION, min_zoom, max_zoom)
+                    })
+                }),
             "home" => {
                 let c = Camera::fit(self.root_rect(), vw, vh);
                 self.home_zoom = c.zoom;
@@ -1506,8 +1584,7 @@ impl TreemapView {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| folder.to_string_lossy().into_owned());
         let progress = Arc::new(outrider_index::IndexProgress::new());
-        let result: Arc<Mutex<Option<Result<LoadedProject, String>>>> =
-            Arc::new(Mutex::new(None));
+        let result: Arc<Mutex<Option<Result<LoadedProject, String>>>> = Arc::new(Mutex::new(None));
 
         let p = Arc::clone(&progress);
         let r = Arc::clone(&result);
@@ -1525,7 +1602,11 @@ impl TreemapView {
             let layout = outrider_layout::pack(&tree, &world::pack_config());
             let mut textures = TextureCache::new(cache_bytes);
             rasterize::pre_bake_all(&tree, &layout, &mut textures, &p);
-            *r.lock().unwrap() = Some(Ok(LoadedProject { tree, layout, textures }));
+            *r.lock().unwrap() = Some(Ok(LoadedProject {
+                tree,
+                layout,
+                textures,
+            }));
         });
 
         self.textures.clear_disk_cache();
@@ -1533,14 +1614,22 @@ impl TreemapView {
         self.show_welcome = false;
         self.settings_draft = None;
         self.context_menu = None;
-        self.loading = Some(LoadingState { folder_name, progress, result });
+        self.loading = Some(LoadingState {
+            folder_name,
+            progress,
+            result,
+        });
     }
 
     /// Check if background indexing completed; if so, apply the result.
     fn poll_loading(&mut self) -> bool {
-        let Some(state) = &self.loading else { return false };
+        let Some(state) = &self.loading else {
+            return false;
+        };
         let mut guard = state.result.lock().unwrap();
-        let Some(result) = guard.take() else { return false };
+        let Some(result) = guard.take() else {
+            return false;
+        };
         drop(guard);
         let loading = self.loading.take().unwrap();
         match result {
@@ -1569,9 +1658,18 @@ impl TreemapView {
     /// Render the loading progress overlay.
     fn render_loading(&self, vw: f64) -> gpui::Div {
         let state = self.loading.as_ref().unwrap();
-        let phase = state.progress.phase.load(std::sync::atomic::Ordering::Relaxed);
-        let total = state.progress.files_total.load(std::sync::atomic::Ordering::Relaxed);
-        let parsed = state.progress.files_parsed.load(std::sync::atomic::Ordering::Relaxed);
+        let phase = state
+            .progress
+            .phase
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total = state
+            .progress
+            .files_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let parsed = state
+            .progress
+            .files_parsed
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         let (status_text, fraction) = match phase {
             0 => ("Scanning files…".to_string(), 0.0_f32),
@@ -1697,37 +1795,43 @@ impl TreemapView {
             .overflow_hidden()
             .shadow_lg()
             .child(
-                row("ctx-open-fm", "Open File Location")
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                row("ctx-open-fm", "Open File Location").on_click(cx.listener(
+                    move |this, _e, _w, cx| {
                         open_in_file_manager(&open_path);
                         this.context_menu = None;
                         cx.notify();
-                    })),
+                    },
+                )),
             )
             .child(
-                row("ctx-copy-rel", "Copy Relative Path")
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_rel_str.clone()));
+                row("ctx-copy-rel", "Copy Relative Path").on_click(cx.listener(
+                    move |this, _e, _w, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            copy_rel_str.clone(),
+                        ));
                         this.context_menu = None;
                         cx.notify();
-                    })),
+                    },
+                )),
             )
             .child(
-                row("ctx-copy-abs", "Copy Absolute Path")
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_abs_str.clone()));
+                row("ctx-copy-abs", "Copy Absolute Path").on_click(cx.listener(
+                    move |this, _e, _w, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            copy_abs_str.clone(),
+                        ));
                         this.context_menu = None;
                         cx.notify();
-                    })),
+                    },
+                )),
             )
-            .child(
-                row("ctx-copy-name", "Copy Name")
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_name_str.clone()));
-                        this.context_menu = None;
-                        cx.notify();
-                    })),
-            );
+            .child(row("ctx-copy-name", "Copy Name").on_click(cx.listener(
+                move |this, _e, _w, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_name_str.clone()));
+                    this.context_menu = None;
+                    cx.notify();
+                },
+            )));
 
         Some(menu_div)
     }
@@ -1740,7 +1844,11 @@ impl TreemapView {
         let draft = self.settings_draft.as_ref().unwrap();
 
         let field_border = |active: bool| -> u32 {
-            if active { theme::FOCUS_BORDER } else { 0x333340 }
+            if active {
+                theme::FOCUS_BORDER
+            } else {
+                0x333340
+            }
         };
 
         let ext_active = draft.active == SettingsField::Extensions;
@@ -1748,54 +1856,59 @@ impl TreemapView {
         let cache_active = draft.active == SettingsField::CacheMb;
 
         let ext_text = if ext_active {
-            format!("{}|", &draft.filter_extensions)
+            format!("{}|", draft.filter_extensions)
         } else {
             draft.filter_extensions.clone()
         };
         let folder_text = if folder_active {
-            format!("{}|", &draft.filter_folders)
+            format!("{}|", draft.filter_folders)
         } else {
             draft.filter_folders.clone()
         };
         let cache_text = if cache_active {
-            format!("{}|", &draft.cache_mb)
+            format!("{}|", draft.cache_mb)
         } else {
             draft.cache_mb.clone()
         };
 
-        let settings_field = |id: &str, label: &str, text: String, active: bool, field: SettingsField| {
-            div()
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_family(theme::FONT_FAMILY_SANS)
-                        .text_color(rgb(theme::FOCUS_BORDER))
-                        .pb(px(4.0))
-                        .child(label.to_string()),
-                )
-                .child(
-                    div()
-                        .id(ElementId::Name(id.to_string().into()))
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .mb(px(12.0))
-                        .bg(rgb(0x1a1d21_u32))
-                        .border_1()
-                        .border_color(rgb(field_border(active)))
-                        .rounded(px(3.0))
-                        .cursor_pointer()
-                        .text_size(px(12.0))
-                        .font_family(theme::FONT_FAMILY)
-                        .text_color(rgb(if active { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }))
-                        .child(text)
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            if let Some(d) = &mut this.settings_draft {
-                                d.active = field;
-                            }
-                            cx.notify();
-                        })),
-                )
-        };
+        let settings_field =
+            |id: &str, label: &str, text: String, active: bool, field: SettingsField| {
+                div()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::FOCUS_BORDER))
+                            .pb(px(4.0))
+                            .child(label.to_string()),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(id.to_string().into()))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .mb(px(12.0))
+                            .bg(rgb(0x1a1d21_u32))
+                            .border_1()
+                            .border_color(rgb(field_border(active)))
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .font_family(theme::FONT_FAMILY)
+                            .text_color(rgb(if active {
+                                theme::TEXT_PRIMARY
+                            } else {
+                                theme::TEXT_SECONDARY
+                            }))
+                            .child(text)
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                if let Some(d) = &mut this.settings_draft {
+                                    d.active = field;
+                                }
+                                cx.notify();
+                            })),
+                    )
+            };
 
         // Backdrop blocks map interaction
         div()
@@ -1945,27 +2058,30 @@ impl TreemapView {
             ("Ctrl+Shift+E", "Open focused file in file manager"),
         ];
 
-        let rows: Vec<_> = keybindings.iter().map(|(key, action)| {
-            div()
-                .flex()
-                .flex_row()
-                .py(px(3.0))
-                .child(
-                    div()
-                        .w(px(200.0))
-                        .text_size(px(12.0))
-                        .font_family(theme::FONT_FAMILY)
-                        .text_color(rgb(theme::FOCUS_BORDER))
-                        .child(*key),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .font_family(theme::FONT_FAMILY_SANS)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child(*action),
-                )
-        }).collect();
+        let rows: Vec<_> = keybindings
+            .iter()
+            .map(|(key, action)| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .py(px(3.0))
+                    .child(
+                        div()
+                            .w(px(200.0))
+                            .text_size(px(12.0))
+                            .font_family(theme::FONT_FAMILY)
+                            .text_color(rgb(theme::FOCUS_BORDER))
+                            .child(*key),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(*action),
+                    )
+            })
+            .collect();
 
         div()
             .absolute()
@@ -1991,7 +2107,13 @@ impl TreemapView {
             // Keybinding rows
             .children(rows)
             // Separator
-            .child(div().h(px(1.0)).mt(px(14.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
+            .child(
+                div()
+                    .h(px(1.0))
+                    .mt(px(14.0))
+                    .mb(px(14.0))
+                    .bg(rgb(0x2a2d32_u32)),
+            )
             // Buttons row
             .child(
                 div()
@@ -2069,7 +2191,10 @@ impl Render for TreemapView {
         let palette_overlay = self.palette.is_open().then(|| self.render_palette(vw));
 
         // Build the settings overlay (needs cx for click listeners).
-        let settings_overlay = self.settings_draft.is_some().then(|| self.render_settings_window(vw, cx));
+        let settings_overlay = self
+            .settings_draft
+            .is_some()
+            .then(|| self.render_settings_window(vw, cx));
 
         // Build the welcome overlay (needs cx for click listeners).
         let welcome_overlay = self.show_welcome.then(|| self.render_welcome(vw, cx));
@@ -2211,13 +2336,17 @@ impl Render for TreemapView {
                                 if bt.text.is_empty() {
                                     continue;
                                 }
-                                let runs: Vec<TextRun> = bt.runs.iter().map(|&(len, color)| {
-                                    let mut r = run(len, color);
-                                    if item.body_opacity < 1.0 {
-                                        r.color = r.color.opacity(item.body_opacity);
-                                    }
-                                    r
-                                }).collect();
+                                let runs: Vec<TextRun> = bt
+                                    .runs
+                                    .iter()
+                                    .map(|&(len, color)| {
+                                        let mut r = run(len, color);
+                                        if item.body_opacity < 1.0 {
+                                            r.color = r.color.opacity(item.body_opacity);
+                                        }
+                                        r
+                                    })
+                                    .collect();
                                 let line = window.text_system().shape_line(
                                     bt.text.clone().into(),
                                     px(item.body_font_px),
@@ -2277,8 +2406,11 @@ impl Render for TreemapView {
                                 if bt.text.is_empty() {
                                     continue;
                                 }
-                                let runs: Vec<TextRun> =
-                                    bt.runs.iter().map(|&(len, color)| run(len, color)).collect();
+                                let runs: Vec<TextRun> = bt
+                                    .runs
+                                    .iter()
+                                    .map(|&(len, color)| run(len, color))
+                                    .collect();
                                 let line = window.text_system().shape_line(
                                     bt.text.clone().into(),
                                     px(item.body_font_px),
@@ -2379,7 +2511,12 @@ impl Render for TreemapView {
             .flex()
             .flex_col()
             .bg(rgb(theme::BG))
-            .child(chrome::titlebar(title, file_menu, self.memory_status(), window))
+            .child(chrome::titlebar(
+                title,
+                file_menu,
+                self.memory_status(),
+                window,
+            ))
             .child(map)
             .children(chrome::resize_rim(window))
     }
@@ -2402,19 +2539,36 @@ mod tests {
     fn truncation() {
         // 12 + 10*0.62*12 = wide enough for exactly 10 chars at 12px
         let w = 12.0 + 10.0 * 0.62 * 12.0;
-        assert_eq!(truncate_to_width("short.rs", w, 12.0), Some("short.rs".into()));
+        assert_eq!(
+            truncate_to_width("short.rs", w, 12.0),
+            Some("short.rs".into())
+        );
         assert_eq!(
             truncate_to_width("a_very_long_file_name.rs", w, 12.0),
             Some("a_very_lo…".into())
         );
         assert_eq!(truncate_to_width("anything", 10.0, 12.0), None);
         // multi-byte chars must not panic
-        assert_eq!(truncate_to_width("ééééééééééééé", w, 12.0), Some("ééééééééé…".into()));
+        assert_eq!(
+            truncate_to_width("ééééééééééééé", w, 12.0),
+            Some("ééééééééé…".into())
+        );
     }
 
-    fn node(kind: SymbolKind, qual: &str, byte_range: Option<std::ops::Range<usize>>, measure: u64, signature: Option<&str>, doc: Option<&str>) -> SymbolNode {
+    fn node(
+        kind: SymbolKind,
+        qual: &str,
+        byte_range: Option<std::ops::Range<usize>>,
+        measure: u64,
+        signature: Option<&str>,
+        doc: Option<&str>,
+    ) -> SymbolNode {
         SymbolNode {
-            id: SymbolId { kind, qualified_path: qual.into(), ordinal: 0 },
+            id: SymbolId {
+                kind,
+                qualified_path: qual.into(),
+                ordinal: 0,
+            },
             name: qual.to_string(),
             byte_range,
             signature: signature.map(str::to_string),
@@ -2430,13 +2584,19 @@ mod tests {
     fn runs_cover_text_exactly_and_truncate() {
         use outrider_index::buffer::{HighlightKind, HighlightSpan};
         let spans = vec![
-            HighlightSpan { range: 0..2, kind: HighlightKind::Keyword },
-            HighlightSpan { range: 3..7, kind: HighlightKind::Function },
+            HighlightSpan {
+                range: 0..2,
+                kind: HighlightKind::Keyword,
+            },
+            HighlightSpan {
+                range: 3..7,
+                kind: HighlightKind::Function,
+            },
         ];
         let runs = runs_from_spans(10, &spans);
         assert_eq!(runs.iter().map(|r| r.0).sum::<usize>(), 10);
         assert_eq!(runs.len(), 4); // keyword, gap, function, tail
-        // truncated code line: run lengths still cover the shown bytes exactly
+                                   // truncated code line: run lengths still cover the shown bytes exactly
         let w = 12.0 + 5.0 * 0.62 * 12.0; // 5-char budget at 12px
         let (shown, runs) = code_line("fn frobnicate()", &spans, w, 12.0).unwrap();
         assert_eq!(shown, "fn f…");
@@ -2447,8 +2607,20 @@ mod tests {
 
     #[test]
     fn container_body_positions_detail_lines() {
-        let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
-        let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+        let f = node(
+            SymbolKind::File,
+            "a.rs",
+            Some(0..24),
+            2,
+            None,
+            Some("Doc line."),
+        );
+        let px = PxRect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 300.0,
+        };
         let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0);
         // churn readout only (doc shown via hover panel, no children → no kinds)
         assert_eq!(body.len(), 1);
@@ -2459,19 +2631,37 @@ mod tests {
     fn leaf_text_body_paints_code_without_duplicate_signature() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
-        let leaf = node(SymbolKind::Item { label: "fn".into() }, "a.rs::two", Some(12..23), 1, Some("fn two()"), None);
+        let leaf = node(
+            SymbolKind::Item { label: "fn".into() },
+            "a.rs::two",
+            Some(12..23),
+            1,
+            Some("fn two()"),
+            None,
+        );
         let mut mgr = BufferManager::new(dir.path().to_path_buf());
         let mut file_symbols = BTreeMap::new();
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let natural = crate::content::natural_px(&leaf);
         // scale 1.0: full_h == natural
-        let body =
-            leaf_text_body(&leaf, 0.0, 0.0, natural, 480.0, 600.0, &mut mgr, &file_symbols);
+        let body = leaf_text_body(
+            &leaf,
+            0.0,
+            0.0,
+            natural,
+            480.0,
+            600.0,
+            &mut mgr,
+            &file_symbols,
+        );
         // code only — no separate signature row (the code line IS the signature)
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two() {}");
         assert!(body[0].runs.len() > 1, "code rows carry colored runs");
-        assert_eq!(body[0].runs.iter().map(|r| r.0).sum::<usize>(), body[0].text.len());
+        assert_eq!(
+            body[0].runs.iter().map(|r| r.0).sum::<usize>(),
+            body[0].text.len()
+        );
         // code row 0 at natural-y HEADER
         assert!((f64::from(body[0].y) - HEADER).abs() < 1e-3);
     }
@@ -2480,28 +2670,54 @@ mod tests {
     fn leaf_text_body_scales_uniformly_past_one() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
-        let leaf = node(SymbolKind::Item { label: "fn".into() }, "a.rs::two", Some(12..23), 1, Some("fn two()"), None);
+        let leaf = node(
+            SymbolKind::Item { label: "fn".into() },
+            "a.rs::two",
+            Some(12..23),
+            1,
+            Some("fn two()"),
+            None,
+        );
         let mut mgr = BufferManager::new(dir.path().to_path_buf());
         let mut file_symbols = BTreeMap::new();
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let natural = crate::content::natural_px(&leaf);
         // zoom 2× (full_h = 2·natural): code row y doubles, still no clip
         let body = leaf_text_body(
-            &leaf, 0.0, 0.0, 2.0 * natural, 960.0, 100_000.0, &mut mgr, &file_symbols,
+            &leaf,
+            0.0,
+            0.0,
+            2.0 * natural,
+            960.0,
+            100_000.0,
+            &mut mgr,
+            &file_symbols,
         );
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - 2.0 * HEADER).abs() < 1e-3);
         // buffer unavailable → signature only, no code
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
-        let body =
-            leaf_text_body(&leaf, 0.0, 0.0, natural, 480.0, 600.0, &mut broken, &BTreeMap::new());
+        let body = leaf_text_body(
+            &leaf,
+            0.0,
+            0.0,
+            natural,
+            480.0,
+            600.0,
+            &mut broken,
+            &BTreeMap::new(),
+        );
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two()");
     }
 
     fn make_node(kind: SymbolKind, name: &str) -> SymbolNode {
         SymbolNode {
-            id: SymbolId { kind, qualified_path: name.into(), ordinal: 0 },
+            id: SymbolId {
+                kind,
+                qualified_path: name.into(),
+                ordinal: 0,
+            },
             name: name.to_string(),
             byte_range: None,
             signature: None,
@@ -2519,7 +2735,11 @@ mod tests {
         use crate::theme::BoxTint;
         for name in &["docs", "doc", "documentation"] {
             let n = make_node(SymbolKind::Folder, name);
-            assert_eq!(classify_tint(&n), BoxTint::DocsFolder, "expected DocsFolder for {name}");
+            assert_eq!(
+                classify_tint(&n),
+                BoxTint::DocsFolder,
+                "expected DocsFolder for {name}"
+            );
         }
     }
 
@@ -2529,7 +2749,11 @@ mod tests {
         use crate::theme::BoxTint;
         for name in &["test", "tests", "spec", "specs", "__tests__"] {
             let n = make_node(SymbolKind::Folder, name);
-            assert_eq!(classify_tint(&n), BoxTint::TestFolder, "expected TestFolder for {name}");
+            assert_eq!(
+                classify_tint(&n),
+                BoxTint::TestFolder,
+                "expected TestFolder for {name}"
+            );
         }
     }
 
@@ -2537,9 +2761,26 @@ mod tests {
     fn classify_tint_typedef_items() {
         use super::classify_tint;
         use crate::theme::BoxTint;
-        for label in &["struct", "enum", "trait", "class", "interface", "type", "typedef"] {
-            let n = make_node(SymbolKind::Item { label: label.to_string() }, "Foo");
-            assert_eq!(classify_tint(&n), BoxTint::TypeDef, "expected TypeDef for {label}");
+        for label in &[
+            "struct",
+            "enum",
+            "trait",
+            "class",
+            "interface",
+            "type",
+            "typedef",
+        ] {
+            let n = make_node(
+                SymbolKind::Item {
+                    label: label.to_string(),
+                },
+                "Foo",
+            );
+            assert_eq!(
+                classify_tint(&n),
+                BoxTint::TypeDef,
+                "expected TypeDef for {label}"
+            );
         }
     }
 
@@ -2548,21 +2789,37 @@ mod tests {
         use super::classify_tint;
         use crate::theme::BoxTint;
         // Unrecognized folder name
-        assert_eq!(classify_tint(&make_node(SymbolKind::Folder, "src")), BoxTint::Normal);
+        assert_eq!(
+            classify_tint(&make_node(SymbolKind::Folder, "src")),
+            BoxTint::Normal
+        );
         // Non-typedef item label
         assert_eq!(
             classify_tint(&make_node(SymbolKind::Item { label: "fn".into() }, "foo")),
             BoxTint::Normal
         );
         // File and Chunk always Normal
-        assert_eq!(classify_tint(&make_node(SymbolKind::File, "main.rs")), BoxTint::Normal);
-        assert_eq!(classify_tint(&make_node(SymbolKind::Chunk, "chunk")), BoxTint::Normal);
+        assert_eq!(
+            classify_tint(&make_node(SymbolKind::File, "main.rs")),
+            BoxTint::Normal
+        );
+        assert_eq!(
+            classify_tint(&make_node(SymbolKind::Chunk, "chunk")),
+            BoxTint::Normal
+        );
     }
 
     #[test]
     fn leaf_tex_rect_covers_the_line_area() {
         // 10-line leaf drawn at half its natural height.
-        let leaf = node(SymbolKind::Item { label: "fn".into() }, "a.rs::f", Some(0..100), 10, Some("fn f()"), None);
+        let leaf = node(
+            SymbolKind::Item { label: "fn".into() },
+            "a.rs::f",
+            Some(0..100),
+            10,
+            Some("fn f()"),
+            None,
+        );
         let natural = crate::content::natural_px(&leaf);
         let full_h = natural * 0.5;
         let (x, y, w, h) = leaf_tex_rect(&leaf, 100.0, 50.0, full_h);
@@ -2586,8 +2843,17 @@ mod tests {
 
     #[test]
     fn inset_top_centers_rect_in_the_band_below_the_inset() {
-        let r = Rect { x: 0.0, y: 7.0, w: 100.0, h: 20.0 };
-        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 2.0 };
+        let r = Rect {
+            x: 0.0,
+            y: 7.0,
+            w: 100.0,
+            h: 20.0,
+        };
+        let cam = Camera {
+            center_x: 0.0,
+            center_y: 0.0,
+            zoom: 2.0,
+        };
         // band [20, 100], rect 20·2 = 40 tall → top at 20 + (80 − 40)/2 = 40
         let c = inset_top(cam, r, 20.0, 100.0);
         assert!((screen_y(&c, r.y, 100.0) - 40.0).abs() < 1e-9);
@@ -2596,19 +2862,37 @@ mod tests {
 
     #[test]
     fn inset_top_pins_to_band_top_when_rect_is_taller_than_the_band() {
-        let r = Rect { x: 0.0, y: 7.0, w: 100.0, h: 90.0 };
-        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 1.0 };
+        let r = Rect {
+            x: 0.0,
+            y: 7.0,
+            w: 100.0,
+            h: 90.0,
+        };
+        let cam = Camera {
+            center_x: 0.0,
+            center_y: 0.0,
+            zoom: 1.0,
+        };
         let c = inset_top(cam, r, 20.0, 100.0);
         assert!((screen_y(&c, r.y, 100.0) - 20.0).abs() < 1e-9);
     }
 
     fn named(kind: SymbolKind, qual: &str, name: &str, children: Vec<SymbolNode>) -> SymbolNode {
-        SymbolNode { name: name.into(), children, ..node(kind, qual, None, 1, None, None) }
+        SymbolNode {
+            name: name.into(),
+            children,
+            ..node(kind, qual, None, 1, None, None)
+        }
     }
 
     /// root { mid { anon(unnamed) { f } } } with rects far above the viewport.
     fn stack_fixture() -> (SymbolTree, PackLayout, SymbolId) {
-        let leaf = named(SymbolKind::Item { label: "fn".into() }, "r/m/a/f", "f", vec![]);
+        let leaf = named(
+            SymbolKind::Item { label: "fn".into() },
+            "r/m/a/f",
+            "f",
+            vec![],
+        );
         let focus = leaf.id.clone();
         let anon = named(SymbolKind::Folder, "r/m/a", "", vec![leaf]);
         let anon_id = anon.id.clone();
@@ -2616,11 +2900,46 @@ mod tests {
         let mid_id = mid.id.clone();
         let root = named(SymbolKind::Folder, "r", "root", vec![mid]);
         let mut rects = BTreeMap::new();
-        rects.insert(root.id.clone(), Rect { x: 0.0, y: -1000.0, w: 4000.0, h: 4000.0 });
-        rects.insert(mid_id, Rect { x: 10.0, y: -900.0, w: 3000.0, h: 3000.0 });
-        rects.insert(anon_id, Rect { x: 20.0, y: -800.0, w: 2000.0, h: 2000.0 });
-        rects.insert(focus.clone(), Rect { x: 30.0, y: 0.0, w: 480.0, h: 200.0 });
-        let tree = SymbolTree { root, repo_root: std::path::PathBuf::from("/x") };
+        rects.insert(
+            root.id.clone(),
+            Rect {
+                x: 0.0,
+                y: -1000.0,
+                w: 4000.0,
+                h: 4000.0,
+            },
+        );
+        rects.insert(
+            mid_id,
+            Rect {
+                x: 10.0,
+                y: -900.0,
+                w: 3000.0,
+                h: 3000.0,
+            },
+        );
+        rects.insert(
+            anon_id,
+            Rect {
+                x: 20.0,
+                y: -800.0,
+                w: 2000.0,
+                h: 2000.0,
+            },
+        );
+        rects.insert(
+            focus.clone(),
+            Rect {
+                x: 30.0,
+                y: 0.0,
+                w: 480.0,
+                h: 200.0,
+            },
+        );
+        let tree = SymbolTree {
+            root,
+            repo_root: std::path::PathBuf::from("/x"),
+        };
         (tree, PackLayout { rects }, focus)
     }
 
@@ -2630,12 +2949,20 @@ mod tests {
         let index = TreeIndex::new(&tree);
         // Both named ancestors' tops are above the viewport → each pins at
         // the top and stacks; the unnamed folder contributes nothing.
-        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 1.0 };
+        let cam = Camera {
+            center_x: 0.0,
+            center_y: 0.0,
+            zoom: 1.0,
+        };
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
         let hdr = HEADER + 2.0 * LINE_STEP;
         assert!((h - 2.0 * hdr).abs() < 1e-9);
         // Header height scales with zoom below 1.
-        let cam = Camera { center_x: 0.0, center_y: 0.0, zoom: 0.5 };
+        let cam = Camera {
+            center_x: 0.0,
+            center_y: 0.0,
+            zoom: 0.5,
+        };
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
         assert!((h - hdr).abs() < 1e-9);
     }
@@ -2646,7 +2973,11 @@ mod tests {
         let index = TreeIndex::new(&tree);
         // root top on screen at 50, mid top at 150 (clear of root's header)
         // → stack bottom is mid's top plus one header.
-        let cam = Camera { center_x: 0.0, center_y: -750.0, zoom: 1.0 };
+        let cam = Camera {
+            center_x: 0.0,
+            center_y: -750.0,
+            zoom: 1.0,
+        };
         let vh = 600.0;
         assert!((screen_y(&cam, -1000.0, vh) - 50.0).abs() < 1e-9);
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, vh);
@@ -2661,7 +2992,10 @@ mod tests {
 
     #[test]
     fn wrap_doc_fits_short_text_on_one_row() {
-        assert_eq!(wrap_doc("hello world", wrap_w(11), 12.0), vec!["hello world"]);
+        assert_eq!(
+            wrap_doc("hello world", wrap_w(11), 12.0),
+            vec!["hello world"]
+        );
     }
 
     #[test]
@@ -2813,7 +3147,6 @@ mod tests {
         assert_ne!(hist[0].qualified_path, "f0.rs");
     }
 
-
     #[test]
     fn resolve_fs_path_file_node() {
         let root = std::path::Path::new("/home/user/project");
@@ -2823,7 +3156,10 @@ mod tests {
             ordinal: 0,
         };
         let path = super::resolve_fs_path(&id, root);
-        assert_eq!(path, std::path::PathBuf::from("/home/user/project/src/main.rs"));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/home/user/project/src/main.rs")
+        );
     }
 
     #[test]
@@ -2835,7 +3171,10 @@ mod tests {
             ordinal: 0,
         };
         let path = super::resolve_fs_path(&id, root);
-        assert_eq!(path, std::path::PathBuf::from("/home/user/project/src/lib.rs"));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/home/user/project/src/lib.rs")
+        );
     }
 
     #[test]

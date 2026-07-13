@@ -28,10 +28,28 @@ fn index_repo_parses_rust_files_into_items() {
     assert_eq!(
         kids,
         vec![
-            ("Point", SymbolKind::Item { label: "struct".into() }, 0), // struct appears before impl in source
-            ("Point", SymbolKind::Item { label: "impl".into() }, 1),
+            (
+                "Point",
+                SymbolKind::Item {
+                    label: "struct".into()
+                },
+                0
+            ), // struct appears before impl in source
+            (
+                "Point",
+                SymbolKind::Item {
+                    label: "impl".into()
+                },
+                1
+            ),
             ("free", SymbolKind::Item { label: "fn".into() }, 0),
-            ("inner", SymbolKind::Item { label: "module".into() }, 0),
+            (
+                "inner",
+                SymbolKind::Item {
+                    label: "module".into()
+                },
+                0
+            ),
         ]
     );
 

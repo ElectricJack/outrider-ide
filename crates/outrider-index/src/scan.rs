@@ -50,7 +50,10 @@ pub fn scan_files(
         }
         // Skip files with filtered extensions
         if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-            if filter_extensions.iter().any(|f| f.eq_ignore_ascii_case(ext)) {
+            if filter_extensions
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(ext))
+            {
                 continue;
             }
         }
@@ -61,7 +64,9 @@ pub fn scan_files(
             .to_path_buf();
         // Skip files inside filtered folders
         if rel_path.components().any(|c| {
-            filter_folders.iter().any(|f| c.as_os_str().to_string_lossy() == f.as_str())
+            filter_folders
+                .iter()
+                .any(|f| c.as_os_str().to_string_lossy() == f.as_str())
         }) {
             continue;
         }
@@ -136,7 +141,10 @@ fn build_folder(
         match comps.as_slice() {
             [file_name] => {
                 let qual = join_path(qualified, file_name);
-                let parsed = parsed_children.get(&file.rel_path).cloned().unwrap_or_default();
+                let parsed = parsed_children
+                    .get(&file.rel_path)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut node = SymbolNode {
                     id: SymbolId {
                         kind: SymbolKind::File,
@@ -198,7 +206,13 @@ fn build_folder(
 
     for (folder_name, sub_entries) in &by_subfolder {
         let qual = join_path(qualified, folder_name);
-        children.push(build_folder(repo_root, folder_name, &qual, sub_entries, parsed_children));
+        children.push(build_folder(
+            repo_root,
+            folder_name,
+            &qual,
+            sub_entries,
+            parsed_children,
+        ));
     }
 
     finalize_children(&mut children);
@@ -240,7 +254,10 @@ mod tests {
     }
 
     fn child<'a>(root: &'a SymbolNode, name: &str) -> &'a SymbolNode {
-        root.children.iter().find(|c| c.name == name).expect("child present")
+        root.children
+            .iter()
+            .find(|c| c.name == name)
+            .expect("child present")
     }
 
     #[test]
@@ -264,12 +281,21 @@ mod tests {
         let mut sorted: Vec<&SymbolNode> = f.children.iter().collect();
         sorted.sort_by_key(|c| c.byte_range.as_ref().unwrap().start);
         assert_eq!(sorted[0].byte_range.as_ref().unwrap().start, 0);
-        assert_eq!(sorted.last().unwrap().byte_range.as_ref().unwrap().end, text.len());
+        assert_eq!(
+            sorted.last().unwrap().byte_range.as_ref().unwrap().end,
+            text.len()
+        );
         for w in sorted.windows(2) {
-            assert_eq!(w[0].byte_range.as_ref().unwrap().end, w[1].byte_range.as_ref().unwrap().start);
+            assert_eq!(
+                w[0].byte_range.as_ref().unwrap().end,
+                w[1].byte_range.as_ref().unwrap().start
+            );
         }
         // chunk qualified_path is "{file}#{i}"
-        assert!(f.children.iter().all(|c| c.id.qualified_path.starts_with("BIG.md#")));
+        assert!(f
+            .children
+            .iter()
+            .all(|c| c.id.qualified_path.starts_with("BIG.md#")));
     }
 
     #[test]

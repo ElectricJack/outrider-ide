@@ -122,29 +122,63 @@ impl FileBuffer {
     /// no parse, every line's span list empty.
     pub fn new(text: String, ext: &str) -> anyhow::Result<Self> {
         let lang: Option<(tree_sitter::Language, &str)> = match ext {
-            "rs" => Some((tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY)),
-            "c" | "h" => Some((tree_sitter_c::LANGUAGE.into(), tree_sitter_c::HIGHLIGHT_QUERY)),
-            "md" => Some((tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK)),
+            "rs" => Some((
+                tree_sitter_rust::LANGUAGE.into(),
+                tree_sitter_rust::HIGHLIGHTS_QUERY,
+            )),
+            "c" | "h" => Some((
+                tree_sitter_c::LANGUAGE.into(),
+                tree_sitter_c::HIGHLIGHT_QUERY,
+            )),
+            "md" => Some((
+                tree_sitter_md::LANGUAGE.into(),
+                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+            )),
             "toml" => Some((tree_sitter_toml_ng::LANGUAGE.into(), TOML_HIGHLIGHTS)),
-            "py" => Some((tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY)),
-            "js" | "jsx" => Some((tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::HIGHLIGHT_QUERY)),
-            "ts" => Some((tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), tree_sitter_typescript::HIGHLIGHTS_QUERY)),
-            "tsx" => Some((tree_sitter_typescript::LANGUAGE_TSX.into(), tree_sitter_typescript::HIGHLIGHTS_QUERY)),
-            "cs" => Some((tree_sitter_c_sharp::LANGUAGE.into(), tree_sitter_c_sharp::HIGHLIGHTS_QUERY)),
+            "py" => Some((
+                tree_sitter_python::LANGUAGE.into(),
+                tree_sitter_python::HIGHLIGHTS_QUERY,
+            )),
+            "js" | "jsx" => Some((
+                tree_sitter_javascript::LANGUAGE.into(),
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+            )),
+            "ts" => Some((
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            )),
+            "tsx" => Some((
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            )),
+            "cs" => Some((
+                tree_sitter_c_sharp::LANGUAGE.into(),
+                tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+            )),
             _ => None,
         };
         let (tree, lines) = match lang {
             Some((language, query_src)) => {
                 let mut parser = tree_sitter::Parser::new();
-                parser.set_language(&language).context("loading tree-sitter grammar")?;
-                let tree = parser.parse(&text, None).context("tree-sitter parse failed")?;
+                parser
+                    .set_language(&language)
+                    .context("loading tree-sitter grammar")?;
+                let tree = parser
+                    .parse(&text, None)
+                    .context("tree-sitter parse failed")?;
                 let lines = highlight_lines(&text, &tree, &language, query_src)?;
                 (Some(tree), lines)
             }
             None => (None, vec![Vec::new(); line_bounds(&text).len()]),
         };
         let minimap = compute_minimap(&text, &lines);
-        Ok(Self { rope: Rope::from(text), tree, lines, minimap, anchors: AnchorList::default() })
+        Ok(Self {
+            rope: Rope::from(text),
+            tree,
+            lines,
+            minimap,
+            anchors: AnchorList::default(),
+        })
     }
 
     /// Content lines (the empty final line after a trailing newline is not counted).
@@ -226,11 +260,17 @@ fn compute_minimap(text: &str, lines: &[Vec<HighlightSpan>]) -> Vec<MinimapRow> 
         .zip(lines)
         .map(|(b, spans)| {
             let content = &text[b.clone()];
-            let indent =
-                content.chars().take_while(|&c| c == ' ' || c == '\t').count() as u32;
+            let indent = content
+                .chars()
+                .take_while(|&c| c == ' ' || c == '\t')
+                .count() as u32;
             let trimmed = content.trim();
             let len = trimmed.chars().count() as u32;
-            let kind = if len == 0 { HighlightKind::Default } else { dominant_kind(spans) };
+            let kind = if len == 0 {
+                HighlightKind::Default
+            } else {
+                dominant_kind(spans)
+            };
             MinimapRow { indent, len, kind }
         })
         .collect()
@@ -286,13 +326,21 @@ fn highlight_lines(
                 let s = r.start.max(b.start);
                 let e = r.end.min(b.end);
                 if s < e {
-                    lines[l].push(HighlightSpan { range: s - b.start..e - b.start, kind });
+                    lines[l].push(HighlightSpan {
+                        range: s - b.start..e - b.start,
+                        kind,
+                    });
                 }
             }
         }
     }
     for spans in &mut lines {
-        spans.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(b.range.end.cmp(&a.range.end)));
+        spans.sort_by(|a, b| {
+            a.range
+                .start
+                .cmp(&b.range.start)
+                .then(b.range.end.cmp(&a.range.end))
+        });
         let mut end = 0;
         spans.retain(|s| {
             if s.range.start >= end {
@@ -314,11 +362,20 @@ mod tests {
     fn anchor_remap_insert_before_inside_after() {
         let mut a = AnchorList::default();
         let id = a.create(100);
-        a.remap(&Edit { range: 50..50, new_len: 10 }); // insert before → shifts
+        a.remap(&Edit {
+            range: 50..50,
+            new_len: 10,
+        }); // insert before → shifts
         assert_eq!(a.resolve(id), 110);
-        a.remap(&Edit { range: 200..200, new_len: 7 }); // insert after → unchanged
+        a.remap(&Edit {
+            range: 200..200,
+            new_len: 7,
+        }); // insert after → unchanged
         assert_eq!(a.resolve(id), 110);
-        a.remap(&Edit { range: 105..120, new_len: 3 }); // replace spanning → clamp
+        a.remap(&Edit {
+            range: 105..120,
+            new_len: 3,
+        }); // replace spanning → clamp
         assert_eq!(a.resolve(id), 105);
     }
 
@@ -326,7 +383,10 @@ mod tests {
     fn anchor_delete_spanning_clamps_to_start() {
         let mut a = AnchorList::default();
         let id = a.create(30);
-        a.remap(&Edit { range: 20..40, new_len: 0 });
+        a.remap(&Edit {
+            range: 20..40,
+            new_len: 0,
+        });
         assert_eq!(a.resolve(id), 20);
     }
 
@@ -334,9 +394,15 @@ mod tests {
     fn anchor_at_edit_boundaries() {
         let mut a = AnchorList::default();
         let id = a.create(50);
-        a.remap(&Edit { range: 50..60, new_len: 1 }); // edit starts at anchor → stays
+        a.remap(&Edit {
+            range: 50..60,
+            new_len: 1,
+        }); // edit starts at anchor → stays
         assert_eq!(a.resolve(id), 50);
-        a.remap(&Edit { range: 50..50, new_len: 4 }); // insertion at anchor → shifts
+        a.remap(&Edit {
+            range: 50..50,
+            new_len: 4,
+        }); // insertion at anchor → shifts
         assert_eq!(a.resolve(id), 54);
     }
 
@@ -346,13 +412,15 @@ mod tests {
         let x = a.create(10);
         let y = a.create(20);
         let z = a.create(30);
-        a.remap(&Edit { range: 15..25, new_len: 2 }); // y clamps to 15; z shifts −8
+        a.remap(&Edit {
+            range: 15..25,
+            new_len: 2,
+        }); // y clamps to 15; z shifts −8
         assert_eq!((a.resolve(x), a.resolve(y), a.resolve(z)), (10, 15, 22));
         assert!(a.resolve(x) <= a.resolve(y) && a.resolve(y) <= a.resolve(z));
     }
 
-    const SNIPPET: &str =
-        "// a comment line\nfn free() -> i32 {\n    let s = \"hi\";\n    42\n}\n";
+    const SNIPPET: &str = "// a comment line\nfn free() -> i32 {\n    let s = \"hi\";\n    42\n}\n";
 
     #[test]
     fn highlight_kinds_and_bounds() {
@@ -424,7 +492,8 @@ mod tests {
         // heading content is Type ("text.title")
         let (t0, s0) = buf.line(0).unwrap();
         assert!(
-            s0.iter().any(|s| s.kind == HighlightKind::Type && &t0[s.range.clone()] == "Title"),
+            s0.iter()
+                .any(|s| s.kind == HighlightKind::Type && &t0[s.range.clone()] == "Title"),
             "no Type span over 'Title' in {s0:?}"
         );
         // plain paragraph line: no mapped spans

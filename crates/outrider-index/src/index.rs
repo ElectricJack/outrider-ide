@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use anyhow::Context;
 use rayon::prelude::*;
 
-use crate::parse::{parse_rust_items, parse_c_items, parse_cpp_items, parse_python_items, parse_js_items, parse_ts_items, parse_tsx_items, parse_csharp_items, RawItem};
+use crate::parse::{
+    parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_python_items,
+    parse_rust_items, parse_ts_items, parse_tsx_items, RawItem,
+};
 use crate::scan::{build_tree, scan_files, ParsedFile, ScannedFile};
 use crate::types::{dedupe_ids, finalize_children, SymbolId, SymbolNode, SymbolTree};
 
@@ -28,6 +31,12 @@ impl IndexProgress {
             files_total: AtomicUsize::new(0),
             files_parsed: AtomicUsize::new(0),
         }
+    }
+}
+
+impl Default for IndexProgress {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -95,8 +104,8 @@ fn parse_all(
         .map(|(f, parser)| {
             let source = std::fs::read(repo_root.join(&f.rel_path))
                 .with_context(|| format!("reading {}", f.rel_path.display()))?;
-            let items = parser(&source)
-                .with_context(|| format!("parsing {}", f.rel_path.display()))?;
+            let items =
+                parser(&source).with_context(|| format!("parsing {}", f.rel_path.display()))?;
             let file_qual = f.rel_path.to_string_lossy().replace('\\', "/");
             let mut children: Vec<SymbolNode> = items
                 .into_iter()
@@ -111,7 +120,13 @@ fn parse_all(
             if let Some(p) = progress {
                 p.files_parsed.fetch_add(1, Ordering::Relaxed);
             }
-            Ok((f.rel_path.clone(), ParsedFile { items: children, doc }))
+            Ok((
+                f.rel_path.clone(),
+                ParsedFile {
+                    items: children,
+                    doc,
+                },
+            ))
         })
         .collect()
 }

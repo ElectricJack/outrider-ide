@@ -26,10 +26,18 @@ fn git_fixture() -> tempfile::TempDir {
     git(p, &["add", "."]);
     git(p, &["commit", "-qm", "one"]);
     // touch lib.rs twice more so it out-churns everything
-    fs::write(p.join("src/lib.rs"), fs::read_to_string(p.join("src/lib.rs")).unwrap() + "\n// x\n").unwrap();
+    fs::write(
+        p.join("src/lib.rs"),
+        fs::read_to_string(p.join("src/lib.rs")).unwrap() + "\n// x\n",
+    )
+    .unwrap();
     git(p, &["add", "."]);
     git(p, &["commit", "-qm", "two"]);
-    fs::write(p.join("src/lib.rs"), fs::read_to_string(p.join("src/lib.rs")).unwrap() + "// y\n").unwrap();
+    fs::write(
+        p.join("src/lib.rs"),
+        fs::read_to_string(p.join("src/lib.rs")).unwrap() + "// y\n",
+    )
+    .unwrap();
     git(p, &["add", "."]);
     git(p, &["commit", "-qm", "three"]);
     dir
@@ -52,7 +60,11 @@ fn churn_counts_real_repo_writes_and_reuses_cache() {
     let mtime = fs::metadata(&cache).unwrap().modified().unwrap();
     let again = churn_counts(p).unwrap();
     assert_eq!(again, counts);
-    assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), mtime, "cache not rewritten");
+    assert_eq!(
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        mtime,
+        "cache not rewritten"
+    );
 }
 
 #[test]

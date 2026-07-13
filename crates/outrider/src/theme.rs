@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(depth_fill(0), 0x17171B);
         assert_eq!(depth_fill(8), 0x3C3C46);
         assert_eq!(depth_fill(12), 0x3C3C46); // clamps at level 8
-        // t = 0.5 per channel: r,g 23+18.5→42 (0x2a); b 27+21.5→49 (0x31)
+                                              // t = 0.5 per channel: r,g 23+18.5→42 (0x2a); b 27+21.5→49 (0x31)
         assert_eq!(depth_fill(4), 0x2a2a31);
     }
 
@@ -198,7 +198,10 @@ mod tests {
         for level in [0, 3, 8] {
             let folder = box_fill(BoxKind::Folder, level, BoxTint::Normal);
             let file = box_fill(BoxKind::File, level, BoxTint::Normal);
-            assert_ne!(file, folder, "file and folder fills must differ at level {level}");
+            assert_ne!(
+                file, folder,
+                "file and folder fills must differ at level {level}"
+            );
             assert_eq!(file, file_fill(level));
         }
     }
@@ -231,5 +234,4 @@ mod tests {
             }
         }
     }
-
 }

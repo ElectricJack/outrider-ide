@@ -38,7 +38,10 @@ pub struct NodeTexture {
 
 impl NodeTexture {
     pub fn empty() -> Self {
-        Self { image: None, bytes: 0 }
+        Self {
+            image: None,
+            bytes: 0,
+        }
     }
 }
 
@@ -67,7 +70,10 @@ pub struct Rasterizer {
 
 impl Rasterizer {
     pub fn new() -> Self {
-        Self { font_system: FontSystem::new(), swash: SwashCache::new() }
+        Self {
+            font_system: FontSystem::new(),
+            swash: SwashCache::new(),
+        }
     }
 
     /// Rasterize `lines` into a single BGRA texture.
@@ -112,8 +118,7 @@ impl Rasterizer {
                 None => a,
             }
         };
-        let mut buffer =
-            Buffer::new(&mut self.font_system, Metrics::new(font_size, l as f32));
+        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, l as f32));
         buffer.set_size(Some(w as f32), Some(h as f32));
         buffer.set_wrap(Wrap::None);
         buffer.set_rich_text(
@@ -147,8 +152,8 @@ impl Rasterizer {
             p.swap(0, 2);
         }
         let bytes = rgba.len();
-        let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, rgba)
-            .expect("buffer sized to w*h*4");
+        let img =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, rgba).expect("buffer sized to w*h*4");
         NodeTexture {
             image: Some(Arc::new(RenderImage::new(vec![Frame::new(img)]))),
             bytes,
@@ -175,22 +180,39 @@ pub fn bake_container(
     }
     let aspect = container_rect.w / container_rect.h;
     let (tw, th) = if aspect >= 1.0 {
-        (CONTAINER_TEX_MAX as u32, (CONTAINER_TEX_MAX / aspect).ceil().max(1.0) as u32)
+        (
+            CONTAINER_TEX_MAX as u32,
+            (CONTAINER_TEX_MAX / aspect).ceil().max(1.0) as u32,
+        )
     } else {
-        ((CONTAINER_TEX_MAX * aspect).ceil().max(1.0) as u32, CONTAINER_TEX_MAX as u32)
+        (
+            (CONTAINER_TEX_MAX * aspect).ceil().max(1.0) as u32,
+            CONTAINER_TEX_MAX as u32,
+        )
     };
     let sx = tw as f64 / container_rect.w;
     let sy = th as f64 / container_rect.h;
 
     let mut rgba = vec![0u8; (tw as usize) * (th as usize) * 4];
-    container_fill(node, &container_rect, layout, sx, sy, tw, th, &mut rgba, base_level + 1, child_tex);
+    container_fill(
+        node,
+        &container_rect,
+        layout,
+        sx,
+        sy,
+        tw,
+        th,
+        &mut rgba,
+        base_level + 1,
+        child_tex,
+    );
 
     for p in rgba.chunks_exact_mut(4) {
         p.swap(0, 2);
     }
     let bytes = rgba.len();
-    let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(tw, th, rgba)
-        .expect("buffer sized to tw*th*4");
+    let img =
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(tw, th, rgba).expect("buffer sized to tw*th*4");
     NodeTexture {
         image: Some(Arc::new(RenderImage::new(vec![Frame::new(img)]))),
         bytes,
@@ -199,6 +221,7 @@ pub fn bake_container(
 
 /// Recursively fill descendant rectangles into the RGBA buffer, compositing
 /// cached child textures on top of themed fills.
+#[allow(clippy::too_many_arguments)]
 fn container_fill(
     node: &SymbolNode,
     root: &Rect,
@@ -212,7 +235,9 @@ fn container_fill(
     child_tex: &impl Fn(&SymbolId) -> Option<(u32, u32, Vec<u8>)>,
 ) {
     for child in &node.children {
-        let Some(r) = layout.rects.get(&child.id) else { continue };
+        let Some(r) = layout.rects.get(&child.id) else {
+            continue;
+        };
         let px = ((r.x - root.x) * sx) as i32;
         let py = ((r.y - root.y) * sy) as i32;
         let pw = (r.w * sx).max(1.0).ceil() as i32;
@@ -252,9 +277,22 @@ fn container_fill(
         }
 
         if let Some((sw, sh, src_bgra)) = child_tex(&child.id) {
-            composite_bgra(&src_bgra, sw, sh, pw as u32, ph as u32, px, py, tw, th, rgba);
+            composite_bgra(
+                &src_bgra, sw, sh, pw as u32, ph as u32, px, py, tw, th, rgba,
+            );
         } else if !child.children.is_empty() {
-            container_fill(child, root, layout, sx, sy, tw, th, rgba, level.saturating_add(1), child_tex);
+            container_fill(
+                child,
+                root,
+                layout,
+                sx,
+                sy,
+                tw,
+                th,
+                rgba,
+                level.saturating_add(1),
+                child_tex,
+            );
         }
 
         if child.churn > 0.0 {
@@ -292,6 +330,7 @@ fn classify_tint_node(node: &SymbolNode) -> theme::BoxTint {
 
 /// Nearest-neighbor scale BGRA source into destination RGBA buffer via
 /// src-over blend. Insets by 1px to avoid overwriting borders.
+#[allow(clippy::too_many_arguments)]
 fn composite_bgra(
     src_bgra: &[u8],
     src_w: u32,
@@ -339,7 +378,7 @@ fn composite_bgra(
                 &mut rgba[di..di + 4],
                 src_bgra[si + 2], // B→R (BGRA→RGBA)
                 src_bgra[si + 1],
-                src_bgra[si],     // R→B
+                src_bgra[si], // R→B
                 a,
             );
         }
@@ -371,7 +410,9 @@ fn disk_key(id: &SymbolId) -> String {
 fn save_to_disk(dir: &std::path::Path, id: &SymbolId, tex: &NodeTexture) {
     let Some(img) = &tex.image else { return };
     let path = dir.join(format!("{}.tex", disk_key(id)));
-    let Ok(mut f) = std::fs::File::create(&path) else { return };
+    let Ok(mut f) = std::fs::File::create(&path) else {
+        return;
+    };
     let sz = img.size(0);
     let w = sz.width.0 as u32;
     let h = sz.height.0 as u32;
@@ -457,7 +498,13 @@ impl TextureCache {
         if let Some(dir) = &self.disk_dir {
             if let Some(tex) = load_from_disk(dir, id) {
                 self.bytes += tex.bytes;
-                self.entries.insert(id.clone(), Entry { tex, last_used: self.clock });
+                self.entries.insert(
+                    id.clone(),
+                    Entry {
+                        tex,
+                        last_used: self.clock,
+                    },
+                );
                 return Some(&self.entries.get(id).unwrap().tex);
             }
         }
@@ -499,7 +546,13 @@ impl TextureCache {
             }
             self.bytes += tex.bytes;
             self.clock += 1;
-            self.entries.insert(id, Entry { tex, last_used: self.clock });
+            self.entries.insert(
+                id,
+                Entry {
+                    tex,
+                    last_used: self.clock,
+                },
+            );
         }
         let remaining = it.next().is_some();
         self.evict();
@@ -513,7 +566,13 @@ impl TextureCache {
         }
         self.bytes += tex.bytes;
         self.clock += 1;
-        self.entries.insert(id, Entry { tex, last_used: self.clock });
+        self.entries.insert(
+            id,
+            Entry {
+                tex,
+                last_used: self.clock,
+            },
+        );
     }
 
     fn evict(&mut self) {
@@ -584,7 +643,9 @@ pub fn pre_bake_all(
     cache: &mut TextureCache,
     progress: &outrider_index::IndexProgress,
 ) {
-    progress.phase.store(4, std::sync::atomic::Ordering::Relaxed);
+    progress
+        .phase
+        .store(4, std::sync::atomic::Ordering::Relaxed);
     let file_symbols = collect_file_symbols(tree);
     let mut buffers = BufferManager::new(tree.repo_root.clone());
 
@@ -598,12 +659,18 @@ pub fn pre_bake_all(
     collect_nodes(&tree.root, 0, &mut order);
 
     let total = order.len();
-    progress.files_total.store(total, std::sync::atomic::Ordering::Relaxed);
-    progress.files_parsed.store(0, std::sync::atomic::Ordering::Relaxed);
+    progress
+        .files_total
+        .store(total, std::sync::atomic::Ordering::Relaxed);
+    progress
+        .files_parsed
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 
     for (i, &(node, depth)) in order.iter().enumerate() {
         if cache.contains(&node.id) {
-            progress.files_parsed.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+            progress
+                .files_parsed
+                .store(i + 1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
 
@@ -613,8 +680,8 @@ pub fn pre_bake_all(
             let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
             if let Some(m) = buffers.get(&rel, syms) {
                 if let Some(start) = m.symbol_start_line(&node.id) {
-                    let count = (node.measure as usize)
-                        .min(m.buffer.len_lines().saturating_sub(start));
+                    let count =
+                        (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
                     let mut lines: Vec<Line> = Vec::with_capacity(count);
                     for j in 0..count {
                         if let Some((text, spans)) = m.buffer.line(start + j) {
@@ -640,7 +707,9 @@ pub fn pre_bake_all(
             }
         }
 
-        progress.files_parsed.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+        progress
+            .files_parsed
+            .store(i + 1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -677,8 +746,7 @@ mod tests {
         let tex = Rasterizer::new().bake(&lines);
         let img = tex.image.unwrap();
         let bytes = img.as_bytes(0).unwrap();
-        let covered: Vec<&[u8]> =
-            bytes.chunks_exact(4).filter(|p| p[3] > 0).collect();
+        let covered: Vec<&[u8]> = bytes.chunks_exact(4).filter(|p| p[3] > 0).collect();
         assert!(!covered.is_empty(), "no glyph coverage — font not found?");
         assert!(covered.iter().all(|p| p[2] >= p[0]), "not BGRA red");
     }
@@ -688,10 +756,7 @@ mod tests {
         let lines: Vec<Line> = (0..5).map(|_| plain("let x = 1;")).collect();
         let a = Rasterizer::new().bake(&lines);
         let b = Rasterizer::new().bake(&lines);
-        assert_eq!(
-            a.image.unwrap().as_bytes(0),
-            b.image.unwrap().as_bytes(0),
-        );
+        assert_eq!(a.image.unwrap().as_bytes(0), b.image.unwrap().as_bytes(0),);
     }
 
     #[test]
@@ -720,7 +785,9 @@ mod tests {
     fn cache_bakes_largest_first_within_budget() {
         let mut cache = TextureCache::new_memory_only(DEFAULT_CACHE_MB as usize * 1024 * 1024);
         for i in 0..6 {
-            assert!(cache.get(&sid(&format!("l{i}")), (i + 1) as f64 * 10.0).is_none());
+            assert!(cache
+                .get(&sid(&format!("l{i}")), (i + 1) as f64 * 10.0)
+                .is_none());
         }
         assert!(cache.has_queued());
         let remaining = cache.bake_queued(|_, r| some_tex(4, r));

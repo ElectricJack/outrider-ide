@@ -18,18 +18,25 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             filter_extensions: vec![
-                "exe", "dll", "obj", "o", "so", "dylib", "a", "lib", "pdb",
-                "class", "pyc", "wasm", "bin", "dat", "db", "sqlite",
-                "png", "jpg", "jpeg", "gif", "ico", "bmp", "svg",
-                "mp3", "mp4", "wav", "zip", "tar", "gz", "7z", "rar",
-                "pdf", "ttf", "otf", "woff", "woff2",
+                "exe", "dll", "obj", "o", "so", "dylib", "a", "lib", "pdb", "class", "pyc", "wasm",
+                "bin", "dat", "db", "sqlite", "png", "jpg", "jpeg", "gif", "ico", "bmp", "svg",
+                "mp3", "mp4", "wav", "zip", "tar", "gz", "7z", "rar", "pdf", "ttf", "otf", "woff",
+                "woff2",
             ]
             .into_iter()
             .map(String::from)
             .collect(),
             filter_folders: vec![
-                "target", "node_modules", "dist", "build", "__pycache__",
-                ".next", ".nuxt", "out", "pkg", "vendor",
+                "target",
+                "node_modules",
+                "dist",
+                "build",
+                "__pycache__",
+                ".next",
+                ".nuxt",
+                "out",
+                "pkg",
+                "vendor",
             ]
             .into_iter()
             .map(String::from)

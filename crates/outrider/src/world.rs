@@ -76,8 +76,16 @@ pub fn rung_for(px_h: f64, px_w: f64) -> Option<Rung> {
     } else {
         Rung::Full
     };
-    let rung = if px_w < LABEL_MIN_W { Rung::Dot } else { by_height };
-    Some(if rung == Rung::Full && px_w < CODE_MIN_W { Rung::Detail } else { rung })
+    let rung = if px_w < LABEL_MIN_W {
+        Rung::Dot
+    } else {
+        by_height
+    };
+    Some(if rung == Rung::Full && px_w < CODE_MIN_W {
+        Rung::Detail
+    } else {
+        rung
+    })
 }
 
 /// Draw mode for a leaf page, chosen by on-screen box size (spec §3).
@@ -163,7 +171,17 @@ pub fn visible_nodes<'a>(
     has_thumbnail: impl Fn(&outrider_index::SymbolId) -> bool,
 ) -> Vec<DrawItem<'a>> {
     let mut out = Vec::new();
-    walk(&tree.root, pack, camera, vw, vh, 0, false, &has_thumbnail, &mut out);
+    walk(
+        &tree.root,
+        pack,
+        camera,
+        vw,
+        vh,
+        0,
+        false,
+        &has_thumbnail,
+        &mut out,
+    );
     out
 }
 
@@ -173,6 +191,7 @@ pub fn visible_nodes<'a>(
 /// folder thumbnail. When false, children that would normally merge away
 /// (below `MERGE_PX`) are kept as Dot fills so they remain visible until
 /// the parent's thumbnail is ready to replace the whole subtree.
+#[allow(clippy::too_many_arguments)]
 fn walk<'a>(
     node: &'a SymbolNode,
     pack: &outrider_layout::PackLayout,
@@ -184,7 +203,9 @@ fn walk<'a>(
     has_thumbnail: &dyn Fn(&outrider_index::SymbolId) -> bool,
     out: &mut Vec<DrawItem<'a>>,
 ) {
-    let Some(r) = pack.rects.get(&node.id) else { return };
+    let Some(r) = pack.rects.get(&node.id) else {
+        return;
+    };
     let (sx, sy) = camera.world_to_screen(r.x, r.y, vw, vh);
     let (pw, ph) = (r.w * camera.zoom, r.h * camera.zoom);
     if sx > vw || sx + pw < 0.0 || sy > vh || sy + ph < 0.0 {
@@ -209,7 +230,12 @@ fn walk<'a>(
     let y1 = (sy + ph).min(vh + 2.0);
     out.push(DrawItem {
         node,
-        px: PxRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+        px: PxRect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        },
         label_w: pw,
         level,
         draw,
@@ -226,7 +252,17 @@ fn walk<'a>(
     };
     if !prune {
         for child in &node.children {
-            walk(child, pack, camera, vw, vh, level.saturating_add(1), this_has_thumb, has_thumbnail, out);
+            walk(
+                child,
+                pack,
+                camera,
+                vw,
+                vh,
+                level.saturating_add(1),
+                this_has_thumb,
+                has_thumbnail,
+                out,
+            );
         }
     }
 }
@@ -251,9 +287,19 @@ mod tests {
         assert!((a - b).abs() < 1e-9, "{a} != {b}");
     }
 
-    fn n(kind: SymbolKind, qp: &str, name: &str, measure: u64, children: Vec<SymbolNode>) -> SymbolNode {
+    fn n(
+        kind: SymbolKind,
+        qp: &str,
+        name: &str,
+        measure: u64,
+        children: Vec<SymbolNode>,
+    ) -> SymbolNode {
         SymbolNode {
-            id: SymbolId { kind, qualified_path: qp.into(), ordinal: 0 },
+            id: SymbolId {
+                kind,
+                qualified_path: qp.into(),
+                ordinal: 0,
+            },
             name: name.into(),
             byte_range: None,
             signature: None,
@@ -281,8 +327,20 @@ mod tests {
                         "b.rs",
                         10,
                         vec![
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", 10, vec![]),
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", 1, vec![]),
+                            n(
+                                SymbolKind::Item { label: "fn".into() },
+                                "b.rs::f",
+                                "f",
+                                10,
+                                vec![],
+                            ),
+                            n(
+                                SymbolKind::Item { label: "fn".into() },
+                                "b.rs::g",
+                                "g",
+                                1,
+                                vec![],
+                            ),
                         ],
                     ),
                 ],
@@ -345,7 +403,11 @@ mod tests {
     fn packed_walk_zoom_one_clips_and_keeps_unclipped_fields() {
         let (tree, p) = packed_example();
         // zoom 1.0 centered on g's page center (744, 355.4)
-        let cam = Camera { center_x: 744.0, center_y: 355.4, zoom: 1.0 };
+        let cam = Camera {
+            center_x: 744.0,
+            center_y: 355.4,
+            zoom: 1.0,
+        };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
@@ -396,7 +458,11 @@ mod tests {
         let (tree, p) = packed_example();
         // Zoomed far out: root at Dot rung. Without a cached thumbnail,
         // all children remain visible (sub-MERGE_PX nodes kept as Dots).
-        let cam = Camera { center_x: 500.0, center_y: 819.6, zoom: 0.03 };
+        let cam = Camera {
+            center_x: 500.0,
+            center_y: 819.6,
+            zoom: 0.03,
+        };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert!(names.contains(&""));
@@ -415,12 +481,20 @@ mod tests {
     #[test]
     fn packed_walk_prunes_offscreen_subtrees() {
         let (tree, p) = packed_example();
-        let cam = Camera { center_x: 100_000.0, center_y: 100_000.0, zoom: 1.0 };
+        let cam = Camera {
+            center_x: 100_000.0,
+            center_y: 100_000.0,
+            zoom: 1.0,
+        };
         assert!(visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false).is_empty());
         // panned right so only b.rs's column of the map remains: a.rs's
         // right edge (488) is left of the viewport's world-left edge
         // (900 − 400 = 500) → a.rs pruned, b.rs subtree survives
-        let cam = Camera { center_x: 900.0, center_y: 293.0, zoom: 1.0 };
+        let cam = Camera {
+            center_x: 900.0,
+            center_y: 293.0,
+            zoom: 1.0,
+        };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "b.rs", "f", "g"]);
@@ -440,9 +514,9 @@ mod tests {
         assert_eq!(leaf_draw(79.9, 400.0, 100.0), Some(Label));
         // Text: font ≥ 7 (ph/natural ≥ 7/12) AND pw ≥ CODE_MIN_W
         assert_eq!(leaf_draw(80.0, 400.0, 100.0), Some(Text)); // font 9.6
-        // Minimap: tall page, font sub-7
+                                                               // Minimap: tall page, font sub-7
         assert_eq!(leaf_draw(80.0, 400.0, 200.0), Some(Minimap)); // font 4.8
-        // width gate forces Minimap even when font clears 7
+                                                                  // width gate forces Minimap even when font clears 7
         assert_eq!(leaf_draw(80.0, 299.9, 100.0), Some(Minimap));
     }
 
@@ -450,7 +524,7 @@ mod tests {
     fn tall_leaf_steps_minimap_then_text_as_it_grows() {
         use LeafDraw::*;
         let natural = 3000.0; // ~190-line page
-        // low zoom: box 200px tall → font 0.8 → Minimap
+                              // low zoom: box 200px tall → font 0.8 → Minimap
         assert_eq!(leaf_draw(200.0, 400.0, natural), Some(Minimap));
         // zoom until font ≥ 7 → ph ≥ 7/12·natural = 1750
         assert_eq!(leaf_draw(1750.0, 400.0, natural), Some(Text));

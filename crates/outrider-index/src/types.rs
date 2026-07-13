@@ -118,7 +118,9 @@ mod tests {
     fn mk(name: &str) -> SymbolNode {
         SymbolNode {
             id: SymbolId {
-                kind: SymbolKind::Item { label: "impl".into() },
+                kind: SymbolKind::Item {
+                    label: "impl".into(),
+                },
                 qualified_path: format!("f.rs::{name}"),
                 ordinal: 0,
             },
@@ -183,36 +185,36 @@ mod tests {
     #[test]
     fn dedupe_ids_disambiguates_cross_scope_duplicates() {
         // Simulates two cfg-gated `mod imp` blocks, each containing `fn connect`.
-        let mk_mod = || {
-            SymbolNode {
+        let mk_mod = || SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Item {
+                    label: "module".into(),
+                },
+                qualified_path: "net.rs::imp".into(),
+                ordinal: 0,
+            },
+            name: "imp".into(),
+            byte_range: None,
+            signature: None,
+            doc: None,
+            measure: 2,
+            churn: 0.0,
+            churn_count: 0,
+            children: vec![SymbolNode {
                 id: SymbolId {
-                    kind: SymbolKind::Item { label: "module".into() },
-                    qualified_path: "net.rs::imp".into(),
+                    kind: SymbolKind::Item { label: "fn".into() },
+                    qualified_path: "net.rs::imp::connect".into(),
                     ordinal: 0,
                 },
-                name: "imp".into(),
+                name: "connect".into(),
                 byte_range: None,
                 signature: None,
                 doc: None,
-                measure: 2,
+                measure: 1,
                 churn: 0.0,
                 churn_count: 0,
-                children: vec![SymbolNode {
-                    id: SymbolId {
-                        kind: SymbolKind::Item { label: "fn".into() },
-                        qualified_path: "net.rs::imp::connect".into(),
-                        ordinal: 0,
-                    },
-                    name: "connect".into(),
-                    byte_range: None,
-                    signature: None,
-                    doc: None,
-                    measure: 1,
-                    churn: 0.0,
-                    churn_count: 0,
-                    children: vec![],
-                }],
-            }
+                children: vec![],
+            }],
         };
         let mut file = mk("net.rs");
         file.children = vec![mk_mod(), mk_mod()];

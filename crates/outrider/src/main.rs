@@ -7,8 +7,8 @@ mod camera;
 mod chrome;
 mod content;
 mod focus;
-mod rasterize;
 mod palette;
+mod rasterize;
 mod settings;
 mod theme;
 mod treemap;
@@ -38,7 +38,11 @@ fn main() {
     };
     let settings = settings::Settings::load();
     eprintln!("indexing {}…", repo.display());
-    let tree = match outrider_index::index_repo(&repo, &settings.filter_extensions, &settings.filter_folders) {
+    let tree = match outrider_index::index_repo(
+        &repo,
+        &settings.filter_extensions,
+        &settings.filter_folders,
+    ) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: {e:#}");

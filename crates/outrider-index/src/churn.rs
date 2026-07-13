@@ -17,12 +17,12 @@ pub fn commit_counts_from_log(log: &str) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
     for line in log.lines() {
         let mut parts = line.splitn(3, '\t');
-        let (Some(added), Some(deleted), Some(path)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
             continue; // commit-hash line or blank
         };
-        let is_stat = |s: &str| s == "-" || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+        let is_stat =
+            |s: &str| s == "-" || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
         if is_stat(added) && is_stat(deleted) {
             *counts.entry(path.to_string()).or_insert(0) += 1;
         }
@@ -69,7 +69,10 @@ pub fn churn_counts(repo_root: &Path) -> anyhow::Result<BTreeMap<String, u64>> {
         }
     }
 
-    let log = git_stdout(repo_root, &["log", "--numstat", "--no-renames", "--format=%H"])?;
+    let log = git_stdout(
+        repo_root,
+        &["log", "--numstat", "--no-renames", "--format=%H"],
+    )?;
     let counts = commit_counts_from_log(&log);
 
     std::fs::create_dir_all(cache_path.parent().expect("cache path has parent"))?;
@@ -92,7 +95,10 @@ fn git_stdout(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
         .output()
         .context("spawning git")?;
     if !out.status.success() {
-        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     String::from_utf8(out.stdout).context("git output not utf-8")
 }
@@ -211,7 +217,10 @@ mod tests {
 
     #[test]
     fn percentiles_are_fraction_strictly_below_over_n_minus_1() {
-        assert_eq!(percentiles(&[10, 20, 30, 20]), vec![0.0, 1.0 / 3.0, 1.0, 1.0 / 3.0]);
+        assert_eq!(
+            percentiles(&[10, 20, 30, 20]),
+            vec![0.0, 1.0 / 3.0, 1.0, 1.0 / 3.0]
+        );
         assert_eq!(percentiles(&[7]), vec![0.0]);
         assert_eq!(percentiles(&[]), Vec::<f32>::new());
         // all equal -> everyone at 0.0

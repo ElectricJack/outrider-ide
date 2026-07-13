@@ -81,7 +81,10 @@ fn is_doc_ext(ext: &str) -> bool {
 /// nesting level instead of kind/size order.
 fn is_source_ordered_ext(ext: &str) -> bool {
     is_doc_ext(ext)
-        || matches!(ext, "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" | "inl")
+        || matches!(
+            ext,
+            "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" | "inl"
+        )
 }
 
 /// Extension of the file part of a qualified path: everything before the
@@ -94,7 +97,8 @@ fn file_ext(qualified_path: &str) -> Option<&str> {
 
 /// True if the plain file name (no path) has a documentation extension.
 fn name_is_doc(name: &str) -> bool {
-    name.rfind('.').is_some_and(|dot| is_doc_ext(&name[dot + 1..]))
+    name.rfind('.')
+        .is_some_and(|dot| is_doc_ext(&name[dot + 1..]))
 }
 
 /// (doc files, total files) under a folder, recursively. Symbol items
@@ -196,7 +200,10 @@ fn size(
         content_h = content_h.max(y + h);
         y += h + cfg.gap;
     }
-    let wh = (x + col_w + 2.0 * cfg.gap, cfg.container_header + content_h + 2.0 * cfg.gap);
+    let wh = (
+        x + col_w + 2.0 * cfg.gap,
+        cfg.container_header + content_h + 2.0 * cfg.gap,
+    );
     rel.insert(node.id.clone(), (0.0, 0.0, wh.0, wh.1));
     wh
 }
@@ -239,9 +246,19 @@ mod tests {
         }
     }
 
-    fn n(kind: SymbolKind, qp: &str, name: &str, measure: u64, children: Vec<SymbolNode>) -> SymbolNode {
+    fn n(
+        kind: SymbolKind,
+        qp: &str,
+        name: &str,
+        measure: u64,
+        children: Vec<SymbolNode>,
+    ) -> SymbolNode {
         SymbolNode {
-            id: SymbolId { kind, qualified_path: qp.into(), ordinal: 0 },
+            id: SymbolId {
+                kind,
+                qualified_path: qp.into(),
+                ordinal: 0,
+            },
             name: name.into(),
             byte_range: None,
             signature: None,
@@ -269,8 +286,20 @@ mod tests {
                         "b.rs",
                         40,
                         vec![
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", 10, vec![]),
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", 1, vec![]),
+                            n(
+                                SymbolKind::Item { label: "fn".into() },
+                                "b.rs::f",
+                                "f",
+                                10,
+                                vec![],
+                            ),
+                            n(
+                                SymbolKind::Item { label: "fn".into() },
+                                "b.rs::g",
+                                "g",
+                                1,
+                                vec![],
+                            ),
                         ],
                     ),
                 ],
@@ -347,7 +376,15 @@ mod tests {
         // class. Group rank wins over height: the tiny struct still packs
         // first; the module packs last despite the fn being far taller.
         let item = |label: &str, qp: &str, name: &str, measure: u64| {
-            n(SymbolKind::Item { label: label.into() }, qp, name, measure, vec![])
+            n(
+                SymbolKind::Item {
+                    label: label.into(),
+                },
+                qp,
+                name,
+                measure,
+                vec![],
+            )
         };
         let file = n(
             SymbolKind::File,
@@ -377,8 +414,14 @@ mod tests {
         // big fn wraps to its own column right of the struct
         assert!(big.x > s.x, "fn in a later column than the struct");
         // class after fn, module after class (later column or lower in same)
-        assert!(c.x > big.x || (c.x == big.x && c.y > big.y), "class after fn");
-        assert!(sub.x > c.x || (sub.x == c.x && sub.y > c.y), "module after class");
+        assert!(
+            c.x > big.x || (c.x == big.x && c.y > big.y),
+            "class after fn"
+        );
+        assert!(
+            sub.x > c.x || (sub.x == c.x && sub.y > c.y),
+            "module after class"
+        );
     }
 
     #[test]
@@ -426,7 +469,15 @@ mod tests {
         // Four equal 480×120.4 pages, aspect 1.6 (test cfg): target_h ≈ 380
         // holds three per column, the fourth wraps to a second column.
         let files: Vec<SymbolNode> = (1..=4)
-            .map(|i| n(SymbolKind::File, &format!("c{i}.rs"), &format!("c{i}.rs"), 5, vec![]))
+            .map(|i| {
+                n(
+                    SymbolKind::File,
+                    &format!("c{i}.rs"),
+                    &format!("c{i}.rs"),
+                    5,
+                    vec![],
+                )
+            })
             .collect();
         let tree = SymbolTree {
             root: n(SymbolKind::Folder, "", "", 0, files),
@@ -464,7 +515,11 @@ mod tests {
             "f.rs",
             "f.rs",
             12,
-            vec![chunk("zzz", 0, 0_u16), chunk("mmm", 60, 1_u16), chunk("aaa", 120, 2_u16)],
+            vec![
+                chunk("zzz", 0, 0_u16),
+                chunk("mmm", 60, 1_u16),
+                chunk("aaa", 120, 2_u16),
+            ],
         );
         file.byte_range = Some(0..200);
         let tree = SymbolTree {
@@ -475,10 +530,13 @@ mod tests {
         let z = rect(&p, "f.rs#0"); // "zzz", byte 0
         let m = rect(&p, "f.rs#1"); // "mmm", byte 60
         let a = rect(&p, "f.rs#2"); // "aaa", byte 120
-        // one column (same x); source order sets the vertical order
+                                    // one column (same x); source order sets the vertical order
         close(z.x, m.x);
         close(m.x, a.x);
-        assert!(z.y < m.y && m.y < a.y, "chunks stack zzz(0) < mmm(60) < aaa(120)");
+        assert!(
+            z.y < m.y && m.y < a.y,
+            "chunks stack zzz(0) < mmm(60) < aaa(120)"
+        );
     }
 
     #[test]
@@ -536,7 +594,13 @@ mod tests {
             "d",
             0,
             vec![
-                n(SymbolKind::Folder, "d/sub", "sub", 0, vec![f("a.md"), f("b.md")]),
+                n(
+                    SymbolKind::Folder,
+                    "d/sub",
+                    "sub",
+                    0,
+                    vec![f("a.md"), f("b.md")],
+                ),
                 f("c.md"),
                 f("x.rs"),
             ],
@@ -548,7 +612,13 @@ mod tests {
         // empty folder — not doc
         assert_eq!(doc_rank(&n(SymbolKind::Folder, "e", "e", 0, vec![])), 0);
         // non-file/folder kinds never rank
-        let it = n(SymbolKind::Item { label: "fn".into() }, "a.md::x", "x", 1, vec![]);
+        let it = n(
+            SymbolKind::Item { label: "fn".into() },
+            "a.md::x",
+            "x",
+            1,
+            vec![],
+        );
         assert_eq!(doc_rank(&it), 0);
     }
 
@@ -557,8 +627,15 @@ mod tests {
         // Scrambled: the tall struct is declared LAST. Kind/size order would
         // place it first (rank 0, tallest); a .c file must keep byte order.
         let item = |label: &str, qp: &str, name: &str, measure: u64, start: usize| {
-            let mut it =
-                n(SymbolKind::Item { label: label.into() }, qp, name, measure, vec![]);
+            let mut it = n(
+                SymbolKind::Item {
+                    label: label.into(),
+                },
+                qp,
+                name,
+                measure,
+                vec![],
+            );
             it.byte_range = Some(start..start + 10);
             it
         };
@@ -582,8 +659,8 @@ mod tests {
         let z = rect(&p, "src/m.c::zebra"); // byte 0
         let m = rect(&p, "src/m.c::mid"); // byte 100
         let s = rect(&p, "src/m.c::S"); // byte 200
-        // zebra and mid stack in the first column in byte order; the struct —
-        // which kind/size order would have placed first — packs last (wraps)
+                                        // zebra and mid stack in the first column in byte order; the struct —
+                                        // which kind/size order would have placed first — packs last (wraps)
         close(z.x, m.x);
         assert!(z.y < m.y, "zebra(0) above mid(100)");
         assert!(s.x > m.x, "S(200) last despite kind rank 0 and max height");
@@ -594,8 +671,13 @@ mod tests {
         // A section inside a .md file: its children pack by byte offset even
         // though tallest-first would reverse them.
         let item = |qp: &str, name: &str, measure: u64, start: usize| {
-            let mut it =
-                n(SymbolKind::Item { label: "h2".into() }, qp, name, measure, vec![]);
+            let mut it = n(
+                SymbolKind::Item { label: "h2".into() },
+                qp,
+                name,
+                measure,
+                vec![],
+            );
             it.byte_range = Some(start..start + 10);
             it
         };
@@ -604,7 +686,10 @@ mod tests {
             "g.md::Sec",
             "Sec",
             0,
-            vec![item("g.md::Sec::zz", "zz", 2, 0), item("g.md::Sec::aa", "aa", 30, 100)],
+            vec![
+                item("g.md::Sec::zz", "zz", 2, 0),
+                item("g.md::Sec::aa", "aa", 30, 100),
+            ],
         );
         sec.byte_range = Some(0..200);
         let mut file = n(SymbolKind::File, "g.md", "g.md", 40, vec![sec]);
@@ -616,8 +701,11 @@ mod tests {
         let p = pack(&tree, &cfg());
         let zz = rect(&p, "g.md::Sec::zz"); // byte 0, short
         let aa = rect(&p, "g.md::Sec::aa"); // byte 100, tall
-        // byte order beats tallest-first: zz is placed first (reading order)
-        assert!(zz.x < aa.x || (zz.x == aa.x && zz.y < aa.y), "zz(0) before aa(100)");
+                                            // byte order beats tallest-first: zz is placed first (reading order)
+        assert!(
+            zz.x < aa.x || (zz.x == aa.x && zz.y < aa.y),
+            "zz(0) before aa(100)"
+        );
     }
 
     #[test]
@@ -683,6 +771,9 @@ mod tests {
         };
         let p = pack(&tree, &cfg());
         let (d, m) = (rect(&p, "a_docs"), rect(&p, "mixed"));
-        assert!(m.x < d.x || (m.x == d.x && m.y < d.y), "mixed before a_docs");
+        assert!(
+            m.x < d.x || (m.x == d.x && m.y < d.y),
+            "mixed before a_docs"
+        );
     }
 }

@@ -50,7 +50,9 @@ fn line_spans(text: &str) -> Vec<(usize, usize)> {
 
 /// Line content (newline/CR trimmed) for each line.
 fn line_contents(text: &str) -> Vec<&str> {
-    text.split_inclusive('\n').map(|s| s.trim_end_matches(['\n', '\r'])).collect()
+    text.split_inclusive('\n')
+        .map(|s| s.trim_end_matches(['\n', '\r']))
+        .collect()
 }
 
 /// Build a Chunk over lines `[a, b)` with the given label.
@@ -114,7 +116,10 @@ fn is_heading(line: &str) -> bool {
 
 /// Heading text with markers and surrounding whitespace stripped.
 fn heading_label(line: &str) -> String {
-    line.trim_start_matches(' ').trim_start_matches('#').trim().to_string()
+    line.trim_start_matches(' ')
+        .trim_start_matches('#')
+        .trim()
+        .to_string()
 }
 
 /// Semantic Markdown chunking: heading splits with preamble-merge and oversized-section fallback.
@@ -202,7 +207,9 @@ mod tests {
         let labels: Vec<&str> = cs.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, vec!["1–60", "61–120", "121–150"]);
         assert_eq!(
-            cs.iter().map(|c| (c.start_line, c.end_line)).collect::<Vec<_>>(),
+            cs.iter()
+                .map(|c| (c.start_line, c.end_line))
+                .collect::<Vec<_>>(),
             vec![(0, 60), (60, 120), (120, 150)]
         );
         assert_contiguous(&cs, &text);
@@ -215,7 +222,9 @@ mod tests {
         let labels: Vec<&str> = cs.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, vec!["Alpha", "Beta"]);
         assert_eq!(
-            cs.iter().map(|c| (c.start_line, c.end_line)).collect::<Vec<_>>(),
+            cs.iter()
+                .map(|c| (c.start_line, c.end_line))
+                .collect::<Vec<_>>(),
             vec![(0, 3), (3, 5)]
         );
         assert_contiguous(&cs, text);
@@ -246,7 +255,11 @@ mod tests {
         text.push('\n'); // blank line, index 66
         text.push_str("tail\n");
         let cs = MarkdownChunker.chunks(&text);
-        assert!(cs.len() >= 2, "expected a blank-line split, got {}", cs.len());
+        assert!(
+            cs.len() >= 2,
+            "expected a blank-line split, got {}",
+            cs.len()
+        );
         // no chunk boundary lands inside the paragraph of x's (lines 1..=65)
         for c in &cs {
             assert!(
@@ -293,7 +306,10 @@ mod tests {
         let labels: Vec<&str> = cs.iter().map(|c| c.label.as_str()).collect();
         // Some chunk must be labeled by the second heading "Two" (i.e. it began
         // on that heading, not merged into a range-labeled chunk).
-        assert!(labels.contains(&"Two"), "heading after blank split should start its own chunk; got {labels:?}");
+        assert!(
+            labels.contains(&"Two"),
+            "heading after blank split should start its own chunk; got {labels:?}"
+        );
         assert!(!cs.is_empty());
         assert_eq!(cs[0].start_line, 0);
         assert_eq!(cs.last().unwrap().end_byte, text.len());
