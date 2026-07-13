@@ -45,11 +45,6 @@ fn settings_path() -> Option<PathBuf> {
 }
 
 impl Settings {
-    /// Return the path to the settings file, if determinable.
-    pub fn path() -> Option<PathBuf> {
-        settings_path()
-    }
-
     pub fn load() -> Self {
         let Some(path) = settings_path() else {
             return Self::default();

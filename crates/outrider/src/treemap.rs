@@ -116,6 +116,54 @@ struct ContextMenu {
     target: SymbolId,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsField {
+    Extensions,
+    Folders,
+    CacheMb,
+}
+
+struct SettingsDraft {
+    filter_extensions: String,
+    filter_folders: String,
+    cache_mb: String,
+    active: SettingsField,
+}
+
+impl SettingsDraft {
+    fn from_settings(s: &settings::Settings) -> Self {
+        Self {
+            filter_extensions: s.filter_extensions.join(", "),
+            filter_folders: s.filter_folders.join(", "),
+            cache_mb: s.cache_mb.to_string(),
+            active: SettingsField::Extensions,
+        }
+    }
+
+    fn active_text_mut(&mut self) -> &mut String {
+        match self.active {
+            SettingsField::Extensions => &mut self.filter_extensions,
+            SettingsField::Folders => &mut self.filter_folders,
+            SettingsField::CacheMb => &mut self.cache_mb,
+        }
+    }
+
+    fn to_settings(&self) -> settings::Settings {
+        let parse_list = |s: &str| -> Vec<String> {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        settings::Settings {
+            filter_extensions: parse_list(&self.filter_extensions),
+            filter_folders: parse_list(&self.filter_folders),
+            show_welcome: false,
+            cache_mb: self.cache_mb.trim().parse::<u32>().unwrap_or(256),
+        }
+    }
+}
+
 /// Root GPUI view: owns the symbol tree, pack layout, camera state, buffer
 /// cache, and texture cache; produces a full-screen canvas each frame.
 pub struct TreemapView {
@@ -148,8 +196,8 @@ pub struct TreemapView {
     settings: settings::Settings,
     /// Whether to show the welcome overlay this session.
     show_welcome: bool,
-    /// Whether the settings overlay is open.
-    settings_open: bool,
+    /// Working copy of settings while the settings panel is open.
+    settings_draft: Option<SettingsDraft>,
     /// Right-click context menu, if currently open.
     context_menu: Option<ContextMenu>,
     /// Background indexing in progress (Open Folder or re-index).
@@ -544,7 +592,7 @@ impl TreemapView {
             palette: palette::Palette::new(),
             settings,
             show_welcome,
-            settings_open: false,
+            settings_draft: None,
             context_menu: None,
             loading: None,
         }
@@ -1097,8 +1145,10 @@ impl TreemapView {
                     .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)).bg(rgb(chrome::MENU_HOVER)))
                     .child("Settings")
                     .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.settings_open = !this.settings_open;
-                        if this.settings_open {
+                        if this.settings_draft.is_some() {
+                            this.settings_draft = None;
+                        } else {
+                            this.settings_draft = Some(SettingsDraft::from_settings(&this.settings));
                             this.palette.close();
                             this.show_welcome = false;
                             this.context_menu = None;
@@ -1236,21 +1286,23 @@ impl TreemapView {
             match e.keystroke.key.as_str() {
                 "p" => {
                     self.palette.open(palette::PaletteMode::File, &self.tree);
-                    self.settings_open = false;
+                    self.settings_draft = None;
                     self.context_menu = None;
                     cx.notify();
                     return;
                 }
                 "t" => {
                     self.palette.open(palette::PaletteMode::Symbol, &self.tree);
-                    self.settings_open = false;
+                    self.settings_draft = None;
                     self.context_menu = None;
                     cx.notify();
                     return;
                 }
                 "," => {
-                    self.settings_open = !self.settings_open;
-                    if self.settings_open {
+                    if self.settings_draft.is_some() {
+                        self.settings_draft = None;
+                    } else {
+                        self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
                         self.palette.close();
                         self.show_welcome = false;
                         self.context_menu = None;
@@ -1261,11 +1313,34 @@ impl TreemapView {
                 _ => {}
             }
         }
-        if self.settings_open {
-            if e.keystroke.key.as_str() == "escape" {
-                self.settings_open = false;
-                cx.notify();
+        if let Some(draft) = &mut self.settings_draft {
+            match e.keystroke.key.as_str() {
+                "escape" => self.settings_draft = None,
+                "tab" => {
+                    draft.active = match draft.active {
+                        SettingsField::Extensions => SettingsField::Folders,
+                        SettingsField::Folders => SettingsField::CacheMb,
+                        SettingsField::CacheMb => SettingsField::Extensions,
+                    };
+                }
+                "backspace" => { draft.active_text_mut().pop(); }
+                _ => {
+                    if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
+                        let mut chars = s.chars();
+                        let c = chars.next()?;
+                        if chars.next().is_none() { Some(c) } else { None }
+                    }) {
+                        if draft.active == SettingsField::CacheMb {
+                            if ch.is_ascii_digit() {
+                                draft.cache_mb.push(ch);
+                            }
+                        } else {
+                            draft.active_text_mut().push(ch);
+                        }
+                    }
+                }
             }
+            cx.notify();
             return;
         }
         if e.keystroke.modifiers.control && e.keystroke.modifiers.shift {
@@ -1456,7 +1531,7 @@ impl TreemapView {
         self.textures.clear_disk_cache();
         self.palette.close();
         self.show_welcome = false;
-        self.settings_open = false;
+        self.settings_draft = None;
         self.context_menu = None;
         self.loading = Some(LoadingState { folder_name, progress, result });
     }
@@ -1574,17 +1649,6 @@ impl TreemapView {
             )
     }
 
-    /// Open the settings.json file in the system editor.
-    fn open_settings_file() {
-        if let Some(path) = settings::Settings::path() {
-            if cfg!(target_os = "windows") {
-                let _ = std::process::Command::new("notepad").arg(&path).spawn();
-            } else {
-                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
-            }
-        }
-    }
-
     /// Build the right-click context menu popup positioned at the click site.
     /// Returns None if no context menu is open.
     fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -1673,185 +1737,189 @@ impl TreemapView {
     fn render_settings_window(&self, map_w: f64, cx: &mut Context<Self>) -> gpui::Div {
         const SETTINGS_W: f32 = 600.0;
         let left_offset = ((map_w as f32 - SETTINGS_W) / 2.0).max(0.0);
+        let draft = self.settings_draft.as_ref().unwrap();
 
-        let ext_list: Vec<_> = self.settings.filter_extensions.iter().map(|s| {
+        let field_border = |active: bool| -> u32 {
+            if active { theme::FOCUS_BORDER } else { 0x333340 }
+        };
+
+        let ext_active = draft.active == SettingsField::Extensions;
+        let folder_active = draft.active == SettingsField::Folders;
+        let cache_active = draft.active == SettingsField::CacheMb;
+
+        let ext_text = if ext_active {
+            format!("{}|", &draft.filter_extensions)
+        } else {
+            draft.filter_extensions.clone()
+        };
+        let folder_text = if folder_active {
+            format!("{}|", &draft.filter_folders)
+        } else {
+            draft.filter_folders.clone()
+        };
+        let cache_text = if cache_active {
+            format!("{}|", &draft.cache_mb)
+        } else {
+            draft.cache_mb.clone()
+        };
+
+        let settings_field = |id: &str, label: &str, text: String, active: bool, field: SettingsField| {
             div()
-                .text_size(px(12.0))
-                .font_family(theme::FONT_FAMILY)
-                .text_color(rgb(theme::TEXT_SECONDARY))
-                .child(format!(".{s}"))
-        }).collect();
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_family(theme::FONT_FAMILY_SANS)
+                        .text_color(rgb(theme::FOCUS_BORDER))
+                        .pb(px(4.0))
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .id(ElementId::Name(id.to_string().into()))
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .mb(px(12.0))
+                        .bg(rgb(0x1a1d21_u32))
+                        .border_1()
+                        .border_color(rgb(field_border(active)))
+                        .rounded(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(rgb(if active { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }))
+                        .child(text)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            if let Some(d) = &mut this.settings_draft {
+                                d.active = field;
+                            }
+                            cx.notify();
+                        })),
+                )
+        };
 
-        let folder_list: Vec<_> = self.settings.filter_folders.iter().map(|s| {
-            div()
-                .text_size(px(12.0))
-                .font_family(theme::FONT_FAMILY)
-                .text_color(rgb(theme::TEXT_SECONDARY))
-                .child(s.clone())
-        }).collect();
-
-        let settings_path_text = settings::Settings::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(path unknown)".into());
-
+        // Backdrop blocks map interaction
         div()
             .absolute()
-            .top(px(80.0))
-            .left(px(left_offset))
-            .w(px(SETTINGS_W))
-            .bg(rgb(theme::CODE_BG))
-            .border_1()
-            .border_color(rgb(theme::FOCUS_BORDER))
-            .rounded(px(6.0))
-            .overflow_hidden()
-            .px(px(24.0))
-            .py(px(20.0))
-            // Title
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgba(0x00000066))
             .child(
                 div()
-                    .text_size(px(18.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::TEXT_PRIMARY))
-                    .pb(px(14.0))
-                    .child("Settings"),
-            )
-            // Filtered Extensions label
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::FOCUS_BORDER))
-                    .pb(px(4.0))
-                    .child("Filtered Extensions:"),
-            )
-            .child(
-                div()
-                    .px(px(8.0))
-                    .py(px(6.0))
-                    .mb(px(12.0))
-                    .bg(rgb(0x1a1d21_u32))
-                    .rounded(px(3.0))
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(4.0))
-                    .children(ext_list),
-            )
-            // Filtered Folders label
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::FOCUS_BORDER))
-                    .pb(px(4.0))
-                    .child("Filtered Folders:"),
-            )
-            .child(
-                div()
-                    .px(px(8.0))
-                    .py(px(6.0))
-                    .mb(px(12.0))
-                    .bg(rgb(0x1a1d21_u32))
-                    .rounded(px(3.0))
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(4.0))
-                    .children(folder_list),
-            )
-            // Cache Size label
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::FOCUS_BORDER))
-                    .pb(px(4.0))
-                    .child("Texture Cache (MB):"),
-            )
-            .child(
-                div()
-                    .px(px(8.0))
-                    .py(px(6.0))
-                    .mb(px(12.0))
-                    .bg(rgb(0x1a1d21_u32))
-                    .rounded(px(3.0))
-                    .text_size(px(12.0))
-                    .font_family(theme::FONT_FAMILY)
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .child(format!("{}", self.settings.cache_mb)),
-            )
-            // Settings file path
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .font_family(theme::FONT_FAMILY)
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .pb(px(14.0))
-                    .child(format!("Edit: {settings_path_text}")),
-            )
-            // Separator
-            .child(div().h(px(1.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
-            // Buttons row
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(10.0))
-                    // "Open Settings File" button
+                    .absolute()
+                    .top(px(80.0))
+                    .left(px(left_offset))
+                    .w(px(SETTINGS_W))
+                    .bg(rgb(theme::CODE_BG))
+                    .border_1()
+                    .border_color(rgb(theme::FOCUS_BORDER))
+                    .rounded(px(6.0))
+                    .overflow_hidden()
+                    .px(px(24.0))
+                    .py(px(20.0))
                     .child(
                         div()
-                            .id(ElementId::Name("settings-open-file".into()))
-                            .px(px(14.0))
-                            .py(px(7.0))
-                            .bg(rgb(theme::FOCUS_BORDER))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_size(px(13.0))
+                            .text_size(px(18.0))
                             .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(0x000000_u32))
-                            .child("Open Settings File")
-                            .on_click(cx.listener(|_this, _e, _w, _cx| {
-                                Self::open_settings_file();
-                            })),
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .pb(px(14.0))
+                            .child("Settings"),
                     )
-                    // "Reset to Defaults" button
+                    .child(settings_field(
+                        "field-extensions",
+                        "Filtered Extensions (comma-separated):",
+                        ext_text,
+                        ext_active,
+                        SettingsField::Extensions,
+                    ))
+                    .child(settings_field(
+                        "field-folders",
+                        "Filtered Folders (comma-separated):",
+                        folder_text,
+                        folder_active,
+                        SettingsField::Folders,
+                    ))
+                    .child(settings_field(
+                        "field-cache-mb",
+                        "Texture Cache (MB):",
+                        cache_text,
+                        cache_active,
+                        SettingsField::CacheMb,
+                    ))
                     .child(
                         div()
-                            .id(ElementId::Name("settings-reset".into()))
-                            .px(px(14.0))
-                            .py(px(7.0))
-                            .border_1()
-                            .border_color(rgb(theme::TEXT_SECONDARY))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_size(px(13.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_size(px(11.0))
+                            .font_family(theme::FONT_FAMILY)
                             .text_color(rgb(theme::TEXT_SECONDARY))
-                            .child("Reset to Defaults")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.settings = settings::Settings::default();
-                                this.settings.save();
-                                this.reindex();
-                                this.settings_open = false;
-                                cx.notify();
-                            })),
+                            .pb(px(14.0))
+                            .child("Tab to switch fields. Type to edit. Esc to cancel."),
                     )
-                    // "Close" button
+                    .child(div().h(px(1.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
                     .child(
                         div()
-                            .id(ElementId::Name("settings-close".into()))
-                            .px(px(14.0))
-                            .py(px(7.0))
-                            .border_1()
-                            .border_color(rgb(theme::TEXT_SECONDARY))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_size(px(13.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(theme::TEXT_SECONDARY))
-                            .child("Close")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.settings_open = false;
-                                cx.notify();
-                            })),
+                            .flex()
+                            .flex_row()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .id(ElementId::Name("settings-save".into()))
+                                    .px(px(14.0))
+                                    .py(px(7.0))
+                                    .bg(rgb(theme::FOCUS_BORDER))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .text_size(px(13.0))
+                                    .font_family(theme::FONT_FAMILY_SANS)
+                                    .text_color(rgb(0x000000_u32))
+                                    .child("Save & Close")
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        if let Some(draft) = this.settings_draft.take() {
+                                            this.settings = draft.to_settings();
+                                            this.settings.save();
+                                            this.reindex();
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(ElementId::Name("settings-reset".into()))
+                                    .px(px(14.0))
+                                    .py(px(7.0))
+                                    .border_1()
+                                    .border_color(rgb(theme::TEXT_SECONDARY))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .text_size(px(13.0))
+                                    .font_family(theme::FONT_FAMILY_SANS)
+                                    .text_color(rgb(theme::TEXT_SECONDARY))
+                                    .child("Reset to Defaults")
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.settings = settings::Settings::default();
+                                        this.settings.save();
+                                        this.settings_draft = None;
+                                        this.reindex();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(ElementId::Name("settings-cancel".into()))
+                                    .px(px(14.0))
+                                    .py(px(7.0))
+                                    .border_1()
+                                    .border_color(rgb(theme::TEXT_SECONDARY))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .text_size(px(13.0))
+                                    .font_family(theme::FONT_FAMILY_SANS)
+                                    .text_color(rgb(theme::TEXT_SECONDARY))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.settings_draft = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
     }
@@ -2001,7 +2069,7 @@ impl Render for TreemapView {
         let palette_overlay = self.palette.is_open().then(|| self.render_palette(vw));
 
         // Build the settings overlay (needs cx for click listeners).
-        let settings_overlay = self.settings_open.then(|| self.render_settings_window(vw, cx));
+        let settings_overlay = self.settings_draft.is_some().then(|| self.render_settings_window(vw, cx));
 
         // Build the welcome overlay (needs cx for click listeners).
         let welcome_overlay = self.show_welcome.then(|| self.render_welcome(vw, cx));
