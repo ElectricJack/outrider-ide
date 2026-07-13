@@ -168,9 +168,9 @@ pub fn bake_container(
     container_rect: Rect,
     layout: &PackLayout,
     base_level: u8,
-    child_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
+    child_tex: &impl Fn(&SymbolId) -> Option<(u32, u32, Vec<u8>)>,
 ) -> NodeTexture {
-    if node.children.is_empty() || container_rect.w < 1.0 || container_rect.h < 1.0 {
+    if container_rect.w < 1.0 || container_rect.h < 1.0 {
         return NodeTexture::empty();
     }
     let aspect = container_rect.w / container_rect.h;
@@ -209,7 +209,7 @@ fn container_fill(
     th: u32,
     rgba: &mut [u8],
     level: u8,
-    child_tex: &impl Fn(&SymbolId) -> Option<Vec<u8>>,
+    child_tex: &impl Fn(&SymbolId) -> Option<(u32, u32, Vec<u8>)>,
 ) {
     for child in &node.children {
         let Some(r) = layout.rects.get(&child.id) else { continue };
@@ -251,8 +251,8 @@ fn container_fill(
             }
         }
 
-        if let Some(src_bgra) = child_tex(&child.id) {
-            composite_bgra(&src_bgra, pw as u32, ph as u32, px, py, tw, th, rgba);
+        if let Some((sw, sh, src_bgra)) = child_tex(&child.id) {
+            composite_bgra(&src_bgra, sw, sh, pw as u32, ph as u32, px, py, tw, th, rgba);
         } else if !child.children.is_empty() {
             container_fill(child, root, layout, sx, sy, tw, th, rgba, level.saturating_add(1), child_tex);
         }
@@ -294,6 +294,8 @@ fn classify_tint_node(node: &SymbolNode) -> theme::BoxTint {
 /// src-over blend. Insets by 1px to avoid overwriting borders.
 fn composite_bgra(
     src_bgra: &[u8],
+    src_w: u32,
+    src_h: u32,
     dst_w: u32,
     dst_h: u32,
     dst_x: i32,
@@ -302,13 +304,7 @@ fn composite_bgra(
     buf_h: u32,
     rgba: &mut [u8],
 ) {
-    if src_bgra.len() < 4 {
-        return;
-    }
-    let src_px = src_bgra.len() / 4;
-    let src_w = (src_px as f64).sqrt().ceil() as u32;
-    let src_h = if src_w > 0 { src_px as u32 / src_w } else { return };
-    if src_w == 0 || src_h == 0 {
+    if src_w == 0 || src_h == 0 || src_bgra.len() < 4 {
         return;
     }
     let inner_x = dst_x + 1;
@@ -473,14 +469,17 @@ impl TextureCache {
         !self.queue.is_empty()
     }
 
-    /// BGRA bytes snapshot for compositing into parent textures.
-    pub fn child_bytes_snapshot(&self) -> HashMap<SymbolId, Vec<u8>> {
+    /// BGRA bytes snapshot with dimensions for compositing into parent textures.
+    pub fn child_bytes_snapshot(&self) -> HashMap<SymbolId, (u32, u32, Vec<u8>)> {
         self.entries
             .iter()
             .filter_map(|(id, e)| {
                 let img = e.tex.image.as_ref()?;
+                let sz = img.size(0);
+                let w = sz.width.0 as u32;
+                let h = sz.height.0 as u32;
                 let bytes = img.as_bytes(0)?;
-                Some((id.clone(), bytes.to_vec()))
+                Some((id.clone(), (w, h, bytes.to_vec())))
             })
             .collect()
     }
