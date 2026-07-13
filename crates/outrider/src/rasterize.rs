@@ -25,7 +25,7 @@ pub const MASTER_LINE_PX: f64 = 4.0;
 /// Master texture height cap; taller leaves stride rows to fit.
 pub const MAX_TEX_H: usize = 1024;
 /// Maximum pixel dimension (longer side) for a container thumbnail.
-const CONTAINER_TEX_MAX: f64 = 256.0;
+const CONTAINER_TEX_MAX: f64 = 1024.0;
 
 /// One source line: text plus colored runs (byte length, 0xRRGGBB).
 pub type Line = (String, Vec<(usize, u32)>);
