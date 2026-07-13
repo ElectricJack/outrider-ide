@@ -60,3 +60,21 @@ fn scan_respects_gitignore_and_builds_sorted_tree() {
     // file measure = line count; util.rs has 3 lines
     assert_eq!(src.children[1].measure, 3);
 }
+
+#[test]
+fn legacy_scanned_file_and_parsed_file_paths_remain_constructible() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = vec![outrider_index::scan::ScannedFile {
+        rel_path: "legacy.rs".into(),
+        lines: 2,
+        bytes: 12,
+    }];
+    let parsed = BTreeMap::from([(
+        "legacy.rs".into(),
+        outrider_index::scan::ParsedFile::default(),
+    )]);
+
+    let tree = build_tree(dir.path(), &files, &parsed);
+    assert_eq!(tree.root.children[0].name, "legacy.rs");
+    assert_eq!(tree.root.children[0].measure, 2);
+}
