@@ -436,6 +436,7 @@ fn code_line(
 /// stacked below ancestor headers when multiple containers are pinned).
 /// `max_h` caps body text to the zoomed container-header area so it
 /// never bleeds into the children zone.
+#[allow(clippy::too_many_arguments)]
 fn container_body(
     node: &SymbolNode,
     rung: Rung,
@@ -1070,7 +1071,7 @@ impl TreemapView {
                 } else {
                     item.px.w as f32
                 },
-                h: if is_focused && is_leaf {
+                h: if is_focused && is_leaf && expanded_w > 0.0 {
                     (item.full_h + focused_extra_h) as f32
                 } else {
                     item.px.h as f32
