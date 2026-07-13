@@ -746,14 +746,14 @@ impl TreemapView {
                     if matches!(rung, Rung::Dot | Rung::Label | Rung::Card)
                         && !item.node.children.is_empty()
                     {
-                        let area = item.px.w * item.px.h;
+                        let area = item.label_w * item.full_h;
                         if let Some(t) = self.textures.get(&item.node.id, area) {
                             if let Some(img) = &t.image {
                                 tex = Some(TexQuad {
-                                    x: item.px.x as f32,
-                                    y: item.px.y as f32,
-                                    w: item.px.w as f32,
-                                    h: item.px.h as f32,
+                                    x: item.left as f32,
+                                    y: item.top as f32,
+                                    w: item.label_w as f32,
+                                    h: item.full_h as f32,
                                     image: img.clone(),
                                 });
                             }
