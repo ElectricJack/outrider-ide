@@ -767,7 +767,7 @@ impl TreemapView {
                     if tier != LeafDraw::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, false, item.px.y);
                     }
-                    if font < content::TEXT_FADE_HI {
+                    {
                         let (tx, ty, tw, th) =
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
                         if tw >= 1.0 && th >= 1.0 && ty < vh && ty + th > 0.0 {
@@ -787,7 +787,7 @@ impl TreemapView {
                             tex_opacity = 1.0
                                 - ((font - content::TEXT_FADE_LO)
                                     / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
-                                    as f32;
+                                    .clamp(0.0, 1.0) as f32;
                         }
                     }
                     if font >= content::TEXT_FADE_LO
