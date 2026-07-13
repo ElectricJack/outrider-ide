@@ -767,7 +767,22 @@ impl TreemapView {
                     if tier != LeafDraw::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, false, item.px.y);
                     }
-                    {
+                    let use_text = font >= content::MIN_TEXT_FONT_PX
+                        && item.label_w >= world::CODE_MIN_W;
+                    if use_text {
+                        tex_opacity = 0.0;
+                        body = leaf_text_body(
+                            item.node,
+                            item.left,
+                            item.top,
+                            item.full_h,
+                            item.label_w,
+                            vh,
+                            &mut self.buffers,
+                            &self.file_symbols,
+                        );
+                    } else {
+                        body_opacity = 0.0;
                         let (tx, ty, tw, th) =
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
                         if tw >= 1.0 && th >= 1.0 && ty < vh && ty + th > 0.0 {
@@ -783,29 +798,6 @@ impl TreemapView {
                                 }
                             }
                         }
-                        if font > content::TEXT_FADE_LO {
-                            tex_opacity = 1.0
-                                - ((font - content::TEXT_FADE_LO)
-                                    / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
-                                    .clamp(0.0, 1.0) as f32;
-                        }
-                    }
-                    if font >= content::TEXT_FADE_LO
-                        && item.label_w >= world::CODE_MIN_W
-                    {
-                        body = leaf_text_body(
-                            item.node,
-                            item.left,
-                            item.top,
-                            item.full_h,
-                            item.label_w,
-                            vh,
-                            &mut self.buffers,
-                            &self.file_symbols,
-                        );
-                        body_opacity = ((font - content::TEXT_FADE_LO)
-                            / (content::TEXT_FADE_HI - content::TEXT_FADE_LO))
-                            .clamp(0.0, 1.0) as f32;
                     }
                 }
             }
