@@ -45,6 +45,152 @@ fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
     }
 }
 
+/// Character budget for a column `w_px` wide at `font_px` monospace.
+fn char_budget(w_px: f32, font_px: f32) -> usize {
+    let b = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
+    if b < 2 { 0 } else { b as usize }
+}
+
+/// Word-wrap a single line to `budget` characters. Words longer than
+/// the budget are hard-split. Returns one or more display lines.
+fn wrap_to_budget(text: &str, budget: usize) -> Vec<String> {
+    if budget == 0 {
+        return vec![];
+    }
+    if text.chars().count() <= budget {
+        return vec![text.to_string()];
+    }
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    let mut line_len = 0usize;
+    for word in text.split(' ') {
+        let mut word = word;
+        let mut wlen = word.chars().count();
+        while wlen > budget {
+            if line_len > 0 {
+                rows.push(std::mem::take(&mut line));
+                line_len = 0;
+            }
+            let cut = word
+                .char_indices()
+                .nth(budget)
+                .map_or(word.len(), |(i, _)| i);
+            rows.push(word[..cut].to_string());
+            word = &word[cut..];
+            wlen = word.chars().count();
+        }
+        if wlen == 0 {
+            continue;
+        }
+        let need = if line_len == 0 { wlen } else { line_len + 1 + wlen };
+        if need > budget {
+            rows.push(std::mem::take(&mut line));
+            line.push_str(word);
+            line_len = wlen;
+        } else {
+            if line_len > 0 {
+                line.push(' ');
+            }
+            line.push_str(word);
+            line_len = need;
+        }
+    }
+    if line_len > 0 {
+        rows.push(line);
+    }
+    rows
+}
+
+/// Wrap a code line into multiple display lines at the character budget,
+/// splitting syntax-highlight runs at wrap boundaries. Returns
+/// `Vec<(text, runs)>` — one entry per display line.
+fn wrap_code_line(
+    text: &str,
+    spans: &[HighlightSpan],
+    w: f32,
+    font_px: f32,
+) -> Vec<(String, Vec<(usize, u32)>)> {
+    let budget = char_budget(w, font_px);
+    if budget == 0 {
+        return vec![];
+    }
+    if text.chars().count() <= budget {
+        return vec![(text.to_string(), runs_from_spans(text.len(), spans))];
+    }
+    let full_runs = runs_from_spans(text.len(), spans);
+    let mut result = Vec::new();
+    let mut text_off = 0usize;
+    let mut run_idx = 0usize;
+    let mut run_off = 0usize;
+    while text_off < text.len() {
+        let rest = &text[text_off..];
+        let take_chars = budget.min(rest.chars().count());
+        let take_bytes = rest
+            .char_indices()
+            .nth(take_chars)
+            .map_or(rest.len(), |(i, _)| i);
+        let seg = rest[..take_bytes].to_string();
+        let mut seg_runs = Vec::new();
+        let mut left = take_bytes;
+        while left > 0 && run_idx < full_runs.len() {
+            let (rlen, color) = full_runs[run_idx];
+            let avail = rlen - run_off;
+            if avail <= left {
+                seg_runs.push((avail, color));
+                left -= avail;
+                run_idx += 1;
+                run_off = 0;
+            } else {
+                seg_runs.push((left, color));
+                run_off += left;
+                left = 0;
+            }
+        }
+        result.push((seg, seg_runs));
+        text_off += take_bytes;
+    }
+    result
+}
+
+/// World-space width for a focused node given the longest line's char count.
+/// Clamped to `[PAGE_W, 2·PAGE_W]` so the expansion is bounded.
+fn focused_width(max_chars: usize) -> f64 {
+    let needed = max_chars as f64 * FONT_PX * 0.62 + 2.0 * BODY_PAD;
+    needed.clamp(world::PAGE_W, 2.0 * world::PAGE_W)
+}
+
+/// Longest line (in characters) across a node's body text and source code.
+/// Used to compute the content-driven expansion width.
+fn max_line_chars(
+    node: &SymbolNode,
+    buffers: &mut BufferManager,
+    file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
+) -> usize {
+    let mut max = 0usize;
+    for line in content::body_lines(node, Rung::Full) {
+        let text = match line {
+            BodyLine::Plain(t) | BodyLine::Dim(t) => t,
+        };
+        max = max.max(text.chars().count());
+    }
+    if content::is_leaf_item(node) {
+        let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
+        let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
+        if let Some(m) = buffers.get(&rel, syms) {
+            if let Some(start) = m.symbol_start_line(&node.id) {
+                let count =
+                    (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
+                for j in 0..count {
+                    if let Some((text, _)) = m.buffer.line(start + j) {
+                        max = max.max(text.chars().count());
+                    }
+                }
+            }
+        }
+    }
+    max
+}
+
 /// Reflow a `///` doc block for the texture-tier overlay: source lines are
 /// joined into paragraphs (a blank line is a paragraph break), then each
 /// paragraph is greedy word-wrapped to the same char budget as
@@ -61,43 +207,7 @@ fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
         if joined.is_empty() {
             continue;
         }
-        let mut line = String::new();
-        let mut line_len = 0usize;
-        for word in joined.split(' ') {
-            let mut word = word;
-            let mut wlen = word.chars().count();
-            while wlen > budget {
-                if line_len > 0 {
-                    rows.push(std::mem::take(&mut line));
-                    line_len = 0;
-                }
-                let cut = word
-                    .char_indices()
-                    .nth(budget)
-                    .map_or(word.len(), |(i, _)| i);
-                rows.push(word[..cut].to_string());
-                word = &word[cut..];
-                wlen = word.chars().count();
-            }
-            if wlen == 0 {
-                continue;
-            }
-            let need = if line_len == 0 { wlen } else { line_len + 1 + wlen };
-            if need > budget {
-                rows.push(std::mem::take(&mut line));
-                line.push_str(word);
-                line_len = wlen;
-            } else {
-                if line_len > 0 {
-                    line.push(' ');
-                }
-                line.push_str(word);
-                line_len = need;
-            }
-        }
-        if line_len > 0 {
-            rows.push(line);
-        }
+        rows.extend(wrap_to_budget(&joined, budget));
     }
     rows
 }
@@ -334,14 +444,16 @@ fn container_body(
     vh: f64,
     pin_y: f64,
     max_h: f64,
+    focused: bool,
 ) -> Vec<BodyText> {
     if rung == Rung::Dot || rung == Rung::Label {
         return Vec::new();
     }
     let font = FONT_PX as f32;
     let mut out = Vec::new();
-    for (k, line) in content::body_lines(node, rung).into_iter().enumerate() {
-        let y = pin_y + HEADER + k as f64 * LINE_STEP;
+    let mut row = 0usize;
+    for line in content::body_lines(node, rung) {
+        let y = pin_y + HEADER + row as f64 * LINE_STEP;
         if y + LINE_STEP > pin_y + max_h || y + LINE_STEP > px.y + px.h || y > vh {
             break;
         }
@@ -349,14 +461,35 @@ fn container_body(
             BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
             BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
         };
-        if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
-            let len = shown.len();
-            out.push(BodyText {
-                x: (px.x + BODY_PAD) as f32,
-                y: y as f32,
-                text: shown,
-                runs: vec![(len, color)],
-            });
+        if focused {
+            let budget = char_budget(label_w as f32, font);
+            if budget > 0 {
+                for seg in wrap_to_budget(&text, budget) {
+                    let wy = pin_y + HEADER + row as f64 * LINE_STEP;
+                    if wy + LINE_STEP > pin_y + max_h || wy + LINE_STEP > px.y + px.h || wy > vh {
+                        break;
+                    }
+                    let len = seg.len();
+                    out.push(BodyText {
+                        x: (px.x + BODY_PAD) as f32,
+                        y: wy as f32,
+                        text: seg,
+                        runs: vec![(len, color)],
+                    });
+                    row += 1;
+                }
+            }
+        } else {
+            if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
+                let len = shown.len();
+                out.push(BodyText {
+                    x: (px.x + BODY_PAD) as f32,
+                    y: y as f32,
+                    text: shown,
+                    runs: vec![(len, color)],
+                });
+            }
+            row += 1;
         }
     }
     out
@@ -376,54 +509,92 @@ fn leaf_text_body(
     vh: f64,
     buffers: &mut BufferManager,
     file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
-) -> Vec<BodyText> {
+    focused: bool,
+) -> (Vec<BodyText>, usize) {
     let scale = full_h / content::natural_px(node);
     let font = (FONT_PX * scale) as f32;
     let step = LINE_STEP * scale;
     let x = (left + BODY_PAD * scale) as f32;
     let content_y0 = HEADER.max(HEADER * scale);
     let mut out = Vec::new();
+    let mut display_row = 0usize;
     let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
     let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
     if let Some(m) = buffers.get(&rel, syms) {
         if let Some(start) = m.symbol_start_line(&node.id) {
             let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
             for j in 0..count {
-                let y = top + content_y0 + j as f64 * LINE_STEP * scale;
+                let y = top + content_y0 + display_row as f64 * step;
                 if y > vh {
                     break;
                 }
-                if y + step < 0.0 {
-                    continue;
-                }
                 if let Some((text, spans)) = m.buffer.line(start + j) {
-                    if let Some((shown, runs)) = code_line(&text, spans, label_w as f32, font) {
-                        out.push(BodyText { x, y: y as f32, text: shown, runs });
+                    if focused {
+                        let wrapped = wrap_code_line(&text, spans, label_w as f32, font);
+                        for (seg, runs) in wrapped {
+                            let wy = top + content_y0 + display_row as f64 * step;
+                            if wy > vh {
+                                break;
+                            }
+                            if wy + step >= 0.0 {
+                                out.push(BodyText { x, y: wy as f32, text: seg, runs });
+                            }
+                            display_row += 1;
+                        }
+                    } else {
+                        if y + step >= 0.0 {
+                            if let Some((shown, runs)) = code_line(&text, spans, label_w as f32, font) {
+                                out.push(BodyText { x, y: y as f32, text: shown, runs });
+                            }
+                        }
+                        display_row += 1;
                     }
+                } else {
+                    display_row += 1;
                 }
             }
-            return out;
+            let extra = display_row.saturating_sub(count);
+            return (out, extra);
         }
     }
     let lines = content::body_lines(node, Rung::Full);
-    for (k, line) in lines.into_iter().enumerate() {
-        let y = top + content_y0 + k as f64 * LINE_STEP * scale;
+    let source_count = lines.len();
+    for line in lines {
+        let y = top + content_y0 + display_row as f64 * step;
         if y > vh {
             break;
-        }
-        if y + step < 0.0 {
-            continue;
         }
         let (text, color) = match line {
             BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
             BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
         };
-        if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
-            let len = shown.len();
-            out.push(BodyText { x, y: y as f32, text: shown, runs: vec![(len, color)] });
+        if focused {
+            let budget = char_budget(label_w as f32, font);
+            if budget > 0 {
+                for seg in wrap_to_budget(&text, budget) {
+                    let wy = top + content_y0 + display_row as f64 * step;
+                    if wy > vh {
+                        break;
+                    }
+                    if wy + step >= 0.0 {
+                        let len = seg.len();
+                        out.push(BodyText { x, y: wy as f32, text: seg, runs: vec![(len, color)] });
+                    }
+                    display_row += 1;
+                }
+            }
+        } else {
+            if y + step >= 0.0 {
+                if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
+                    let len = shown.len();
+                    out.push(BodyText { x, y: y as f32, text: shown, runs: vec![(len, color)] });
+                }
+            }
+            display_row += 1;
         }
     }
-    out
+    let extra = display_row.saturating_sub(source_count);
+    (out, extra)
 }
 
 /// Unclipped screen rect of a leaf's line area: full page width, rows
@@ -745,6 +916,7 @@ impl TreemapView {
         let mut out = Vec::with_capacity(items.len());
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
         let mut panel_doc: Option<(String, f32, f32, f32, f32)> = None;
+        let mut focused_paint_idx: Option<usize> = None;
         for item in items {
             while let Some(&(lvl, _)) = header_stack.last() {
                 if lvl >= item.level {
@@ -753,6 +925,7 @@ impl TreemapView {
                     break;
                 }
             }
+            let is_focused = item.node.id == focus_id;
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
             let box_kind = if is_leaf {
                 theme::BoxKind::Leaf
@@ -771,6 +944,8 @@ impl TreemapView {
             let mut name = None;
             let mut body = Vec::new();
             let mut tex: Option<TexQuad> = None;
+            let mut focused_extra_h = 0.0f64;
+            let mut expanded_w = 0.0f32;
             match item.draw {
                 Draw::Container(rung) => {
                     let stack_bottom =
@@ -783,6 +958,7 @@ impl TreemapView {
                     }
                     body = container_body(
                         item.node, rung, &item.px, item.label_w, vh, pin_y, ch_px,
+                        is_focused,
                     );
                     if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
                         header_bg_h = (HEADER + body.len() as f64 * LINE_STEP)
@@ -818,17 +994,34 @@ impl TreemapView {
                     let use_text = font >= content::MIN_TEXT_FONT_PX
                         && item.label_w >= world::CODE_MIN_W;
                     if use_text {
+                        let effective_label_w = if is_focused {
+                            let max = max_line_chars(
+                                item.node, &mut self.buffers, &self.file_symbols,
+                            );
+                            focused_width(max) * camera.zoom
+                        } else {
+                            item.label_w
+                        };
                         tex_opacity = 0.0;
-                        body = leaf_text_body(
+                        let (text_body, extra) = leaf_text_body(
                             item.node,
                             item.left,
                             item.top,
                             item.full_h,
-                            item.label_w,
+                            effective_label_w,
                             vh,
                             &mut self.buffers,
                             &self.file_symbols,
+                            is_focused,
                         );
+                        body = text_body;
+                        if is_focused && extra > 0 {
+                            let step = LINE_STEP * (item.full_h / content::natural_px(item.node));
+                            focused_extra_h = extra as f64 * step;
+                        }
+                        if is_focused {
+                            expanded_w = effective_label_w as f32;
+                        }
                     } else {
                         let (tx, ty, tw, th) =
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
@@ -849,7 +1042,6 @@ impl TreemapView {
                     }
                 }
             }
-            let is_focused = item.node.id == focus_id;
             let is_hovered = self.hover_id.as_ref() == Some(&item.node.id);
             if item.node.doc.is_some() {
                 if is_hovered {
@@ -873,8 +1065,16 @@ impl TreemapView {
             out.push(PaintItem {
                 x: item.px.x as f32,
                 y: item.px.y as f32,
-                w: item.px.w as f32,
-                h: item.px.h as f32,
+                w: if is_focused && is_leaf && expanded_w > 0.0 {
+                    expanded_w
+                } else {
+                    item.px.w as f32
+                },
+                h: if is_focused && is_leaf {
+                    (item.full_h + focused_extra_h) as f32
+                } else {
+                    item.px.h as f32
+                },
                 fill,
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
@@ -890,6 +1090,13 @@ impl TreemapView {
                 body,
                 tex,
             });
+            if is_focused && is_leaf && expanded_w > 0.0 {
+                focused_paint_idx = Some(out.len() - 1);
+            }
+        }
+        if let Some(idx) = focused_paint_idx {
+            let item = out.remove(idx);
+            out.push(item);
         }
         let doc_panel = panel_doc.and_then(|(doc, fx, fy, fw, _fh)| {
             let panel_w = fw.max(DOC_PANEL_W as f32);
@@ -2391,10 +2598,6 @@ mod tests {
 
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
-    use super::{
-        code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
-        truncate_to_width, wrap_doc, HEADER, LINE_STEP,
-    };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
 
@@ -2449,7 +2652,7 @@ mod tests {
     fn container_body_positions_detail_lines() {
         let f = node(SymbolKind::File, "a.rs", Some(0..24), 2, None, Some("Doc line."));
         let px = PxRect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
-        let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0);
+        let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0, false);
         // churn readout only (doc shown via hover panel, no children → no kinds)
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - HEADER).abs() < 1e-3);
@@ -2465,8 +2668,8 @@ mod tests {
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let natural = crate::content::natural_px(&leaf);
         // scale 1.0: full_h == natural
-        let body =
-            leaf_text_body(&leaf, 0.0, 0.0, natural, 640.0, 600.0, &mut mgr, &file_symbols);
+        let (body, _extra) =
+            leaf_text_body(&leaf, 0.0, 0.0, natural, 640.0, 600.0, &mut mgr, &file_symbols, false);
         // code only — no separate signature row (the code line IS the signature)
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two() {}");
@@ -2486,15 +2689,15 @@ mod tests {
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let natural = crate::content::natural_px(&leaf);
         // zoom 2× (full_h = 2·natural): code row y doubles, still no clip
-        let body = leaf_text_body(
-            &leaf, 0.0, 0.0, 2.0 * natural, 1280.0, 100_000.0, &mut mgr, &file_symbols,
+        let (body, _extra) = leaf_text_body(
+            &leaf, 0.0, 0.0, 2.0 * natural, 1280.0, 100_000.0, &mut mgr, &file_symbols, false,
         );
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - 2.0 * HEADER).abs() < 1e-3);
         // buffer unavailable → signature only, no code
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
-        let body =
-            leaf_text_body(&leaf, 0.0, 0.0, natural, 640.0, 600.0, &mut broken, &BTreeMap::new());
+        let (body, _extra) =
+            leaf_text_body(&leaf, 0.0, 0.0, natural, 640.0, 600.0, &mut broken, &BTreeMap::new(), false);
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two()");
     }
@@ -2572,6 +2775,82 @@ mod tests {
         assert!((y - (50.0 + HEADER)).abs() < 1e-9);
         assert!((w - world::PAGE_W * 0.5).abs() < 1e-9);
         assert!((h - 10.0 * LINE_STEP * 0.5).abs() < 1e-9);
+    }
+
+    use super::{
+        char_budget, code_line, container_body, focused_width, leaf_tex_rect,
+        leaf_text_body, runs_from_spans, truncate_to_width, wrap_code_line,
+        wrap_doc, wrap_to_budget, HEADER, LINE_STEP,
+    };
+
+    #[test]
+    fn char_budget_exact_boundary() {
+        // 12 + 10*0.62*12 = 86.4 → budget of 10
+        let w = 12.0 + 10.0 * 0.62 * 12.0;
+        assert_eq!(char_budget(w as f32, 12.0), 10);
+        assert_eq!(char_budget(10.0, 12.0), 0); // too narrow
+    }
+
+    #[test]
+    fn wrap_to_budget_short_text_one_row() {
+        assert_eq!(wrap_to_budget("hello", 10), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_to_budget_word_wraps() {
+        assert_eq!(
+            wrap_to_budget("alpha beta gamma", 10),
+            vec!["alpha beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn wrap_to_budget_hard_splits_long_word() {
+        assert_eq!(
+            wrap_to_budget("abcdefghijklmno", 10),
+            vec!["abcdefghij", "klmno"]
+        );
+    }
+
+    #[test]
+    fn wrap_code_line_short_no_wrap() {
+        let lines = wrap_code_line("hello", &[], 100.0, 12.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "hello");
+        assert_eq!(lines[0].1.iter().map(|r| r.0).sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn wrap_code_line_wraps_preserving_runs() {
+        use outrider_index::buffer::{HighlightKind, HighlightSpan};
+        // "fn frobnicate()" = 16 chars, budget of 10
+        let w = 12.0 + 10.0 * 0.62 * 12.0;
+        let spans = vec![
+            HighlightSpan { range: 0..2, kind: HighlightKind::Keyword },
+        ];
+        let lines = wrap_code_line("fn frobnicate()", &spans, w as f32, 12.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, "fn frobnic");
+        assert_eq!(lines[1].0, "ate()");
+        // runs cover each segment exactly
+        assert_eq!(lines[0].1.iter().map(|r| r.0).sum::<usize>(), lines[0].0.len());
+        assert_eq!(lines[1].1.iter().map(|r| r.0).sum::<usize>(), lines[1].0.len());
+    }
+
+    #[test]
+    fn wrap_code_line_returns_empty_when_no_room() {
+        assert!(wrap_code_line("x", &[], 10.0, 12.0).is_empty());
+    }
+
+    #[test]
+    fn focused_width_clamps_to_range() {
+        use crate::world::PAGE_W;
+        // 10 chars → needed = 10*12*0.62 + 12 = 86.4 → below PAGE_W → clamp to PAGE_W
+        assert!((focused_width(10) - PAGE_W).abs() < 1e-9);
+        // 200 chars → needed = 200*12*0.62 + 12 = 1500 → above 2*PAGE_W → clamp to 2*PAGE_W
+        assert!((focused_width(200) - 2.0 * PAGE_W).abs() < 1e-9);
+        // 120 chars → needed = 120*12*0.62 + 12 = 904.8 → between PAGE_W and 2*PAGE_W
+        assert!((focused_width(120) - 904.8).abs() < 1e-9);
     }
 
     use super::{inset_top, pinned_stack_h};
