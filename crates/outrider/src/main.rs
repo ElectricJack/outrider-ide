@@ -10,6 +10,7 @@ mod focus;
 mod palette;
 mod rasterize;
 mod settings;
+mod texture_store;
 mod theme;
 mod treemap;
 mod world;
@@ -38,7 +39,7 @@ fn main() {
     };
     let settings = settings::Settings::load();
     eprintln!("indexing {}…", repo.display());
-    let tree = match outrider_index::index_repo(
+    let outcome = match outrider_index::index_repo_outcome(
         &repo,
         &settings.filter_extensions,
         &settings.filter_folders,
@@ -49,6 +50,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let tree = outcome.tree;
+    let source_fingerprints = outcome.source_fingerprints;
     let layout = outrider_layout::pack(&tree, &world::pack_config());
     eprintln!("{} symbols packed", layout.rects.len());
 
@@ -63,7 +66,7 @@ fn main() {
                 window_min_size: Some(size(px(480.), px(320.))),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| TreemapView::new(tree, layout, settings, cx)),
+            |_, cx| cx.new(|cx| TreemapView::new(tree, layout, source_fingerprints, settings, cx)),
         )
         .expect("failed to open window");
         cx.activate(true);

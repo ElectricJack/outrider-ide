@@ -685,6 +685,7 @@ impl TreemapView {
     pub fn new(
         tree: SymbolTree,
         layout: PackLayout,
+        source_fingerprints: BTreeMap<String, u64>,
         loaded_settings: settings::SettingsLoad,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -693,6 +694,12 @@ impl TreemapView {
         let file_symbols = collect_file_symbols(&tree);
         let buffers = BufferManager::new(tree.repo_root.clone());
         let show_welcome = settings.show_welcome;
+        let textures = TextureCache::new(
+            &tree.repo_root,
+            source_fingerprints,
+            settings.cache_mb as usize * 1024 * 1024,
+            settings.disk_cache_bytes(&tree.repo_root),
+        );
         Self {
             tree,
             layout,
@@ -705,7 +712,7 @@ impl TreemapView {
             focus_handle: cx.focus_handle(),
             buffers,
             file_symbols,
-            textures: TextureCache::new(settings.cache_mb as usize * 1024 * 1024),
+            textures,
             bake_pending: false,
             neighbors: None,
             hover_id: None,
@@ -1698,16 +1705,24 @@ impl TreemapView {
         let exts = self.settings.filter_extensions.clone();
         let dirs = self.settings.filter_folders.clone();
         let cache_bytes = self.settings.cache_mb as usize * 1024 * 1024;
+        let disk_cache_bytes = self.settings.disk_cache_bytes(&folder);
         std::thread::spawn(move || {
-            let tree = match outrider_index::index_repo_with_progress(&folder, &exts, &dirs, &p) {
-                Ok(t) => t,
-                Err(e) => {
-                    *r.lock().unwrap() = Some(Err(format!("{e:#}")));
-                    return;
-                }
-            };
+            let outcome =
+                match outrider_index::index_repo_with_progress_outcome(&folder, &exts, &dirs, &p) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        *r.lock().unwrap() = Some(Err(format!("{e:#}")));
+                        return;
+                    }
+                };
+            let tree = outcome.tree;
             let layout = outrider_layout::pack(&tree, &world::pack_config());
-            let mut textures = TextureCache::new(cache_bytes);
+            let mut textures = TextureCache::new(
+                &folder,
+                outcome.source_fingerprints,
+                cache_bytes,
+                disk_cache_bytes,
+            );
             rasterize::pre_bake_all(&tree, &layout, &mut textures, &p);
             *r.lock().unwrap() = Some(Ok(LoadedProject {
                 tree,
@@ -1716,7 +1731,6 @@ impl TreemapView {
             }));
         });
 
-        self.textures.clear_disk_cache();
         self.palette.close();
         self.show_welcome = false;
         self.settings_draft = None;

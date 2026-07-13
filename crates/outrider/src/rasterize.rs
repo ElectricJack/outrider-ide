@@ -1,10 +1,8 @@
 //! Bakes node textures: leaf text via cosmic-text, containers by compositing
 //! cached child textures. One texture per node, GPU handles scaling.
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::io::{Read as _, Write as _};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
@@ -16,6 +14,7 @@ use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::content::{self, LINE_STEP};
+use crate::texture_store::{TextureKey, TexturePayload, TextureStore};
 use crate::theme;
 use crate::treemap::BODY_PAD;
 use crate::world;
@@ -26,6 +25,8 @@ pub const MASTER_LINE_PX: f64 = 4.0;
 pub const MAX_TEX_H: usize = 1024;
 /// Maximum pixel dimension (longer side) for a container thumbnail.
 const CONTAINER_TEX_MAX: f64 = 1024.0;
+/// Increment whenever rasterization semantics change incompatibly.
+pub const RENDER_SCHEMA_VERSION: u64 = 1;
 
 /// One source line: text plus colored runs (byte length, 0xRRGGBB).
 pub type Line = (String, Vec<(usize, u32)>);
@@ -401,47 +402,10 @@ struct Entry {
     last_used: u64,
 }
 
-fn disk_key(id: &SymbolId) -> String {
-    let mut h = std::hash::DefaultHasher::new();
-    id.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
-
-fn save_to_disk(dir: &std::path::Path, id: &SymbolId, tex: &NodeTexture) {
-    let Some(img) = &tex.image else { return };
-    let path = dir.join(format!("{}.tex", disk_key(id)));
-    let Ok(mut f) = std::fs::File::create(&path) else {
-        return;
-    };
-    let sz = img.size(0);
-    let w = sz.width.0 as u32;
-    let h = sz.height.0 as u32;
-    let _ = f.write_all(&w.to_le_bytes());
-    let _ = f.write_all(&h.to_le_bytes());
-    if let Some(bytes) = img.as_bytes(0) {
-        let len = bytes.len() as u32;
-        let _ = f.write_all(&len.to_le_bytes());
-        let _ = f.write_all(bytes);
-    }
-}
-
-fn load_from_disk(dir: &std::path::Path, id: &SymbolId) -> Option<NodeTexture> {
-    let path = dir.join(format!("{}.tex", disk_key(id)));
-    let mut f = std::fs::File::open(&path).ok()?;
-    let mut buf4 = [0u8; 4];
-    f.read_exact(&mut buf4).ok()?;
-    let w = u32::from_le_bytes(buf4);
-    f.read_exact(&mut buf4).ok()?;
-    let h = u32::from_le_bytes(buf4);
-    f.read_exact(&mut buf4).ok()?;
-    let len = u32::from_le_bytes(buf4) as usize;
-    if len == 0 || w == 0 || h == 0 {
-        return None;
-    }
-    let mut data = vec![0u8; len];
-    f.read_exact(&mut data).ok()?;
-    let bytes = data.len();
-    let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, data)?;
+fn texture_from_payload(payload: TexturePayload) -> Option<NodeTexture> {
+    let bytes = payload.bytes.len();
+    let img =
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(payload.width, payload.height, payload.bytes)?;
     Some(NodeTexture {
         image: Some(Arc::new(RenderImage::new(vec![Frame::new(img)]))),
         bytes,
@@ -457,16 +421,18 @@ pub struct TextureCache {
     max_bytes: usize,
     queue: Vec<(SymbolId, f64)>,
     retired: Vec<Arc<RenderImage>>,
-    disk_dir: Option<PathBuf>,
+    disk_store: Option<TextureStore>,
+    source_fingerprints: BTreeMap<String, u64>,
 }
 
 impl TextureCache {
-    pub fn new(max_bytes: usize) -> Self {
-        let disk_dir = dirs::cache_dir().map(|d| {
-            let p = d.join("outrider").join("textures");
-            let _ = std::fs::create_dir_all(&p);
-            p
-        });
+    pub fn new(
+        project_root: &Path,
+        source_fingerprints: BTreeMap<String, u64>,
+        max_bytes: usize,
+        disk_max_bytes: u64,
+    ) -> Self {
+        let disk_store = TextureStore::open(project_root, disk_max_bytes).ok();
         Self {
             raster: Rasterizer::new(),
             entries: HashMap::new(),
@@ -475,8 +441,26 @@ impl TextureCache {
             max_bytes,
             queue: Vec::new(),
             retired: Vec::new(),
-            disk_dir,
+            disk_store,
+            source_fingerprints,
         }
+    }
+
+    fn disk_key(&self, id: &SymbolId) -> Option<TextureKey> {
+        let relative_path = id
+            .qualified_path
+            .split("::")
+            .next()
+            .unwrap_or(&id.qualified_path)
+            .replace('\\', "/");
+        let source_fingerprint = *self.source_fingerprints.get(&relative_path)?;
+        Some(TextureKey::new(
+            &relative_path,
+            source_fingerprint,
+            id,
+            RENDER_SCHEMA_VERSION,
+            theme::fingerprint(),
+        ))
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -495,8 +479,13 @@ impl TextureCache {
             e.last_used = self.clock;
             return Some(&e.tex);
         }
-        if let Some(dir) = &self.disk_dir {
-            if let Some(tex) = load_from_disk(dir, id) {
+        if let Some(key) = self.disk_key(id) {
+            if let Some(payload) = self
+                .disk_store
+                .as_mut()
+                .and_then(|store| store.load(&key).ok().flatten())
+            {
+                let tex = texture_from_payload(payload)?;
                 self.bytes += tex.bytes;
                 self.entries.insert(
                     id.clone(),
@@ -541,9 +530,7 @@ impl TextureCache {
         let mut it = queue.into_iter();
         for (id, _) in it.by_ref().take(BAKES_PER_FRAME) {
             let tex = bake_fn(&id, &mut self.raster).unwrap_or_else(NodeTexture::empty);
-            if let Some(dir) = &self.disk_dir {
-                save_to_disk(dir, &id, &tex);
-            }
+            self.save_to_disk(&id, &tex);
             self.bytes += tex.bytes;
             self.clock += 1;
             self.entries.insert(
@@ -561,9 +548,7 @@ impl TextureCache {
 
     /// Insert a pre-baked texture (used by the bulk pre-bake pass).
     pub fn insert(&mut self, id: SymbolId, tex: NodeTexture) {
-        if let Some(dir) = &self.disk_dir {
-            save_to_disk(dir, &id, &tex);
-        }
+        self.save_to_disk(&id, &tex);
         self.bytes += tex.bytes;
         self.clock += 1;
         self.entries.insert(
@@ -597,16 +582,20 @@ impl TextureCache {
         std::mem::take(&mut self.retired)
     }
 
-    pub fn clear_disk_cache(&self) {
-        if let Some(dir) = &self.disk_dir {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("tex") {
-                        let _ = std::fs::remove_file(p);
-                    }
-                }
-            }
+    fn save_to_disk(&mut self, id: &SymbolId, tex: &NodeTexture) {
+        let Some(key) = self.disk_key(id) else { return };
+        let Some(image) = &tex.image else { return };
+        let size = image.size(0);
+        let Some(bytes) = image.as_bytes(0) else {
+            return;
+        };
+        let payload = TexturePayload {
+            width: size.width.0 as u32,
+            height: size.height.0 as u32,
+            bytes: bytes.to_vec(),
+        };
+        if let Some(store) = &mut self.disk_store {
+            let _ = store.save(&key, &payload);
         }
     }
 
@@ -620,7 +609,8 @@ impl TextureCache {
             max_bytes,
             queue: Vec::new(),
             retired: Vec::new(),
-            disk_dir: None,
+            disk_store: None,
+            source_fingerprints: BTreeMap::new(),
         }
     }
 
