@@ -1,7 +1,7 @@
 //! Bakes node textures: leaf text via cosmic-text, containers by compositing
 //! cached child textures. One texture per node, GPU handles scaling.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,11 +9,11 @@ use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Sw
 use gpui::RenderImage;
 use image::{Frame, ImageBuffer, Rgba};
 
-use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
+use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 use outrider_layout::{PackLayout, Rect};
 
-use crate::buffers::{collect_file_symbols, BufferManager};
-use crate::content::{self, LINE_STEP};
+use crate::buffers::BufferManager;
+use crate::content::LINE_STEP;
 use crate::texture_store::{TextureKey, TexturePayload, TextureStore};
 use crate::theme;
 use crate::treemap::BODY_PAD;
@@ -419,7 +419,8 @@ pub struct TextureCache {
     clock: u64,
     bytes: usize,
     max_bytes: usize,
-    queue: Vec<(SymbolId, f64)>,
+    queue: HashMap<SymbolId, f64>,
+    deferred_once: HashSet<SymbolId>,
     retired: Vec<Arc<RenderImage>>,
     disk_store: Option<TextureStore>,
     source_fingerprints: BTreeMap<String, u64>,
@@ -439,7 +440,8 @@ impl TextureCache {
             clock: 0,
             bytes: 0,
             max_bytes,
-            queue: Vec::new(),
+            queue: HashMap::new(),
+            deferred_once: HashSet::new(),
             retired: Vec::new(),
             disk_store,
             source_fingerprints,
@@ -481,30 +483,61 @@ impl TextureCache {
                 .and_then(|store| store.load(&key).ok().flatten())
             {
                 let tex = texture_from_payload(payload)?;
-                self.bytes += tex.bytes;
-                self.entries.insert(
-                    id.clone(),
-                    Entry {
-                        tex,
-                        last_used: self.clock,
-                    },
-                );
-                return Some(&self.entries.get(id).unwrap().tex);
+                self.insert_entry(id.clone(), tex);
+                return self.entries.get(id).map(|entry| &entry.tex);
             }
         }
-        self.queue.push((id.clone(), screen_area));
+        self.request(id.clone(), screen_area);
         None
+    }
+
+    /// Queue a texture bake, retaining only the largest visible screen area.
+    pub fn request(&mut self, id: SymbolId, screen_area: f64) {
+        if self.entries.contains_key(&id) {
+            return;
+        }
+        self.queue
+            .entry(id)
+            .and_modify(|priority| *priority = priority.max(screen_area))
+            .or_insert(screen_area);
+    }
+
+    /// Give a container's dependencies one bounded processing pass.
+    pub fn defer_request_once(&mut self, id: &SymbolId) -> bool {
+        if self.deferred_once.insert(id.clone()) {
+            self.queue.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn needs_dependency_pass(&self, id: &SymbolId) -> bool {
+        !self.deferred_once.contains(id)
     }
 
     pub fn has_queued(&self) -> bool {
         !self.queue.is_empty()
     }
 
+    /// Highest-priority requests that can be processed this frame.
+    pub fn next_request_ids(&self) -> Vec<SymbolId> {
+        let mut queued: Vec<_> = self.queue.iter().collect();
+        queued.sort_by(|a, b| b.1.total_cmp(a.1));
+        queued
+            .into_iter()
+            .take(BAKES_PER_FRAME)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// BGRA bytes snapshot with dimensions for compositing into parent textures.
-    pub fn child_bytes_snapshot(&self) -> HashMap<SymbolId, (u32, u32, Vec<u8>)> {
-        self.entries
+    pub fn direct_child_bytes(&self, node: &SymbolNode) -> HashMap<SymbolId, (u32, u32, Vec<u8>)> {
+        node.children
             .iter()
-            .filter_map(|(id, e)| {
+            .filter_map(|child| {
+                let id = &child.id;
+                let e = self.entries.get(id)?;
                 let img = e.tex.image.as_ref()?;
                 let sz = img.size(0);
                 let w = sz.width.0 as u32;
@@ -516,34 +549,35 @@ impl TextureCache {
     }
 
     /// Bake up to BAKES_PER_FRAME queued items, evict past budget.
-    pub fn bake_queued(
+    pub fn process_requests(
         &mut self,
         mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
     ) -> bool {
-        self.queue.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let queue = std::mem::take(&mut self.queue);
-        let mut it = queue.into_iter();
-        for (id, _) in it.by_ref().take(BAKES_PER_FRAME) {
+        let mut queue: Vec<_> = std::mem::take(&mut self.queue).into_iter().collect();
+        queue.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let remaining = queue.split_off(queue.len().min(BAKES_PER_FRAME));
+        self.queue.extend(remaining);
+        for (id, _) in queue {
             let tex = bake_fn(&id, &mut self.raster).unwrap_or_else(NodeTexture::empty);
-            self.save_to_disk(&id, &tex);
-            self.bytes += tex.bytes;
-            self.clock += 1;
-            self.entries.insert(
-                id,
-                Entry {
-                    tex,
-                    last_used: self.clock,
-                },
-            );
+            self.insert(id, tex);
         }
-        let remaining = it.next().is_some();
-        self.evict();
-        remaining
+        !self.queue.is_empty()
     }
 
-    /// Insert a pre-baked texture (used by the bulk pre-bake pass).
+    /// Insert a texture while preserving disk and memory-cache invariants.
     pub fn insert(&mut self, id: SymbolId, tex: NodeTexture) {
         self.save_to_disk(&id, &tex);
+        self.insert_entry(id, tex);
+    }
+
+    fn insert_entry(&mut self, id: SymbolId, tex: NodeTexture) {
+        self.deferred_once.remove(&id);
+        if let Some(replaced) = self.entries.remove(&id) {
+            self.bytes -= replaced.tex.bytes;
+            if let Some(image) = replaced.tex.image {
+                self.retired.push(image);
+            }
+        }
         self.bytes += tex.bytes;
         self.clock += 1;
         self.entries.insert(
@@ -553,6 +587,7 @@ impl TextureCache {
                 last_used: self.clock,
             },
         );
+        self.evict();
     }
 
     fn evict(&mut self) {
@@ -602,7 +637,8 @@ impl TextureCache {
             clock: 0,
             bytes: 0,
             max_bytes,
-            queue: Vec::new(),
+            queue: HashMap::new(),
+            deferred_once: HashSet::new(),
             retired: Vec::new(),
             disk_store: None,
             source_fingerprints: BTreeMap::new(),
@@ -613,88 +649,12 @@ impl TextureCache {
     fn set_max_bytes_for_test(&mut self, max_bytes: usize) {
         self.max_bytes = max_bytes;
     }
-}
 
-// ── Pre-bake all textures bottom-up ──────────────────────────────────
-
-use crate::treemap::runs_from_spans;
-
-/// Bake every node in the tree bottom-up: leaves first, then containers
-/// compositing their children's cached textures. Called on the background
-/// thread at the end of indexing so the view opens fully textured.
-pub fn pre_bake_all(
-    tree: &SymbolTree,
-    layout: &PackLayout,
-    cache: &mut TextureCache,
-    progress: &outrider_index::IndexProgress,
-) {
-    progress
-        .phase
-        .store(4, std::sync::atomic::Ordering::Relaxed);
-    let file_symbols = collect_file_symbols(tree);
-    let mut buffers = BufferManager::new(tree.repo_root.clone());
-
-    let mut order: Vec<(&SymbolNode, u8)> = Vec::new();
-    fn collect_nodes<'a>(node: &'a SymbolNode, depth: u8, out: &mut Vec<(&'a SymbolNode, u8)>) {
-        for child in &node.children {
-            collect_nodes(child, depth.saturating_add(1), out);
-        }
-        out.push((node, depth));
-    }
-    collect_nodes(&tree.root, 0, &mut order);
-
-    let total = order.len();
-    progress
-        .files_total
-        .store(total, std::sync::atomic::Ordering::Relaxed);
-    progress
-        .files_parsed
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-
-    for (i, &(node, depth)) in order.iter().enumerate() {
-        if cache.contains(&node.id) {
-            progress
-                .files_parsed
-                .store(i + 1, std::sync::atomic::Ordering::Relaxed);
-            continue;
-        }
-
-        let mut baked = false;
-        if content::is_leaf_item(node) {
-            let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
-            let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
-            if let Some(m) = buffers.get(&rel, syms) {
-                if let Some(start) = m.symbol_start_line(&node.id) {
-                    let count =
-                        (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
-                    let mut lines: Vec<Line> = Vec::with_capacity(count);
-                    for j in 0..count {
-                        if let Some((text, spans)) = m.buffer.line(start + j) {
-                            let runs = runs_from_spans(text.len(), spans);
-                            lines.push((text, runs));
-                        }
-                    }
-                    if !lines.is_empty() {
-                        let tex = cache.raster.bake(&lines);
-                        cache.insert(node.id.clone(), tex);
-                        baked = true;
-                    }
-                }
-            }
-        }
-
-        if !baked {
-            if let Some(rect) = layout.rects.get(&node.id) {
-                let snap = cache.child_bytes_snapshot();
-                let child_lookup = |id: &SymbolId| snap.get(id).cloned();
-                let tex = bake_container(node, *rect, layout, depth, &child_lookup);
-                cache.insert(node.id.clone(), tex);
-            }
-        }
-
-        progress
-            .files_parsed
-            .store(i + 1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    fn queued_ids(&self) -> Vec<SymbolId> {
+        let mut queued: Vec<_> = self.queue.iter().collect();
+        queued.sort_by(|a, b| b.1.total_cmp(a.1));
+        queued.into_iter().map(|(id, _)| id.clone()).collect()
     }
 }
 
@@ -766,6 +726,88 @@ mod tests {
         Some(raster.bake(&lines))
     }
 
+    fn texture(bytes: usize) -> NodeTexture {
+        NodeTexture { image: None, bytes }
+    }
+
+    #[test]
+    fn repeated_request_is_deduplicated_and_priority_is_upgraded() {
+        let mut cache = TextureCache::new_memory_only(1024);
+        cache.request(sid("a"), 10.0);
+        cache.request(sid("a"), 100.0);
+        cache.request(sid("b"), 50.0);
+
+        assert_eq!(cache.queued_ids(), vec![sid("a"), sid("b")]);
+    }
+
+    #[test]
+    fn parent_is_deferred_once_without_losing_dependency_requests() {
+        let mut cache = TextureCache::new_memory_only(100);
+        for i in 0..6 {
+            cache.insert(sid(&format!("child-{i}")), texture(80));
+        }
+
+        cache.request(sid("parent"), 100.0);
+        for i in 0..5 {
+            cache.request(sid(&format!("child-{i}")), 110.0);
+        }
+
+        assert!(cache.defer_request_once(&sid("parent")));
+        assert!(cache.process_requests(|_, _| Some(texture(80))));
+        assert!(!cache.needs_dependency_pass(&sid("parent")));
+
+        cache.request(sid("parent"), 100.0);
+        assert!(!cache.defer_request_once(&sid("parent")));
+        assert!(!cache.process_requests(|_, _| Some(texture(80))));
+        assert!(
+            cache.contains(&sid("parent")),
+            "parent gets a reserved turn"
+        );
+    }
+
+    #[test]
+    fn replacing_an_entry_does_not_double_count_bytes() {
+        let mut cache = TextureCache::new_memory_only(1024);
+        cache.insert(sid("a"), texture(100));
+        cache.insert(sid("a"), texture(60));
+
+        assert_eq!(cache.used_bytes(), 60);
+    }
+
+    #[test]
+    fn insertion_obeys_memory_limit() {
+        let mut cache = TextureCache::new_memory_only(100);
+        cache.insert(sid("a"), texture(80));
+        cache.insert(sid("b"), texture(80));
+
+        assert!(cache.used_bytes() <= 100);
+    }
+
+    #[test]
+    fn disk_promotion_obeys_memory_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let fingerprints = BTreeMap::from([("a".into(), 1), ("b".into(), 1)]);
+        let payload = TexturePayload {
+            width: 5,
+            height: 4,
+            bytes: vec![0; 80],
+        };
+        let disk_limit = 1024 * 1024;
+        let mut cache = TextureCache::new_memory_only(100);
+        cache.source_fingerprints = fingerprints;
+        cache.disk_store =
+            Some(TextureStore::open_at(dir.path(), "promotion-test", disk_limit).unwrap());
+        let a_key = cache.disk_key(&sid("a")).unwrap();
+        let b_key = cache.disk_key(&sid("b")).unwrap();
+        let store = cache.disk_store.as_mut().unwrap();
+        store.save(&a_key, &payload).unwrap();
+        store.save(&b_key, &payload).unwrap();
+        assert!(cache.get(&sid("a"), 1.0).is_some());
+        assert!(cache.get(&sid("b"), 1.0).is_some());
+
+        assert!(cache.used_bytes() <= 100);
+    }
+
     #[test]
     fn cache_bakes_largest_first_within_budget() {
         let mut cache = TextureCache::new_memory_only(DEFAULT_CACHE_MB as usize * 1024 * 1024);
@@ -775,14 +817,14 @@ mod tests {
                 .is_none());
         }
         assert!(cache.has_queued());
-        let remaining = cache.bake_queued(|_, r| some_tex(4, r));
+        let remaining = cache.process_requests(|_, r| some_tex(4, r));
         assert!(remaining, "6 queued, budget 4 — misses remain");
         for i in 2..6 {
             assert!(cache.get(&sid(&format!("l{i}")), 1.0).is_some());
         }
         assert!(cache.get(&sid("l0"), 1.0).is_none());
         assert!(cache.get(&sid("l1"), 1.0).is_none());
-        assert!(!cache.bake_queued(|_, r| some_tex(4, r)));
+        assert!(!cache.process_requests(|_, r| some_tex(4, r)));
         assert!(cache.get(&sid("l0"), 1.0).is_some());
     }
 
@@ -790,7 +832,7 @@ mod tests {
     fn cache_negative_caches_leaves_without_lines() {
         let mut cache = TextureCache::new_memory_only(DEFAULT_CACHE_MB as usize * 1024 * 1024);
         assert!(cache.get(&sid("nofile"), 1.0).is_none());
-        assert!(!cache.bake_queued(|_, _| None));
+        assert!(!cache.process_requests(|_, _| None));
         let tex = cache.get(&sid("nofile"), 1.0).expect("negative-cached");
         assert!(tex.image.is_none());
         assert!(!cache.has_queued());
@@ -800,11 +842,11 @@ mod tests {
     fn cache_evicts_lru_and_retires_images() {
         let mut cache = TextureCache::new_memory_only(usize::MAX);
         cache.get(&sid("a"), 1.0);
-        cache.bake_queued(|_, r| some_tex(4, r));
+        cache.process_requests(|_, r| some_tex(4, r));
         let one = cache.get(&sid("a"), 1.0).unwrap().bytes;
         cache.set_max_bytes_for_test(one);
         cache.get(&sid("b"), 1.0);
-        cache.bake_queued(|_, r| some_tex(4, r));
+        cache.process_requests(|_, r| some_tex(4, r));
         assert!(cache.get(&sid("b"), 1.0).is_some());
         assert!(cache.get(&sid("a"), 1.0).is_none());
         let retired = cache.take_retired();
@@ -816,13 +858,13 @@ mod tests {
     fn cache_hit_refreshes_lru_order() {
         let mut cache = TextureCache::new_memory_only(usize::MAX);
         cache.get(&sid("a"), 1.0);
-        cache.bake_queued(|_, r| some_tex(4, r));
+        cache.process_requests(|_, r| some_tex(4, r));
         cache.get(&sid("b"), 1.0);
-        cache.bake_queued(|_, r| some_tex(4, r));
+        cache.process_requests(|_, r| some_tex(4, r));
         let one = cache.get(&sid("a"), 1.0).unwrap().bytes;
         cache.set_max_bytes_for_test(2 * one);
         cache.get(&sid("c"), 1.0);
-        cache.bake_queued(|_, r| some_tex(4, r));
+        cache.process_requests(|_, r| some_tex(4, r));
         assert!(cache.get(&sid("a"), 1.0).is_some());
         assert!(cache.get(&sid("b"), 1.0).is_none());
         assert!(cache.get(&sid("c"), 1.0).is_some());

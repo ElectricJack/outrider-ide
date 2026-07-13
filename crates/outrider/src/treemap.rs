@@ -3,7 +3,7 @@
 //! world-space layout from `outrider-layout` into per-frame paint instructions
 //! (quads, text runs, and baked texture quads) via a static canvas closure.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -946,6 +946,24 @@ impl TreemapView {
                                     image: img.clone(),
                                 });
                             }
+                        } else {
+                            if self.textures.needs_dependency_pass(&item.node.id) {
+                                let mut dependencies_ready = true;
+                                for child in &item.node.children {
+                                    let child_area = self
+                                        .layout
+                                        .rects
+                                        .get(&child.id)
+                                        .map(|rect| rect.w * rect.h * camera.zoom * camera.zoom)
+                                        .unwrap_or(0.0);
+                                    if self.textures.get(&child.id, area + child_area).is_none() {
+                                        dependencies_ready = false;
+                                    }
+                                }
+                                if !dependencies_ready {
+                                    self.textures.defer_request_once(&item.node.id);
+                                }
+                            }
                         }
                     }
                 }
@@ -1052,16 +1070,30 @@ impl TreemapView {
         });
         self.bake_pending = if self.textures.has_queued() {
             let index = TreeIndex::new(&self.tree);
+            let direct_child_bytes: HashMap<_, _> = self
+                .textures
+                .next_request_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let node = index.node(&id)?;
+                    (!content::is_leaf_item(node))
+                        .then(|| (id, self.textures.direct_child_bytes(node)))
+                })
+                .collect();
             let buffers = &mut self.buffers;
             let file_symbols = &self.file_symbols;
             let layout = &self.layout;
-            let child_snap = self.textures.child_bytes_snapshot();
-            self.textures.bake_queued(|id, rasterizer| {
+            self.textures.process_requests(|id, rasterizer| {
                 let node = index.node(id)?;
                 if !content::is_leaf_item(node) {
                     let rect = layout.rects.get(id)?;
                     let level = index.depth(id).unwrap_or(0) as u8;
-                    let child_tex = |cid: &outrider_index::SymbolId| child_snap.get(cid).cloned();
+                    let child_tex = |cid: &outrider_index::SymbolId| {
+                        direct_child_bytes
+                            .get(id)
+                            .and_then(|children| children.get(cid))
+                            .cloned()
+                    };
                     return Some(rasterize::bake_container(
                         node, *rect, layout, level, &child_tex,
                     ));
@@ -1690,8 +1722,7 @@ impl TreemapView {
         self.start_loading(repo);
     }
 
-    /// Spawn a background thread to index `folder`, compute layout, and
-    /// pre-bake all textures bottom-up so the view opens fully textured.
+    /// Spawn a background thread to index `folder` and compute its layout.
     fn start_loading(&mut self, folder: std::path::PathBuf) {
         let folder_name = folder
             .file_name()
@@ -1717,13 +1748,12 @@ impl TreemapView {
                 };
             let tree = outcome.tree;
             let layout = outrider_layout::pack(&tree, &world::pack_config());
-            let mut textures = TextureCache::new(
+            let textures = TextureCache::new(
                 &folder,
                 outcome.source_fingerprints,
                 cache_bytes,
                 disk_cache_bytes,
             );
-            rasterize::pre_bake_all(&tree, &layout, &mut textures, &p);
             *r.lock().unwrap() = Some(Ok(LoadedProject {
                 tree,
                 layout,
