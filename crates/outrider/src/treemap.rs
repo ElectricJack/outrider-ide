@@ -125,21 +125,31 @@ enum SettingsField {
     Extensions,
     Folders,
     CacheMb,
+    DiskCacheGb,
 }
 
 struct SettingsDraft {
     filter_extensions: String,
     filter_folders: String,
     cache_mb: String,
+    disk_cache_gb: String,
+    notification: Option<String>,
     active: SettingsField,
 }
 
 impl SettingsDraft {
-    fn from_settings(s: &settings::Settings) -> Self {
+    fn from_settings(s: &settings::Settings, project: &std::path::Path) -> Self {
+        let disk_gb =
+            s.disk_cache_bytes(project) as f64 / settings::DEFAULT_DISK_CACHE_BYTES as f64;
         Self {
             filter_extensions: s.filter_extensions.join(", "),
             filter_folders: s.filter_folders.join(", "),
             cache_mb: s.cache_mb.to_string(),
+            disk_cache_gb: format!("{disk_gb:.3}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string(),
+            notification: None,
             active: SettingsField::Extensions,
         }
     }
@@ -149,23 +159,92 @@ impl SettingsDraft {
             SettingsField::Extensions => &mut self.filter_extensions,
             SettingsField::Folders => &mut self.filter_folders,
             SettingsField::CacheMb => &mut self.cache_mb,
+            SettingsField::DiskCacheGb => &mut self.disk_cache_gb,
         }
     }
 
-    fn to_settings(&self) -> settings::Settings {
+    fn apply_to(
+        &self,
+        settings: &mut settings::Settings,
+        project: &std::path::Path,
+    ) -> Result<(), String> {
         let parse_list = |s: &str| -> Vec<String> {
             s.split(',')
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
                 .collect()
         };
-        settings::Settings {
-            filter_extensions: parse_list(&self.filter_extensions),
-            filter_folders: parse_list(&self.filter_folders),
-            show_welcome: false,
-            cache_mb: self.cache_mb.trim().parse::<u32>().unwrap_or(256),
+        let cache_mb =
+            self.cache_mb.trim().parse::<u32>().map_err(|_| {
+                "Texture cache must be a whole number of MB within range".to_string()
+            })?;
+        if cache_mb == 0 {
+            return Err("Texture cache must be greater than zero MB".into());
+        }
+        let disk_cache_bytes = parse_gibibytes(&self.disk_cache_gb)?;
+        settings.filter_extensions = parse_list(&self.filter_extensions);
+        settings.filter_folders = parse_list(&self.filter_folders);
+        settings.cache_mb = cache_mb;
+        settings.set_disk_cache_bytes(project, disk_cache_bytes);
+        Ok(())
+    }
+}
+
+fn parse_gibibytes(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    let mut parts = input.split('.');
+    let whole = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| "Disk cache must be a decimal number of GiB".to_string())?;
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction
+            .is_some_and(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err("Disk cache must be a decimal number of GiB".into());
+    }
+
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| "Disk cache size is too large".to_string())?;
+    let mut bytes = whole
+        .checked_mul(settings::DEFAULT_DISK_CACHE_BYTES)
+        .ok_or_else(|| "Disk cache size is too large".to_string())?;
+    if let Some(fraction) = fraction {
+        let fraction = fraction.trim_end_matches('0');
+        if !fraction.is_empty() {
+            if fraction.len() > 30 {
+                return Err("Disk cache size is too precise".into());
+            }
+            let numerator = fraction
+                .parse::<u128>()
+                .map_err(|_| "Disk cache size is too large".to_string())?;
+            let denominator = 10_u128
+                .checked_pow(fraction.len() as u32)
+                .ok_or_else(|| "Disk cache size is too precise".to_string())?;
+            let mut left = denominator;
+            let mut right = u128::from(settings::DEFAULT_DISK_CACHE_BYTES);
+            while right != 0 {
+                (left, right) = (right, left % right);
+            }
+            let common_factor = left;
+            let fractional_bytes = numerator
+                .checked_mul(u128::from(settings::DEFAULT_DISK_CACHE_BYTES) / common_factor)
+                .ok_or_else(|| "Disk cache size is too large".to_string())?
+                / (denominator / common_factor);
+            let fractional_bytes = u64::try_from(fractional_bytes)
+                .map_err(|_| "Disk cache size is too large".to_string())?;
+            bytes = bytes
+                .checked_add(fractional_bytes)
+                .ok_or_else(|| "Disk cache size is too large".to_string())?;
         }
     }
+    if bytes == 0 {
+        return Err("Disk cache must be greater than zero GiB".into());
+    }
+    Ok(bytes)
 }
 
 /// Root GPUI view: owns the symbol tree, pack layout, camera state, buffer
@@ -202,6 +281,8 @@ pub struct TreemapView {
     show_welcome: bool,
     /// Working copy of settings while the settings panel is open.
     settings_draft: Option<SettingsDraft>,
+    /// Recoverable settings load/save and validation feedback.
+    settings_notification: Option<String>,
     /// Right-click context menu, if currently open.
     context_menu: Option<ContextMenu>,
     /// Background indexing in progress (Open Folder or re-index).
@@ -594,9 +675,10 @@ impl TreemapView {
     pub fn new(
         tree: SymbolTree,
         layout: PackLayout,
-        settings: settings::Settings,
+        loaded_settings: settings::SettingsLoad,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (settings, settings_notification) = loaded_settings.into_parts();
         let root_id = tree.root.id.clone();
         let file_symbols = collect_file_symbols(&tree);
         let buffers = BufferManager::new(tree.repo_root.clone());
@@ -623,6 +705,7 @@ impl TreemapView {
             settings,
             show_welcome,
             settings_draft: None,
+            settings_notification,
             context_menu: None,
             loading: None,
         }
@@ -1170,7 +1253,10 @@ impl TreemapView {
                             .set_title("Open Project Folder")
                             .pick_folder()
                         {
-                            this.settings = crate::settings::Settings::load();
+                            let (settings, warning) =
+                                crate::settings::Settings::load().into_parts();
+                            this.settings = settings;
+                            this.settings_notification = warning;
                             this.start_loading(folder);
                         }
                         cx.notify();
@@ -1195,8 +1281,10 @@ impl TreemapView {
                         if this.settings_draft.is_some() {
                             this.settings_draft = None;
                         } else {
-                            this.settings_draft =
-                                Some(SettingsDraft::from_settings(&this.settings));
+                            this.settings_draft = Some(SettingsDraft::from_settings(
+                                &this.settings,
+                                &this.tree.repo_root,
+                            ));
                             this.palette.close();
                             this.show_welcome = false;
                             this.context_menu = None;
@@ -1360,7 +1448,10 @@ impl TreemapView {
                     if self.settings_draft.is_some() {
                         self.settings_draft = None;
                     } else {
-                        self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
+                        self.settings_draft = Some(SettingsDraft::from_settings(
+                            &self.settings,
+                            &self.tree.repo_root,
+                        ));
                         self.palette.close();
                         self.show_welcome = false;
                         self.context_menu = None;
@@ -1378,7 +1469,8 @@ impl TreemapView {
                     draft.active = match draft.active {
                         SettingsField::Extensions => SettingsField::Folders,
                         SettingsField::Folders => SettingsField::CacheMb,
-                        SettingsField::CacheMb => SettingsField::Extensions,
+                        SettingsField::CacheMb => SettingsField::DiskCacheGb,
+                        SettingsField::DiskCacheGb => SettingsField::Extensions,
                     };
                 }
                 "backspace" => {
@@ -1394,9 +1486,14 @@ impl TreemapView {
                             None
                         }
                     }) {
-                        if draft.active == SettingsField::CacheMb {
-                            if ch.is_ascii_digit() {
-                                draft.cache_mb.push(ch);
+                        if matches!(
+                            draft.active,
+                            SettingsField::CacheMb | SettingsField::DiskCacheGb
+                        ) {
+                            if ch.is_ascii_digit()
+                                || (draft.active == SettingsField::DiskCacheGb && ch == '.')
+                            {
+                                draft.active_text_mut().push(ch);
                             }
                         } else {
                             draft.active_text_mut().push(ch);
@@ -1854,6 +1951,7 @@ impl TreemapView {
         let ext_active = draft.active == SettingsField::Extensions;
         let folder_active = draft.active == SettingsField::Folders;
         let cache_active = draft.active == SettingsField::CacheMb;
+        let disk_active = draft.active == SettingsField::DiskCacheGb;
 
         let ext_text = if ext_active {
             format!("{}|", draft.filter_extensions)
@@ -1869,6 +1967,11 @@ impl TreemapView {
             format!("{}|", draft.cache_mb)
         } else {
             draft.cache_mb.clone()
+        };
+        let disk_text = if disk_active {
+            format!("{}|", draft.disk_cache_gb)
+        } else {
+            draft.disk_cache_gb.clone()
         };
 
         let settings_field =
@@ -1959,6 +2062,21 @@ impl TreemapView {
                         cache_active,
                         SettingsField::CacheMb,
                     ))
+                    .child(settings_field(
+                        "field-disk-cache-gb",
+                        "Project Disk Cache (GiB):",
+                        disk_text,
+                        disk_active,
+                        SettingsField::DiskCacheGb,
+                    ))
+                    .children(draft.notification.as_ref().map(|message| {
+                        div()
+                            .text_size(px(12.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(0xff8a80_u32))
+                            .pb(px(12.0))
+                            .child(message.clone())
+                    }))
                     .child(
                         div()
                             .text_size(px(11.0))
@@ -1986,10 +2104,21 @@ impl TreemapView {
                                     .text_color(rgb(0x000000_u32))
                                     .child("Save & Close")
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        if let Some(draft) = this.settings_draft.take() {
-                                            this.settings = draft.to_settings();
-                                            this.settings.save();
-                                            this.reindex();
+                                        if let Some(mut draft) = this.settings_draft.take() {
+                                            let mut candidate = this.settings.clone();
+                                            let result = draft
+                                                .apply_to(&mut candidate, &this.tree.repo_root)
+                                                .and_then(|()| candidate.save());
+                                            match result {
+                                                Ok(()) => {
+                                                    this.settings = candidate;
+                                                    this.reindex();
+                                                }
+                                                Err(message) => {
+                                                    draft.notification = Some(message);
+                                                    this.settings_draft = Some(draft);
+                                                }
+                                            }
                                         }
                                         cx.notify();
                                     })),
@@ -2008,10 +2137,19 @@ impl TreemapView {
                                     .text_color(rgb(theme::TEXT_SECONDARY))
                                     .child("Reset to Defaults")
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.settings = settings::Settings::default();
-                                        this.settings.save();
-                                        this.settings_draft = None;
-                                        this.reindex();
+                                        let defaults = settings::Settings::default();
+                                        match defaults.save() {
+                                            Ok(()) => {
+                                                this.settings = defaults;
+                                                this.settings_draft = None;
+                                                this.reindex();
+                                            }
+                                            Err(message) => {
+                                                if let Some(draft) = &mut this.settings_draft {
+                                                    draft.notification = Some(message);
+                                                }
+                                            }
+                                        }
                                         cx.notify();
                                     })),
                             )
@@ -2155,7 +2293,7 @@ impl TreemapView {
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.show_welcome = false;
                                 this.settings.show_welcome = false;
-                                this.settings.save();
+                                this.settings_notification = this.settings.save().err();
                                 cx.notify();
                             })),
                     ),
@@ -2204,6 +2342,23 @@ impl Render for TreemapView {
 
         // Build the loading overlay if indexing in background.
         let loading_overlay = is_loading.then(|| self.render_loading(vw));
+        let settings_notification = self.settings_notification.as_ref().map(|message| {
+            div()
+                .absolute()
+                .top(px(12.0))
+                .left(px(12.0))
+                .right(px(12.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .bg(rgb(0x3a2020_u32))
+                .border_1()
+                .border_color(rgb(0xff8a80_u32))
+                .rounded(px(4.0))
+                .text_size(px(12.0))
+                .font_family(theme::FONT_FAMILY_SANS)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(message.clone())
+        });
 
         let title = self.window_title();
         let file_menu = self.render_file_menu(cx);
@@ -2503,7 +2658,8 @@ impl Render for TreemapView {
             .children(settings_overlay)
             .children(welcome_overlay)
             .children(context_menu_overlay)
-            .children(loading_overlay);
+            .children(loading_overlay)
+            .children(settings_notification);
 
         div()
             .relative()
@@ -2524,6 +2680,54 @@ impl Render for TreemapView {
 
 #[cfg(test)]
 mod tests {
+    use super::{parse_gibibytes, SettingsDraft};
+
+    #[test]
+    fn decimal_gibibytes_are_converted_without_overflow() {
+        assert_eq!(parse_gibibytes("1").unwrap(), 1_073_741_824);
+        assert_eq!(parse_gibibytes("1.5").unwrap(), 1_610_612_736);
+        assert!(parse_gibibytes("0.999999999999999999").is_ok());
+        assert!(parse_gibibytes("18446744073709551616").is_err());
+        assert!(parse_gibibytes("0").is_err());
+        assert!(parse_gibibytes("1.2.3").is_err());
+    }
+
+    #[test]
+    fn settings_draft_rejects_overflow_without_mutating_settings() {
+        let project = std::path::Path::new("D:/repo");
+        let mut settings = crate::settings::Settings::default();
+        let mut draft = SettingsDraft::from_settings(&settings, project);
+        draft.cache_mb = "4294967296".into();
+
+        assert!(draft.apply_to(&mut settings, project).is_err());
+        assert_eq!(settings.cache_mb, 256);
+        assert_eq!(
+            settings.disk_cache_bytes(project),
+            crate::settings::DEFAULT_DISK_CACHE_BYTES
+        );
+    }
+
+    #[test]
+    fn settings_draft_updates_only_the_current_project_disk_limit() {
+        let one = std::path::Path::new("D:/one");
+        let two = std::path::Path::new("D:/two");
+        let mut settings = crate::settings::Settings::default();
+        settings.set_disk_cache_bytes(two, 2 * crate::settings::DEFAULT_DISK_CACHE_BYTES);
+        let mut draft = SettingsDraft::from_settings(&settings, one);
+        draft.disk_cache_gb = "0.5".into();
+
+        draft.apply_to(&mut settings, one).unwrap();
+
+        assert_eq!(
+            settings.disk_cache_bytes(one),
+            crate::settings::DEFAULT_DISK_CACHE_BYTES / 2
+        );
+        assert_eq!(
+            settings.disk_cache_bytes(two),
+            2 * crate::settings::DEFAULT_DISK_CACHE_BYTES
+        );
+    }
+
     use std::collections::BTreeMap;
 
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};

@@ -1,5 +1,34 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+pub const DEFAULT_DISK_CACHE_BYTES: u64 = 1_073_741_824;
+
+#[derive(Debug)]
+pub enum SettingsLoad {
+    Loaded(Settings),
+    Recovered { settings: Settings, warning: String },
+}
+
+impl SettingsLoad {
+    pub fn into_parts(self) -> (Settings, Option<String>) {
+        match self {
+            Self::Loaded(settings) => (settings, None),
+            Self::Recovered { settings, warning } => (settings, Some(warning)),
+        }
+    }
+}
+
+impl std::ops::Deref for SettingsLoad {
+    type Target = Settings;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Loaded(settings) | Self::Recovered { settings, .. } => settings,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -8,6 +37,8 @@ pub struct Settings {
     pub show_welcome: bool,
     #[serde(default = "default_cache_mb")]
     pub cache_mb: u32,
+    #[serde(default)]
+    pub(crate) disk_cache_bytes: BTreeMap<String, u64>,
 }
 
 fn default_cache_mb() -> u32 {
@@ -43,6 +74,7 @@ impl Default for Settings {
             .collect(),
             show_welcome: true,
             cache_mb: default_cache_mb(),
+            disk_cache_bytes: BTreeMap::new(),
         }
     }
 }
@@ -52,23 +84,185 @@ fn settings_path() -> Option<PathBuf> {
 }
 
 impl Settings {
-    pub fn load() -> Self {
-        let Some(path) = settings_path() else {
-            return Self::default();
-        };
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+    pub fn disk_cache_bytes(&self, project: &Path) -> u64 {
+        self.disk_cache_bytes_for_key(&project_key(project))
     }
 
-    pub fn save(&self) {
-        let Some(path) = settings_path() else { return };
+    pub fn set_disk_cache_bytes(&mut self, project: &Path, bytes: u64) {
+        self.set_disk_cache_bytes_for_key(project_key(project), bytes);
+    }
+
+    fn disk_cache_bytes_for_key(&self, key: &str) -> u64 {
+        self.disk_cache_bytes
+            .get(key)
+            .copied()
+            .unwrap_or(DEFAULT_DISK_CACHE_BYTES)
+    }
+
+    fn set_disk_cache_bytes_for_key(&mut self, key: String, bytes: u64) {
+        self.disk_cache_bytes.insert(key, bytes);
+    }
+
+    pub fn load() -> SettingsLoad {
+        let Some(path) = settings_path() else {
+            return SettingsLoad::Recovered {
+                settings: Self::default(),
+                warning: "Unable to determine the settings directory; using defaults".into(),
+            };
+        };
+        Self::load_from_path(&path)
+    }
+
+    fn load_from_path(path: &Path) -> SettingsLoad {
+        let json = match std::fs::read_to_string(path) {
+            Ok(json) => json,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return SettingsLoad::Loaded(Self::default());
+            }
+            Err(error) => {
+                return SettingsLoad::Recovered {
+                    settings: Self::default(),
+                    warning: format!("Could not read settings: {error}; using defaults"),
+                };
+            }
+        };
+        match serde_json::from_str(&json) {
+            Ok(settings) => SettingsLoad::Loaded(settings),
+            Err(error) => {
+                let invalid_path = path.with_file_name("settings.invalid.json");
+                let preservation = std::fs::rename(path, &invalid_path)
+                    .map(|()| format!(" Preserved the invalid file at {}.", invalid_path.display()))
+                    .unwrap_or_else(|rename_error| {
+                        format!(" Could not preserve the invalid file: {rename_error}.")
+                    });
+                SettingsLoad::Recovered {
+                    settings: Self::default(),
+                    warning: format!(
+                        "Settings were invalid ({error}); using defaults.{preservation}"
+                    ),
+                }
+            }
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = settings_path()
+            .ok_or_else(|| "Unable to determine the settings directory".to_string())?;
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Could not create settings directory: {error}"))?;
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, json);
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|error| format!("Could not serialize settings: {error}"))?;
+        let temp_path = path.with_file_name("settings.tmp.json");
+        std::fs::write(&temp_path, json)
+            .map_err(|error| format!("Could not write temporary settings file: {error}"))?;
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("Could not replace settings file: {error}"));
         }
+        Ok(())
+    }
+}
+
+fn project_key(project: &Path) -> String {
+    let canonical = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let key = canonical.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let key = key.to_lowercase();
+    let trimmed = key.trim_end_matches('/');
+    if trimmed.is_empty() {
+        key
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Settings, SettingsLoad};
+
+    #[test]
+    fn new_project_defaults_to_one_gibibyte() {
+        let settings = Settings::default();
+        assert_eq!(settings.disk_cache_bytes_for_key("D:/repo"), 1_073_741_824);
+    }
+
+    #[test]
+    fn project_disk_limits_are_independent() {
+        let mut settings = Settings::default();
+        settings.set_disk_cache_bytes_for_key("D:/one".into(), 512 * 1024 * 1024);
+        settings.set_disk_cache_bytes_for_key("D:/two".into(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            settings.disk_cache_bytes_for_key("D:/one"),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            settings.disk_cache_bytes_for_key("D:/two"),
+            2 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn old_settings_json_receives_disk_defaults() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"filter_extensions":[],"filter_folders":[],"show_welcome":false,"cache_mb":128}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.disk_cache_bytes_for_key("repo"), 1_073_741_824);
+    }
+
+    #[test]
+    fn malformed_settings_are_preserved_and_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "not json").unwrap();
+
+        let loaded = Settings::load_from_path(&path);
+
+        assert!(matches!(loaded, SettingsLoad::Recovered { .. }));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("settings.invalid.json")).unwrap(),
+            "not json"
+        );
+    }
+
+    #[test]
+    fn newest_malformed_settings_replace_the_previous_invalid_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "new invalid").unwrap();
+        std::fs::write(dir.path().join("settings.invalid.json"), "old invalid").unwrap();
+
+        let loaded = Settings::load_from_path(&path);
+
+        assert!(matches!(loaded, SettingsLoad::Recovered { .. }));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("settings.invalid.json")).unwrap(),
+            "new invalid"
+        );
+    }
+
+    #[test]
+    fn save_round_trip_preserves_project_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("settings.json");
+        let mut settings = Settings::default();
+        settings.set_disk_cache_bytes_for_key("project".into(), 42);
+
+        settings.save_to_path(&path).unwrap();
+        settings.set_disk_cache_bytes_for_key("project".into(), 84);
+        settings.save_to_path(&path).unwrap();
+        let SettingsLoad::Loaded(loaded) = Settings::load_from_path(&path) else {
+            panic!("saved settings should load normally");
+        };
+
+        assert_eq!(loaded.disk_cache_bytes_for_key("project"), 84);
+        assert!(!path.with_file_name("settings.tmp.json").exists());
     }
 }
