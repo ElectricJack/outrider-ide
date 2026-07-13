@@ -23,7 +23,7 @@ pub const CODE_MIN_W: f64 = 300.0;
 pub const LABEL_MIN_W: f64 = 60.0;
 
 /// Leaf page width in world units (= natural pixels).
-pub const PAGE_W: f64 = 480.0;
+pub const PAGE_W: f64 = 640.0;
 /// World-px gap between siblings and container inner margin.
 pub const PACK_GAP: f64 = 8.0;
 /// Target container width/height ratio (≈ square).
@@ -317,7 +317,7 @@ mod tests {
 
     fn pack_cfg() -> outrider_layout::PackConfig {
         outrider_layout::PackConfig {
-            page_w: 480.0,
+            page_w: 640.0,
             line_step: 15.6,
             header: 20.8,
             container_header: 52.0,
@@ -344,8 +344,8 @@ mod tests {
     #[test]
     fn packed_walk_zoom_one_clips_and_keeps_unclipped_fields() {
         let (tree, p) = packed_example();
-        // zoom 1.0 centered on g's page center (744, 355.4)
-        let cam = Camera { center_x: 744.0, center_y: 355.4, zoom: 1.0 };
+        // zoom 1.0 centered on g's page center (984, 355.4)
+        let cam = Camera { center_x: 984.0, center_y: 355.4, zoom: 1.0 };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
@@ -368,22 +368,22 @@ mod tests {
         // a.rs hangs off the left edge: clipped x/w, unclipped left/full_h
         let a = &items[1];
         close(a.px.x, -2.0);
-        close(a.left, -336.0);
-        close(a.px.w, 146.0);
+        close(a.left, -576.0);
+        close(a.px.w, 66.0);
         close(a.px.y, 4.6);
         close(a.top, 4.6);
         close(a.px.h, 597.4);
         close(a.full_h, 1602.4);
-        assert!((a.label_w - 480.0).abs() < 1e-9);
+        assert!((a.label_w - 640.0).abs() < 1e-9);
         // root's top is above the viewport: top unclipped, px.y clipped
         close(items[0].top, -55.4);
-        close(items[0].left, -344.0);
+        close(items[0].left, -584.0);
         close(items[0].px.x, -2.0);
         // g fully on-screen: nothing clipped
         let g = &items[4];
-        close(g.px.x, 160.0);
+        close(g.px.x, 80.0);
         close(g.px.y, 271.0);
-        close(g.px.w, 480.0);
+        close(g.px.w, 640.0);
         close(g.px.h, 58.0);
         close(g.full_h, 58.0);
         // hit-test picks the deepest node under the point
@@ -418,9 +418,9 @@ mod tests {
         let cam = Camera { center_x: 100_000.0, center_y: 100_000.0, zoom: 1.0 };
         assert!(visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false).is_empty());
         // panned right so only b.rs's column of the map remains: a.rs's
-        // right edge (488) is left of the viewport's world-left edge
-        // (900 − 400 = 500) → a.rs pruned, b.rs subtree survives
-        let cam = Camera { center_x: 900.0, center_y: 293.0, zoom: 1.0 };
+        // right edge (648) is left of the viewport's world-left edge
+        // (1060 − 400 = 660) → a.rs pruned, b.rs subtree survives
+        let cam = Camera { center_x: 1060.0, center_y: 293.0, zoom: 1.0 };
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "b.rs", "f", "g"]);

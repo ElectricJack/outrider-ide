@@ -229,7 +229,7 @@ mod tests {
 
     fn cfg() -> PackConfig {
         PackConfig {
-            page_w: 480.0,
+            page_w: 640.0,
             line_step: 15.6,
             header: 20.8,
             container_header: 52.0,
@@ -298,14 +298,11 @@ mod tests {
     fn worked_example_exact_rects() {
         let p = pack(&worked_example(), &cfg());
         assert_eq!(p.rects.len(), 5);
-        // leaf pages: w = page_w, h = header + (1+measure)·line_step + bottom_pad
-        assert_rect(rect(&p, "a.rs"), 8.0, 60.0, 480.0, 1602.4);
-        // b.rs: f fills the first column, g stacks under it (one column)
-        assert_rect(rect(&p, "b.rs::f"), 504.0, 120.0, 480.0, 198.4);
-        assert_rect(rect(&p, "b.rs::g"), 504.0, 326.4, 480.0, 58.0);
-        assert_rect(rect(&p, "b.rs"), 496.0, 60.0, 496.0, 332.4);
-        // root: a.rs fills column 1 (tall), b.rs wraps to column 2
-        assert_rect(rect(&p, ""), 0.0, 0.0, 1000.0, 1670.4);
+        assert_rect(rect(&p, "a.rs"), 8.0, 60.0, 640.0, 1602.4);
+        assert_rect(rect(&p, "b.rs::f"), 664.0, 120.0, 640.0, 198.4);
+        assert_rect(rect(&p, "b.rs::g"), 664.0, 326.4, 640.0, 58.0);
+        assert_rect(rect(&p, "b.rs"), 656.0, 60.0, 656.0, 332.4);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 1320.0, 1670.4);
     }
 
     #[test]
@@ -337,7 +334,7 @@ mod tests {
         close(z.x, 8.0);
         close(z.y, 60.0);
         // alpha wraps to the second column (zeta alone fills target_h)
-        close(a.x, 496.0);
+        close(a.x, 656.0);
         close(a.y, 60.0);
     }
 
@@ -392,12 +389,12 @@ mod tests {
         edited.root.children[1].children[0].measure = 50;
         let after = pack(&edited, &cfg());
         assert_eq!(rect(&before, "a.rs"), rect(&after, "a.rs"));
-        // f: 480 × 822.4; b.rs grows wide (two columns): 984 × 890.4
-        assert_rect(rect(&after, "b.rs::f"), 504.0, 120.0, 480.0, 822.4);
-        assert_rect(rect(&after, "b.rs"), 496.0, 60.0, 984.0, 890.4);
+        // f: 640 × 822.4; b.rs grows wide (two columns): 1304 × 890.4
+        assert_rect(rect(&after, "b.rs::f"), 664.0, 120.0, 640.0, 822.4);
+        assert_rect(rect(&after, "b.rs"), 656.0, 60.0, 1304.0, 890.4);
         // g wraps to b.rs's second column
         let g = rect(&after, "b.rs::g");
-        close(g.x, 992.0);
+        close(g.x, 1312.0);
         close(g.y, 120.0);
     }
 
@@ -416,14 +413,14 @@ mod tests {
             repo_root: "/x".into(),
         };
         let p = pack(&tree, &cfg());
-        // single 480×58 child: content 480×58 → root 496 × 126.0
-        assert_rect(rect(&p, "one.rs"), 8.0, 60.0, 480.0, 58.0);
-        assert_rect(rect(&p, ""), 0.0, 0.0, 496.0, 126.0);
+        // single 640×58 child: content 640×58 → root 656 × 126.0
+        assert_rect(rect(&p, "one.rs"), 8.0, 60.0, 640.0, 58.0);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 656.0, 126.0);
     }
 
     #[test]
     fn columns_fill_down_then_wrap_right() {
-        // Four equal 480×120.4 pages, aspect 1.6 (test cfg): target_h ≈ 380
+        // Four equal 640×120.4 pages, aspect 1.6 (test cfg): target_h ≈ 380
         // holds three per column, the fourth wraps to a second column.
         let files: Vec<SymbolNode> = (1..=4)
             .map(|i| n(SymbolKind::File, &format!("c{i}.rs"), &format!("c{i}.rs"), 5, vec![]))
@@ -433,11 +430,11 @@ mod tests {
             repo_root: "/x".into(),
         };
         let p = pack(&tree, &cfg());
-        assert_rect(rect(&p, "c1.rs"), 8.0, 60.0, 480.0, 120.4);
-        assert_rect(rect(&p, "c2.rs"), 8.0, 188.4, 480.0, 120.4);
-        assert_rect(rect(&p, "c3.rs"), 8.0, 316.8, 480.0, 120.4);
-        assert_rect(rect(&p, "c4.rs"), 496.0, 60.0, 480.0, 120.4);
-        assert_rect(rect(&p, ""), 0.0, 0.0, 984.0, 445.2);
+        assert_rect(rect(&p, "c1.rs"), 8.0, 60.0, 640.0, 120.4);
+        assert_rect(rect(&p, "c2.rs"), 8.0, 188.4, 640.0, 120.4);
+        assert_rect(rect(&p, "c3.rs"), 8.0, 316.8, 640.0, 120.4);
+        assert_rect(rect(&p, "c4.rs"), 656.0, 60.0, 640.0, 120.4);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 1304.0, 445.2);
     }
 
     #[test]
@@ -643,7 +640,7 @@ mod tests {
         close(m.x, 8.0);
         close(m.y, 60.0);
         // README wraps to the second column
-        close(r.x, 496.0);
+        close(r.x, 656.0);
         close(r.y, 60.0);
     }
 

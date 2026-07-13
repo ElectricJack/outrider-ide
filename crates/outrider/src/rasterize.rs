@@ -659,9 +659,9 @@ mod tests {
         let lines: Vec<Line> = (0..10).map(|_| plain("fn foo() {}")).collect();
         let tex = Rasterizer::new().bake(&lines);
         let img = tex.image.as_ref().unwrap();
-        assert_eq!(img.size(0).width.0, 123);
+        assert_eq!(img.size(0).width.0, 164);
         assert_eq!(img.size(0).height.0, 40);
-        assert_eq!(tex.bytes, 123 * 40 * 4);
+        assert_eq!(tex.bytes, 164 * 40 * 4);
     }
 
     #[test]

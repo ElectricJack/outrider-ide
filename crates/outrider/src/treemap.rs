@@ -2466,7 +2466,7 @@ mod tests {
         let natural = crate::content::natural_px(&leaf);
         // scale 1.0: full_h == natural
         let body =
-            leaf_text_body(&leaf, 0.0, 0.0, natural, 480.0, 600.0, &mut mgr, &file_symbols);
+            leaf_text_body(&leaf, 0.0, 0.0, natural, 640.0, 600.0, &mut mgr, &file_symbols);
         // code only — no separate signature row (the code line IS the signature)
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two() {}");
@@ -2487,14 +2487,14 @@ mod tests {
         let natural = crate::content::natural_px(&leaf);
         // zoom 2× (full_h = 2·natural): code row y doubles, still no clip
         let body = leaf_text_body(
-            &leaf, 0.0, 0.0, 2.0 * natural, 960.0, 100_000.0, &mut mgr, &file_symbols,
+            &leaf, 0.0, 0.0, 2.0 * natural, 1280.0, 100_000.0, &mut mgr, &file_symbols,
         );
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - 2.0 * HEADER).abs() < 1e-3);
         // buffer unavailable → signature only, no code
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
         let body =
-            leaf_text_body(&leaf, 0.0, 0.0, natural, 480.0, 600.0, &mut broken, &BTreeMap::new());
+            leaf_text_body(&leaf, 0.0, 0.0, natural, 640.0, 600.0, &mut broken, &BTreeMap::new());
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two()");
     }
@@ -2619,7 +2619,7 @@ mod tests {
         rects.insert(root.id.clone(), Rect { x: 0.0, y: -1000.0, w: 4000.0, h: 4000.0 });
         rects.insert(mid_id, Rect { x: 10.0, y: -900.0, w: 3000.0, h: 3000.0 });
         rects.insert(anon_id, Rect { x: 20.0, y: -800.0, w: 2000.0, h: 2000.0 });
-        rects.insert(focus.clone(), Rect { x: 30.0, y: 0.0, w: 480.0, h: 200.0 });
+        rects.insert(focus.clone(), Rect { x: 30.0, y: 0.0, w: 640.0, h: 200.0 });
         let tree = SymbolTree { root, repo_root: std::path::PathBuf::from("/x") };
         (tree, PackLayout { rects }, focus)
     }
