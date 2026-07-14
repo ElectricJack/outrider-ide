@@ -19,7 +19,7 @@ Git churn is visualized as a heat stripe on each box, so you can immediately spo
 
 ## Build
 
-Requires Rust 1.80+.
+Requires Rust 1.89+.
 
 ```bash
 cargo build --release
@@ -62,6 +62,14 @@ Settings are stored in:
 - Windows: `%APPDATA%\outrider\settings.json`
 
 You can configure which file extensions and folders are filtered out of the treemap.
+
+### Cache behavior
+
+- The in-memory texture cache limit is global across projects.
+- The disk texture cache limit is configured per project and defaults to 1 GB for each project.
+- Texture and Git churn caches live under the operating system's cache directory.
+- Texture work prioritizes nodes currently visible in the viewport so useful project content appears sooner.
+- Outrider never writes cache files into repositories that it analyzes.
 
 ## License
 
