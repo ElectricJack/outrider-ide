@@ -2,17 +2,14 @@
 //! all input (mouse drag/zoom/click, keyboard navigation), and translates the
 //! world-space layout from `outrider-layout` into per-frame paint instructions
 //! (quads, text runs, and baked texture quads) via a static canvas closure.
-
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, BorderStyle,
-    Bounds, ContentMask, Context, Corners, ElementId, FocusHandle, Pixels, RenderImage, TextAlign,
-    TextRun, Window,
+    Bounds, ContentMask, Context, Corners, ElementId, FocusHandle, Pixels, TextAlign, TextRun,
+    Window,
 };
-use outrider_index::buffer::HighlightSpan;
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 use outrider_layout::{PackLayout, Rect};
 
@@ -21,6 +18,13 @@ use crate::camera::{self, Camera, CameraTween};
 use crate::chrome;
 use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
+use crate::interaction::InteractionAction;
+use crate::navigation::NavigationHistory;
+use crate::overlays::{ContextMenu, Notification, Notifications};
+use crate::paint_model::{
+    code_line, runs_from_spans, truncate_to_width, wrap_doc, BodyText, DocPanel, NameRow,
+    PaintItem, TexQuad,
+};
 use crate::palette;
 use crate::project_loader::{LoadProgress, LoadResult, LoaderPoll, ProjectLoader};
 use crate::rasterize::{self, TextureCache};
@@ -28,99 +32,11 @@ use crate::settings;
 use crate::theme;
 use crate::world::{self, Draw, LeafDraw, Rung};
 
-/// Approximate char budget for a column `w_px` wide at `font_px` monospace.
-/// 0.62 ≈ advance-width/em for common monospace faces; exactness is not
-/// required — worst case the ellipsis lands a character early.
-fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
-    // Add a small epsilon before flooring to absorb f32 rounding at exact integer
-    // boundaries (e.g. 10.0 * 0.62 * 12.0 in f32 is 9.999999 without it).
-    let budget = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
-    if budget < 2 {
-        return None; // no room for any text
-    }
-    let budget = budget as usize;
-    if name.chars().count() <= budget {
-        Some(name.to_string())
-    } else {
-        let cut: String = name.chars().take(budget - 1).collect();
-        Some(format!("{cut}…"))
-    }
-}
-
-/// Reflow a `///` doc block for the texture-tier overlay: source lines are
-/// joined into paragraphs (a blank line is a paragraph break), then each
-/// paragraph is greedy word-wrapped to the same char budget as
-/// `truncate_to_width`. Words longer than the budget are hard-split.
-fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
-    let budget = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
-    if budget < 2 {
-        return Vec::new();
-    }
-    let budget = budget as usize;
-    let mut rows = Vec::new();
-    for para in text.split("\n\n") {
-        let joined = para.split_whitespace().collect::<Vec<_>>().join(" ");
-        if joined.is_empty() {
-            continue;
-        }
-        let mut line = String::new();
-        let mut line_len = 0usize;
-        for word in joined.split(' ') {
-            let mut word = word;
-            let mut wlen = word.chars().count();
-            while wlen > budget {
-                if line_len > 0 {
-                    rows.push(std::mem::take(&mut line));
-                    line_len = 0;
-                }
-                let cut = word
-                    .char_indices()
-                    .nth(budget)
-                    .map_or(word.len(), |(i, _)| i);
-                rows.push(word[..cut].to_string());
-                word = &word[cut..];
-                wlen = word.chars().count();
-            }
-            if wlen == 0 {
-                continue;
-            }
-            let need = if line_len == 0 {
-                wlen
-            } else {
-                line_len + 1 + wlen
-            };
-            if need > budget {
-                rows.push(std::mem::take(&mut line));
-                line.push_str(word);
-                line_len = wlen;
-            } else {
-                if line_len > 0 {
-                    line.push(' ');
-                }
-                line.push_str(word);
-                line_len = need;
-            }
-        }
-        if line_len > 0 {
-            rows.push(line);
-        }
-    }
-    rows
-}
-
 /// Left text inset shared by name rows and body rows.
 pub(crate) const BODY_PAD: f64 = 6.0;
 
 /// Width of the floating doc panel shown to the right of the focused leaf.
 const DOC_PANEL_W: f64 = 280.0;
-
-/// State for the right-click context menu popup.
-struct ContextMenu {
-    /// Position (window coords) at which the menu was opened.
-    position: gpui::Point<Pixels>,
-    /// The tree node that was right-clicked.
-    target: SymbolId,
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsField {
@@ -281,10 +197,8 @@ pub struct TreemapView {
     neighbors: Option<(SymbolId, [Option<SymbolId>; 4])>,
     /// Leaf node currently under the mouse cursor (for doc tooltip).
     hover_id: Option<SymbolId>,
-    /// Ordered list of focused SymbolIds visited via Enter/Esc/click (not arrow keys).
-    nav_history: Vec<SymbolId>,
-    /// Index into `nav_history` of the currently displayed location.
-    nav_cursor: usize,
+    /// Browser-style history of explicit focus visits (not arrow-key movement).
+    nav_history: NavigationHistory,
     /// Search palette (Ctrl+P = file mode, Ctrl+T = symbol mode).
     palette: palette::Palette,
     /// Persisted user preferences.
@@ -294,121 +208,12 @@ pub struct TreemapView {
     /// Working copy of settings while the settings panel is open.
     settings_draft: Option<SettingsDraft>,
     /// Recoverable settings load/save and validation feedback.
-    settings_notification: Option<String>,
+    notifications: Notifications,
     /// Right-click context menu, if currently open.
     context_menu: Option<ContextMenu>,
     /// Background indexing controller (Open Folder, startup, or re-index).
     loader: ProjectLoader,
     load_progress: Option<LoadProgress>,
-}
-
-/// One shaped body/code line: canvas position, text, and colored runs.
-struct BodyText {
-    x: f32,
-    y: f32,
-    text: String,
-    runs: Vec<(usize, u32)>,
-}
-
-/// A name row — pinned at 12px (containers, Label leaves) or scaled with a
-/// leaf page (Text leaves).
-struct NameRow {
-    x: f32,
-    y: f32,
-    font_px: f32,
-    text: String,
-}
-
-/// One baked-texture quad for a far-zoom leaf (replaces minimap bars).
-struct TexQuad {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    image: Arc<RenderImage>,
-}
-
-/// Floating doc-description panel shown to the right of the focused leaf.
-struct DocPanel {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    rows: Vec<BodyText>,
-}
-
-/// Owned, GPUI-free paint instruction — built in render (which may borrow
-/// self), moved into the 'static canvas closure.
-struct PaintItem {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    fill: u32,
-    border: u32,
-    stripe: Option<u32>,
-    focused: bool,
-    /// One of the four arrow-key targets — painted with a dimmed focus border.
-    neighbor: bool,
-    /// Font size for body rows: FONT_PX·scale for a Text leaf, else 12.0.
-    body_font_px: f32,
-    /// Height of an opaque header-background band painted behind container
-    /// name + body text so children's boxes don't occlude the header.
-    header_bg_h: f32,
-    /// Y coordinate for the header background (may differ from `y` when
-    /// nested pinned headers are stacked).
-    header_bg_y: f32,
-    /// Opacity for body text (0..1); used for the Texture→Text fade.
-    body_opacity: f32,
-    /// Opacity for the baked texture quad (0..1); inverse of body_opacity in the fade zone.
-    tex_opacity: f32,
-    name: Option<NameRow>,
-    body: Vec<BodyText>,
-    tex: Option<TexQuad>,
-}
-
-/// Full-coverage colored runs for the first `len` bytes of a line from its
-/// highlight spans; gaps paint TEXT_PRIMARY. Run lengths sum exactly to `len`.
-pub(crate) fn runs_from_spans(len: usize, spans: &[HighlightSpan]) -> Vec<(usize, u32)> {
-    let mut runs = Vec::new();
-    let mut pos = 0;
-    for s in spans {
-        let start = s.range.start.min(len);
-        let end = s.range.end.min(len);
-        if start > pos {
-            runs.push((start - pos, theme::TEXT_PRIMARY));
-        }
-        if end > start {
-            runs.push((end - start, theme::syntax_color(s.kind)));
-        }
-        pos = pos.max(end);
-    }
-    if pos < len {
-        runs.push((len - pos, theme::TEXT_PRIMARY));
-    }
-    runs
-}
-
-/// Truncate a code line to the box width, clipping its runs to the kept
-/// bytes; a trailing ellipsis paints TEXT_PRIMARY.
-fn code_line(
-    text: &str,
-    spans: &[HighlightSpan],
-    w: f32,
-    font_px: f32,
-) -> Option<(String, Vec<(usize, u32)>)> {
-    let shown = truncate_to_width(text, w, font_px)?;
-    let truncated = shown != text;
-    let kept = if truncated {
-        shown.len() - '…'.len_utf8()
-    } else {
-        shown.len()
-    };
-    let mut runs = runs_from_spans(kept, spans);
-    if truncated {
-        runs.push(('…'.len_utf8(), theme::TEXT_PRIMARY));
-    }
-    Some((shown, runs))
 }
 
 /// Content-table rows for a container, pinned to `pin_y` (which may be
@@ -599,35 +404,6 @@ fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     }
 }
 
-const NAV_HISTORY_CAP: usize = 64;
-
-fn nav_push_to(hist: &mut Vec<SymbolId>, cursor: &mut usize, id: SymbolId) {
-    hist.truncate(*cursor + 1);
-    hist.push(id);
-    *cursor = hist.len() - 1;
-    if hist.len() > NAV_HISTORY_CAP {
-        let excess = hist.len() - NAV_HISTORY_CAP;
-        hist.drain(..excess);
-        *cursor -= excess;
-    }
-}
-
-fn nav_back_cursor(_hist: &[SymbolId], cursor: usize) -> Option<usize> {
-    if cursor == 0 {
-        None
-    } else {
-        Some(cursor - 1)
-    }
-}
-
-fn nav_forward_cursor(hist: &[SymbolId], cursor: usize) -> Option<usize> {
-    if cursor + 1 >= hist.len() {
-        None
-    } else {
-        Some(cursor + 1)
-    }
-}
-
 fn resolve_fs_path(id: &SymbolId, repo_root: &std::path::Path) -> std::path::PathBuf {
     let rel = match id.kind {
         SymbolKind::Folder => id.qualified_path.as_str(),
@@ -674,6 +450,12 @@ fn loading_texture_cache() -> Option<TextureCache> {
 
 /// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
+    fn apply_action(&mut self, action: InteractionAction) {
+        match action {
+            InteractionAction::DismissNotification => self.notifications.dismiss_visible(),
+        }
+    }
+
     /// Construct a responsive shell and begin indexing only after GPUI has
     /// entered its application callback.
     pub fn loading_shell(
@@ -732,6 +514,10 @@ impl TreemapView {
         let file_symbols = collect_file_symbols(&tree);
         let buffers = BufferManager::new(tree.repo_root.clone());
         let show_welcome = settings.show_welcome;
+        let mut notifications = Notifications::default();
+        if let Some(message) = settings_notification {
+            notifications.push(Notification::warning(message));
+        }
         Self {
             tree,
             layout,
@@ -748,13 +534,12 @@ impl TreemapView {
             bake_pending: false,
             neighbors: None,
             hover_id: None,
-            nav_history: vec![root_id],
-            nav_cursor: 0,
+            nav_history: NavigationHistory::new(root_id, 64),
             palette: palette::Palette::new(),
             settings,
             show_welcome,
             settings_draft: None,
-            settings_notification,
+            notifications,
             context_menu: None,
             loader: ProjectLoader::new(),
             load_progress: None,
@@ -1350,7 +1135,9 @@ impl TreemapView {
                             let (settings, warning) =
                                 crate::settings::Settings::load().into_parts();
                             this.settings = settings;
-                            this.settings_notification = warning;
+                            if let Some(message) = warning {
+                                this.notifications.push(Notification::warning(message));
+                            }
                             this.start_loading(folder);
                         }
                         cx.notify();
@@ -1448,11 +1235,7 @@ impl TreemapView {
         if let Some(id) = hit {
             let index = TreeIndex::new(&self.tree);
             if self.focus.set(id, &index) {
-                nav_push_to(
-                    &mut self.nav_history,
-                    &mut self.nav_cursor,
-                    self.focus.current.clone(),
-                );
+                self.nav_history.push(self.focus.current.clone());
             }
             cx.notify();
         }
@@ -1630,11 +1413,7 @@ impl TreemapView {
                     self.palette.close();
                     let index = TreeIndex::new(&self.tree);
                     if self.focus.set(id, &index) {
-                        nav_push_to(
-                            &mut self.nav_history,
-                            &mut self.nav_cursor,
-                            self.focus.current.clone(),
-                        );
+                        self.nav_history.push(self.focus.current.clone());
                     }
                     let (vw, vh) = Self::map_viewport(window);
                     let max_zoom = camera::MAX_ZOOM;
@@ -1687,22 +1466,14 @@ impl TreemapView {
                 if !self.focus.step_in(&index) {
                     return;
                 }
-                nav_push_to(
-                    &mut self.nav_history,
-                    &mut self.nav_cursor,
-                    self.focus.current.clone(),
-                );
+                self.nav_history.push(self.focus.current.clone());
                 self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
             }
             "escape" => {
                 if !self.focus.step_out(&index) {
                     return;
                 }
-                nav_push_to(
-                    &mut self.nav_history,
-                    &mut self.nav_cursor,
-                    self.focus.current.clone(),
-                );
+                self.nav_history.push(self.focus.current.clone());
                 self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
             }
             "end" => self
@@ -1721,22 +1492,18 @@ impl TreemapView {
                 Some(c)
             }
             "left" if e.keystroke.modifiers.alt => {
-                let Some(c) = nav_back_cursor(&self.nav_history, self.nav_cursor) else {
+                let Some(id) = self.nav_history.back().cloned() else {
                     return;
                 };
-                self.nav_cursor = c;
-                let id = self.nav_history[c].clone();
                 self.focus.current = id;
                 self.focus.record_visit(&index);
                 self.neighbors = None;
                 self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
             }
             "right" if e.keystroke.modifiers.alt => {
-                let Some(c) = nav_forward_cursor(&self.nav_history, self.nav_cursor) else {
+                let Some(id) = self.nav_history.forward().cloned() else {
                     return;
                 };
-                self.nav_cursor = c;
-                let id = self.nav_history[c].clone();
                 self.focus.current = id;
                 self.focus.record_visit(&index);
                 self.neighbors = None;
@@ -1800,7 +1567,9 @@ impl TreemapView {
                 }
                 Err(error) => {
                     self.load_progress = None;
-                    self.settings_notification = Some(format!("Could not open project: {error}"));
+                    self.notifications.push(Notification::warning(format!(
+                        "Could not open project: {error}"
+                    )));
                     true
                 }
             },
@@ -1821,8 +1590,7 @@ impl TreemapView {
         self.buffers = BufferManager::new(project_root.clone());
         let root_id = tree.root.id.clone();
         self.focus = Focus::new(root_id.clone());
-        self.nav_history = vec![root_id];
-        self.nav_cursor = 0;
+        self.nav_history = NavigationHistory::new(root_id, 64);
         self.neighbors = None;
         self.hover_id = None;
         self.camera = None;
@@ -1837,83 +1605,9 @@ impl TreemapView {
             self.settings.disk_cache_bytes(&project_root),
         ));
         if !warnings.is_empty() {
-            self.settings_notification = Some(warnings.join("; "));
+            self.notifications
+                .push(Notification::warning(warnings.join("; ")));
         }
-    }
-
-    /// Render the loading progress overlay.
-    fn render_loading(&self, vw: f64) -> gpui::Div {
-        let state = self.load_progress.as_ref().unwrap();
-        let phase = state.phase;
-        let total = state.files_total;
-        let parsed = state.files_parsed;
-
-        let (status_text, fraction) = match phase {
-            0 => ("Scanning files…".to_string(), 0.0_f32),
-            1 => {
-                if total > 0 {
-                    let frac = parsed as f32 / total as f32;
-                    (format!("Parsing {parsed}/{total} files…"), frac)
-                } else {
-                    ("Parsing…".to_string(), 0.0)
-                }
-            }
-            2 => ("Building symbol tree…".to_string(), 1.0),
-            _ => ("Done".to_string(), 1.0),
-        };
-
-        let bar_w = 300.0_f32.min(vw as f32 - 80.0);
-        let fill_w = bar_w * fraction;
-
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x00000088))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(16.0))
-                    .px(px(40.0))
-                    .py(px(32.0))
-                    .bg(rgb(theme::CODE_BG))
-                    .border_1()
-                    .border_color(rgb(theme::border_for(theme::CODE_BG)))
-                    .rounded(px(8.0))
-                    .text_color(rgb(theme::TEXT_PRIMARY))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .child(
-                        div()
-                            .text_size(px(16.0))
-                            .child(format!("Indexing {}…", state.folder_name)),
-                    )
-                    .child(
-                        div()
-                            .w(px(bar_w))
-                            .h(px(6.0))
-                            .rounded(px(3.0))
-                            .bg(rgb(0x333340))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(px(fill_w))
-                                    .rounded(px(3.0))
-                                    .bg(rgb(theme::FOCUS_BORDER)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(theme::TEXT_SECONDARY))
-                            .child(status_text),
-                    ),
-            )
     }
 
     /// Build the right-click context menu popup positioned at the click site.
@@ -1939,68 +1633,47 @@ impl TreemapView {
         let copy_name_str = node_name.clone();
         let open_path = fs_path.clone();
 
-        let row = |id: &'static str, label: &'static str| {
-            div()
-                .id(ElementId::Name(id.into()))
-                .px(px(12.0))
-                .py(px(7.0))
-                .text_size(px(13.0))
-                .font_family(theme::FONT_FAMILY_SANS)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(0x2a3040_u32)))
-                .child(label)
-        };
-
-        let menu_div = div()
-            .absolute()
-            .top(px(y))
-            .left(px(x))
-            .w(px(210.0))
-            .bg(rgb(theme::CODE_BG))
-            .border_1()
-            .border_color(rgb(theme::FOCUS_BORDER))
-            .rounded(px(4.0))
-            .overflow_hidden()
-            .shadow_lg()
-            .child(
-                row("ctx-open-fm", "Open File Location").on_click(cx.listener(
-                    move |this, _e, _w, cx| {
-                        open_in_file_manager(&open_path);
-                        this.context_menu = None;
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(
-                row("ctx-copy-rel", "Copy Relative Path").on_click(cx.listener(
-                    move |this, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                            copy_rel_str.clone(),
-                        ));
-                        this.context_menu = None;
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(
-                row("ctx-copy-abs", "Copy Absolute Path").on_click(cx.listener(
-                    move |this, _e, _w, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                            copy_abs_str.clone(),
-                        ));
-                        this.context_menu = None;
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(row("ctx-copy-name", "Copy Name").on_click(cx.listener(
-                move |this, _e, _w, cx| {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_name_str.clone()));
-                    this.context_menu = None;
-                    cx.notify();
-                },
-            )));
+        let menu_div =
+            crate::overlays::context_menu_shell(x, y)
+                .child(
+                    crate::overlays::context_menu_row("ctx-open-fm", "Open File Location")
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            open_in_file_manager(&open_path);
+                            this.context_menu = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    crate::overlays::context_menu_row("ctx-copy-rel", "Copy Relative Path")
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_rel_str.clone(),
+                            ));
+                            this.context_menu = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    crate::overlays::context_menu_row("ctx-copy-abs", "Copy Absolute Path")
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_abs_str.clone(),
+                            ));
+                            this.context_menu = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    crate::overlays::context_menu_row("ctx-copy-name", "Copy Name").on_click(
+                        cx.listener(move |this, _e, _w, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_name_str.clone(),
+                            ));
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    ),
+                );
 
         Some(menu_div)
     }
@@ -2008,368 +1681,102 @@ impl TreemapView {
     /// Build the settings overlay div (absolutely positioned, centered).
     /// Shows current filter settings read-only with action buttons.
     fn render_settings_window(&self, map_w: f64, cx: &mut Context<Self>) -> gpui::Div {
-        const SETTINGS_W: f32 = 600.0;
-        let left_offset = ((map_w as f32 - SETTINGS_W) / 2.0).max(0.0);
         let draft = self.settings_draft.as_ref().unwrap();
-
-        let field_border = |active: bool| -> u32 {
-            if active {
-                theme::FOCUS_BORDER
-            } else {
-                0x333340
-            }
-        };
-
-        let ext_active = draft.active == SettingsField::Extensions;
-        let folder_active = draft.active == SettingsField::Folders;
-        let cache_active = draft.active == SettingsField::CacheMb;
-        let disk_active = draft.active == SettingsField::DiskCacheGb;
-
-        let ext_text = if ext_active {
-            format!("{}|", draft.filter_extensions)
-        } else {
-            draft.filter_extensions.clone()
-        };
-        let folder_text = if folder_active {
-            format!("{}|", draft.filter_folders)
-        } else {
-            draft.filter_folders.clone()
-        };
-        let cache_text = if cache_active {
-            format!("{}|", draft.cache_mb)
-        } else {
-            draft.cache_mb.clone()
-        };
-        let disk_text = if disk_active {
-            format!("{}|", draft.disk_cache_gb)
-        } else {
-            draft.disk_cache_gb.clone()
-        };
-
-        let settings_field =
-            |id: &str, label: &str, text: String, active: bool, field: SettingsField| {
-                div()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(theme::FOCUS_BORDER))
-                            .pb(px(4.0))
-                            .child(label.to_string()),
-                    )
-                    .child(
-                        div()
-                            .id(ElementId::Name(id.to_string().into()))
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .mb(px(12.0))
-                            .bg(rgb(0x1a1d21_u32))
-                            .border_1()
-                            .border_color(rgb(field_border(active)))
-                            .rounded(px(3.0))
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .font_family(theme::FONT_FAMILY)
-                            .text_color(rgb(if active {
-                                theme::TEXT_PRIMARY
-                            } else {
-                                theme::TEXT_SECONDARY
-                            }))
-                            .child(text)
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                if let Some(d) = &mut this.settings_draft {
-                                    d.active = field;
-                                }
-                                cx.notify();
-                            })),
-                    )
+        let field = |kind: SettingsField, text: String| {
+            let (id, label) = match kind {
+                SettingsField::Extensions => {
+                    ("field-extensions", "Filtered Extensions (comma-separated):")
+                }
+                SettingsField::Folders => ("field-folders", "Filtered Folders (comma-separated):"),
+                SettingsField::CacheMb => ("field-cache-mb", "Texture Cache (MB):"),
+                SettingsField::DiskCacheGb => ("field-disk-cache-gb", "Project Disk Cache (GiB):"),
             };
-
-        // Backdrop blocks map interaction
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .bg(rgba(0x00000066))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(80.0))
-                    .left(px(left_offset))
-                    .w(px(SETTINGS_W))
-                    .bg(rgb(theme::CODE_BG))
-                    .border_1()
-                    .border_color(rgb(theme::FOCUS_BORDER))
-                    .rounded(px(6.0))
-                    .overflow_hidden()
-                    .px(px(24.0))
-                    .py(px(20.0))
-                    .child(
-                        div()
-                            .text_size(px(18.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(theme::TEXT_PRIMARY))
-                            .pb(px(14.0))
-                            .child("Settings"),
-                    )
-                    .child(settings_field(
-                        "field-extensions",
-                        "Filtered Extensions (comma-separated):",
-                        ext_text,
-                        ext_active,
-                        SettingsField::Extensions,
-                    ))
-                    .child(settings_field(
-                        "field-folders",
-                        "Filtered Folders (comma-separated):",
-                        folder_text,
-                        folder_active,
-                        SettingsField::Folders,
-                    ))
-                    .child(settings_field(
-                        "field-cache-mb",
-                        "Texture Cache (MB):",
-                        cache_text,
-                        cache_active,
-                        SettingsField::CacheMb,
-                    ))
-                    .child(settings_field(
-                        "field-disk-cache-gb",
-                        "Project Disk Cache (GiB):",
-                        disk_text,
-                        disk_active,
-                        SettingsField::DiskCacheGb,
-                    ))
-                    .children(draft.notification.as_ref().map(|message| {
-                        div()
-                            .text_size(px(12.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(0xff8a80_u32))
-                            .pb(px(12.0))
-                            .child(message.clone())
-                    }))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_family(theme::FONT_FAMILY)
-                            .text_color(rgb(theme::TEXT_SECONDARY))
-                            .pb(px(14.0))
-                            .child("Tab to switch fields. Type to edit. Esc to cancel."),
-                    )
-                    .child(div().h(px(1.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .id(ElementId::Name("settings-save".into()))
-                                    .px(px(14.0))
-                                    .py(px(7.0))
-                                    .bg(rgb(theme::FOCUS_BORDER))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .text_size(px(13.0))
-                                    .font_family(theme::FONT_FAMILY_SANS)
-                                    .text_color(rgb(0x000000_u32))
-                                    .child("Save & Close")
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        if let Some(mut draft) = this.settings_draft.take() {
-                                            let mut candidate = this.settings.clone();
-                                            let result = draft
-                                                .apply_to(&mut candidate, &this.tree.repo_root)
-                                                .and_then(|()| candidate.save());
-                                            match result {
-                                                Ok(()) => {
-                                                    this.settings = candidate;
-                                                    this.reindex();
-                                                }
-                                                Err(message) => {
-                                                    draft.notification = Some(message);
-                                                    this.settings_draft = Some(draft);
-                                                }
-                                            }
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(ElementId::Name("settings-reset".into()))
-                                    .px(px(14.0))
-                                    .py(px(7.0))
-                                    .border_1()
-                                    .border_color(rgb(theme::TEXT_SECONDARY))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .text_size(px(13.0))
-                                    .font_family(theme::FONT_FAMILY_SANS)
-                                    .text_color(rgb(theme::TEXT_SECONDARY))
-                                    .child("Reset to Defaults")
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        let defaults = settings::Settings::default();
-                                        match defaults.save() {
-                                            Ok(()) => {
-                                                this.settings = defaults;
-                                                this.settings_draft = None;
-                                                this.reindex();
-                                            }
-                                            Err(message) => {
-                                                if let Some(draft) = &mut this.settings_draft {
-                                                    draft.notification = Some(message);
-                                                }
-                                            }
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(ElementId::Name("settings-cancel".into()))
-                                    .px(px(14.0))
-                                    .py(px(7.0))
-                                    .border_1()
-                                    .border_color(rgb(theme::TEXT_SECONDARY))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .text_size(px(13.0))
-                                    .font_family(theme::FONT_FAMILY_SANS)
-                                    .text_color(rgb(theme::TEXT_SECONDARY))
-                                    .child("Cancel")
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.settings_draft = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
+            let active = draft.active == kind;
+            let text = if active { format!("{text}|") } else { text };
+            crate::overlays::labeled_field(
+                label,
+                crate::overlays::settings_input(id, text, active).on_click(cx.listener(
+                    move |this, _event, _window, cx| {
+                        if let Some(draft) = &mut this.settings_draft {
+                            draft.active = kind;
+                        }
+                        cx.notify();
+                    },
+                )),
             )
+        };
+        let fields = vec![
+            field(SettingsField::Extensions, draft.filter_extensions.clone()),
+            field(SettingsField::Folders, draft.filter_folders.clone()),
+            field(SettingsField::CacheMb, draft.cache_mb.clone()),
+            field(SettingsField::DiskCacheGb, draft.disk_cache_gb.clone()),
+        ];
+        let validation = draft.notification.clone();
+        let save = crate::overlays::action_button("settings-save", "Save & Close", true).on_click(
+            cx.listener(|this, _event, _window, cx| {
+                if let Some(mut draft) = this.settings_draft.take() {
+                    let mut candidate = this.settings.clone();
+                    let result = draft
+                        .apply_to(&mut candidate, &this.tree.repo_root)
+                        .and_then(|()| candidate.save());
+                    match result {
+                        Ok(()) => {
+                            this.settings = candidate;
+                            this.reindex();
+                        }
+                        Err(message) => {
+                            draft.notification = Some(message);
+                            this.settings_draft = Some(draft);
+                        }
+                    }
+                }
+                cx.notify();
+            }),
+        );
+        let reset = crate::overlays::action_button("settings-reset", "Reset to Defaults", false)
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                let defaults = settings::Settings::default();
+                match defaults.save() {
+                    Ok(()) => {
+                        this.settings = defaults;
+                        this.settings_draft = None;
+                        this.reindex();
+                    }
+                    Err(message) => {
+                        if let Some(draft) = &mut this.settings_draft {
+                            draft.notification = Some(message);
+                        }
+                    }
+                }
+                cx.notify();
+            }));
+        let cancel = crate::overlays::action_button("settings-cancel", "Cancel", false).on_click(
+            cx.listener(|this, _event, _window, cx| {
+                this.settings_draft = None;
+                cx.notify();
+            }),
+        );
+        crate::overlays::settings_element(map_w, fields, validation, vec![save, reset, cancel])
     }
-
     /// Build the welcome screen overlay div (absolutely positioned, centered).
     /// `map_w` is the map viewport width in logical pixels.
     fn render_welcome(&self, map_w: f64, cx: &mut Context<Self>) -> gpui::Div {
-        const WELCOME_W: f32 = 600.0;
-        let left_offset = ((map_w as f32 - WELCOME_W) / 2.0).max(0.0);
-
-        // Keybinding table rows: (key, action)
-        let keybindings: &[(&str, &str)] = &[
-            ("Enter / Esc", "Step into / out of focused node"),
-            ("Arrow keys", "Move focus spatially"),
-            ("Alt+Left / Alt+Right", "Navigate history back / forward"),
-            ("Home", "Reset camera to fit all nodes"),
-            ("End", "Frame the focused node"),
-            ("Scroll", "Zoom in / out at cursor"),
-            ("Click", "Set focus"),
-            ("Drag", "Pan the view"),
-            ("Ctrl+P", "Open file palette"),
-            ("Ctrl+T", "Open symbol palette"),
-            ("Ctrl+Shift+E", "Open focused file in file manager"),
-        ];
-
-        let rows: Vec<_> = keybindings
-            .iter()
-            .map(|(key, action)| {
-                div()
-                    .flex()
-                    .flex_row()
-                    .py(px(3.0))
-                    .child(
-                        div()
-                            .w(px(200.0))
-                            .text_size(px(12.0))
-                            .font_family(theme::FONT_FAMILY)
-                            .text_color(rgb(theme::FOCUS_BORDER))
-                            .child(*key),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(theme::TEXT_PRIMARY))
-                            .child(*action),
-                    )
-            })
-            .collect();
-
-        div()
-            .absolute()
-            .top(px(80.0))
-            .left(px(left_offset))
-            .w(px(WELCOME_W))
-            .bg(rgb(theme::CODE_BG))
-            .border_1()
-            .border_color(rgb(theme::FOCUS_BORDER))
-            .rounded(px(6.0))
-            .overflow_hidden()
-            .px(px(24.0))
-            .py(px(20.0))
-            // Title
-            .child(
-                div()
-                    .text_size(px(18.0))
-                    .font_family(theme::FONT_FAMILY_SANS)
-                    .text_color(rgb(theme::TEXT_PRIMARY))
-                    .pb(px(14.0))
-                    .child("Welcome to Outrider"),
-            )
-            // Keybinding rows
-            .children(rows)
-            // Separator
-            .child(
-                div()
-                    .h(px(1.0))
-                    .mt(px(14.0))
-                    .mb(px(14.0))
-                    .bg(rgb(0x2a2d32_u32)),
-            )
-            // Buttons row
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(10.0))
-                    // "Got it" button — dismiss for this session only
-                    .child(
-                        div()
-                            .id(ElementId::Name("welcome-got-it".into()))
-                            .px(px(14.0))
-                            .py(px(7.0))
-                            .bg(rgb(theme::FOCUS_BORDER))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_size(px(13.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(0x000000_u32))
-                            .child("Got it")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.show_welcome = false;
-                                cx.notify();
-                            })),
-                    )
-                    // "Don't show again" button — persists to settings
-                    .child(
-                        div()
-                            .id(ElementId::Name("welcome-no-show".into()))
-                            .px(px(14.0))
-                            .py(px(7.0))
-                            .border_1()
-                            .border_color(rgb(theme::TEXT_SECONDARY))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_size(px(13.0))
-                            .font_family(theme::FONT_FAMILY_SANS)
-                            .text_color(rgb(theme::TEXT_SECONDARY))
-                            .child("Don't show again")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.show_welcome = false;
-                                this.settings.show_welcome = false;
-                                this.settings_notification = this.settings.save().err();
-                                cx.notify();
-                            })),
-                    ),
-            )
+        let got_it = crate::overlays::action_button("welcome-got-it", "Got it", true).on_click(
+            cx.listener(|this, _event, _window, cx| {
+                this.show_welcome = false;
+                cx.notify();
+            }),
+        );
+        let no_show = crate::overlays::action_button("welcome-no-show", "Don't show again", false)
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.show_welcome = false;
+                this.settings.show_welcome = false;
+                if let Err(message) = this.settings.save() {
+                    this.notifications.push(Notification::warning(message));
+                }
+                cx.notify();
+            }));
+        crate::overlays::welcome_element(map_w, vec![got_it, no_show])
     }
 }
 
@@ -2415,23 +1822,18 @@ impl Render for TreemapView {
         let context_menu_overlay = self.render_context_menu(cx);
 
         // Build the loading overlay if indexing in background.
-        let loading_overlay = is_loading.then(|| self.render_loading(vw));
-        let settings_notification = self.settings_notification.as_ref().map(|message| {
-            div()
-                .absolute()
-                .top(px(12.0))
-                .left(px(12.0))
-                .right(px(12.0))
-                .px(px(12.0))
-                .py(px(8.0))
-                .bg(rgb(0x3a2020_u32))
-                .border_1()
-                .border_color(rgb(0xff8a80_u32))
-                .rounded(px(4.0))
-                .text_size(px(12.0))
-                .font_family(theme::FONT_FAMILY_SANS)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(message.clone())
+        let loading_overlay = self
+            .load_progress
+            .as_ref()
+            .filter(|_| is_loading)
+            .map(|progress| crate::overlays::loading_element(progress, vw));
+        let notification_overlay = self.notifications.visible().map(|notification| {
+            crate::overlays::notification_element(notification).on_click(cx.listener(
+                |this, _event, _window, cx| {
+                    this.apply_action(InteractionAction::DismissNotification);
+                    cx.notify();
+                },
+            ))
         });
 
         let title = self.window_title();
@@ -2733,7 +2135,7 @@ impl Render for TreemapView {
             .children(welcome_overlay)
             .children(context_menu_overlay)
             .children(loading_overlay)
-            .children(settings_notification);
+            .children(notification_overlay);
 
         div()
             .relative()
@@ -3342,118 +2744,6 @@ mod tests {
     #[test]
     fn wrap_doc_returns_nothing_when_no_room() {
         assert!(wrap_doc("anything", 13.0, 12.0).is_empty());
-    }
-
-    #[test]
-    fn nav_history_push_and_back() {
-        use super::{nav_back_cursor, nav_push_to};
-        let ids: Vec<SymbolId> = (0..4)
-            .map(|i| SymbolId {
-                kind: SymbolKind::File,
-                qualified_path: format!("f{i}.rs"),
-                ordinal: 0,
-            })
-            .collect();
-        let mut hist = vec![ids[0].clone()];
-        let mut cursor: usize = 0;
-
-        // push 3 more
-        for id in &ids[1..] {
-            nav_push_to(&mut hist, &mut cursor, id.clone());
-        }
-        assert_eq!(hist.len(), 4);
-        assert_eq!(cursor, 3);
-
-        // back twice
-        cursor = nav_back_cursor(&hist, cursor).unwrap();
-        assert_eq!(cursor, 2);
-        assert_eq!(hist[cursor], ids[2]);
-        cursor = nav_back_cursor(&hist, cursor).unwrap();
-        assert_eq!(cursor, 1);
-
-        // back at beginning is None
-        cursor = nav_back_cursor(&hist, cursor).unwrap();
-        assert_eq!(cursor, 0);
-        assert!(nav_back_cursor(&hist, cursor).is_none());
-    }
-
-    #[test]
-    fn nav_history_forward_after_back() {
-        use super::{nav_back_cursor, nav_forward_cursor, nav_push_to};
-        let ids: Vec<SymbolId> = (0..3)
-            .map(|i| SymbolId {
-                kind: SymbolKind::File,
-                qualified_path: format!("f{i}.rs"),
-                ordinal: 0,
-            })
-            .collect();
-        let mut hist = vec![ids[0].clone()];
-        let mut cursor: usize = 0;
-        for id in &ids[1..] {
-            nav_push_to(&mut hist, &mut cursor, id.clone());
-        }
-        // back to f1
-        cursor = nav_back_cursor(&hist, cursor).unwrap();
-        assert_eq!(hist[cursor], ids[1]);
-        // forward to f2
-        cursor = nav_forward_cursor(&hist, cursor).unwrap();
-        assert_eq!(cursor, 2);
-        assert_eq!(hist[cursor], ids[2]);
-        // forward at end is None
-        assert!(nav_forward_cursor(&hist, cursor).is_none());
-    }
-
-    #[test]
-    fn nav_history_push_truncates_forward() {
-        use super::{nav_back_cursor, nav_push_to};
-        let ids: Vec<SymbolId> = (0..4)
-            .map(|i| SymbolId {
-                kind: SymbolKind::File,
-                qualified_path: format!("f{i}.rs"),
-                ordinal: 0,
-            })
-            .collect();
-        let mut hist = vec![ids[0].clone()];
-        let mut cursor: usize = 0;
-        for id in &ids[1..3] {
-            nav_push_to(&mut hist, &mut cursor, id.clone());
-        }
-        // back to f0
-        cursor = nav_back_cursor(&hist, cursor).unwrap();
-        cursor = nav_back_cursor(&hist, cursor).unwrap();
-        // push f3 — truncates f1, f2
-        nav_push_to(&mut hist, &mut cursor, ids[3].clone());
-        assert_eq!(hist.len(), 2);
-        assert_eq!(hist[0], ids[0]);
-        assert_eq!(hist[1], ids[3]);
-        assert_eq!(cursor, 1);
-    }
-
-    #[test]
-    fn nav_history_caps_at_64() {
-        use super::nav_push_to;
-        let mut hist = vec![SymbolId {
-            kind: SymbolKind::File,
-            qualified_path: "f0.rs".into(),
-            ordinal: 0,
-        }];
-        let mut cursor: usize = 0;
-        for i in 1..=70 {
-            nav_push_to(
-                &mut hist,
-                &mut cursor,
-                SymbolId {
-                    kind: SymbolKind::File,
-                    qualified_path: format!("f{i}.rs"),
-                    ordinal: 0,
-                },
-            );
-        }
-        assert_eq!(hist.len(), 64);
-        // cursor points to the most recent entry
-        assert_eq!(cursor, 63);
-        // oldest was dropped — first entry is no longer f0
-        assert_ne!(hist[0].qualified_path, "f0.rs");
     }
 
     #[test]
