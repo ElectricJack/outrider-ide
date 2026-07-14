@@ -344,6 +344,10 @@ fn leaf_tex_rect(node: &SymbolNode, left: f64, top: f64, full_h: f64) -> (f64, f
     )
 }
 
+fn container_header_px(zoom: f64) -> f64 {
+    ((HEADER + 2.0 * LINE_STEP) * zoom.min(1.0)).max(HEADER)
+}
+
 /// Predicted height of the pinned ancestor-header stack above `focus` under
 /// camera `cam`, mirroring paint_items' stacking: each named ancestor's
 /// header pins at max(its screen top clamped to the viewport, the previous
@@ -357,7 +361,7 @@ fn pinned_stack_h(
     vw: f64,
     vh: f64,
 ) -> f64 {
-    let hdr = (HEADER + 2.0 * LINE_STEP) * cam.zoom.min(1.0);
+    let hdr = container_header_px(cam.zoom);
     let mut chain = Vec::new();
     let mut id = focus;
     while let Some(p) = index.parent(id) {
@@ -760,7 +764,7 @@ impl TreemapView {
                 Draw::Container(rung) => {
                     let stack_bottom = header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
                     let pin_y = item.px.y.max(stack_bottom);
-                    let ch_px = (HEADER + 2.0 * LINE_STEP) * camera.zoom;
+                    let ch_px = container_header_px(camera.zoom);
                     if rung != Rung::Dot && item.px.h >= 14.0 {
                         name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
                     }
@@ -2312,8 +2316,8 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
-        truncate_to_width, wrap_doc, HEADER, LINE_STEP,
+        code_line, container_body, container_header_px, leaf_tex_rect, leaf_text_body,
+        runs_from_spans, truncate_to_width, wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2620,6 +2624,15 @@ mod tests {
     use outrider_index::SymbolTree;
     use outrider_layout::{PackLayout, Rect};
 
+    #[test]
+    fn container_header_never_collapses_below_one_line() {
+        let natural = HEADER + 2.0 * LINE_STEP;
+        assert!((container_header_px(1.0) - natural).abs() < 1e-9);
+        assert!((container_header_px(0.5) - natural * 0.5).abs() < 1e-9);
+        assert!((container_header_px(0.1) - HEADER).abs() < 1e-9);
+        assert!((container_header_px(0.0) - HEADER).abs() < 1e-9);
+    }
+
     fn screen_y(cam: &Camera, wy: f64, vh: f64) -> f64 {
         (wy - cam.center_y) * cam.zoom + vh / 2.0
     }
@@ -2748,6 +2761,13 @@ mod tests {
         };
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
         assert!((h - hdr).abs() < 1e-9);
+        let cam = Camera {
+            center_x: 0.0,
+            center_y: 3000.0,
+            zoom: 0.1,
+        };
+        let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
+        assert!((h - 2.0 * HEADER).abs() < 1e-9);
     }
 
     #[test]
