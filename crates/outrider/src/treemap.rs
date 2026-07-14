@@ -344,6 +344,7 @@ fn leaf_tex_rect(node: &SymbolNode, left: f64, top: f64, full_h: f64) -> (f64, f
     )
 }
 
+/// Rendered container-header height for a positive [`Camera`] zoom.
 fn container_header_px(zoom: f64) -> f64 {
     ((HEADER + 2.0 * LINE_STEP) * zoom.min(1.0)).max(HEADER)
 }
@@ -352,11 +353,37 @@ fn container_header_bg_h(body_len: usize, max_h: f64) -> f64 {
     (HEADER + body_len as f64 * LINE_STEP).min(max_h)
 }
 
-fn container_name_eligible(rung: Rung, clipped_h: f64) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContainerHeaderLayout {
+    pin_y: f64,
+    max_h: f64,
+}
+
+/// Computes pinned-header geometry within the clipped container. `zoom` is a
+/// positive [`Camera`] zoom. Card-or-higher headers require one complete line
+/// after ancestor stacking and never extend past the container's trailing edge.
+fn container_header_layout(
+    rung: Rung,
+    clipped_y: f64,
+    clipped_h: f64,
+    stack_bottom: f64,
+    zoom: f64,
+) -> Option<ContainerHeaderLayout> {
+    let pin_y = clipped_y.max(stack_bottom);
     match rung {
-        Rung::Dot => false,
-        Rung::Label => clipped_h >= 14.0,
-        Rung::Card | Rung::Detail | Rung::Full => true,
+        Rung::Dot => None,
+        Rung::Label if clipped_h >= 14.0 => Some(ContainerHeaderLayout {
+            pin_y,
+            max_h: clipped_h,
+        }),
+        Rung::Label => None,
+        Rung::Card | Rung::Detail | Rung::Full => {
+            let available = clipped_y + clipped_h - pin_y;
+            (available >= HEADER).then(|| ContainerHeaderLayout {
+                pin_y,
+                max_h: container_header_px(zoom).min(available),
+            })
+        }
     }
 }
 
@@ -775,17 +802,28 @@ impl TreemapView {
             match item.draw {
                 Draw::Container(rung) => {
                     let stack_bottom = header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
-                    let pin_y = item.px.y.max(stack_bottom);
-                    let ch_px = container_header_px(camera.zoom);
-                    if container_name_eligible(rung, item.px.h) {
-                        name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
-                    }
-                    body =
-                        container_body(item.node, rung, &item.px, item.label_w, vh, pin_y, ch_px);
-                    if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
-                        header_bg_h = container_header_bg_h(body.len(), ch_px) as f32;
-                        header_bg_y = pin_y as f32;
-                        header_stack.push((item.level, pin_y + header_bg_h as f64));
+                    if let Some(header) = container_header_layout(
+                        rung,
+                        item.px.y,
+                        item.px.h,
+                        stack_bottom,
+                        camera.zoom,
+                    ) {
+                        name = Self::pinned_name(&item, rung == Rung::Label, header.pin_y);
+                        body = container_body(
+                            item.node,
+                            rung,
+                            &item.px,
+                            item.label_w,
+                            vh,
+                            header.pin_y,
+                            header.max_h,
+                        );
+                        if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
+                            header_bg_h = container_header_bg_h(body.len(), header.max_h) as f32;
+                            header_bg_y = header.pin_y as f32;
+                            header_stack.push((item.level, header.pin_y + header_bg_h as f64));
+                        }
                     }
                     if matches!(rung, Rung::Dot | Rung::Label | Rung::Card)
                         && !item.node.children.is_empty()
@@ -2328,8 +2366,8 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, container_header_bg_h, container_header_px,
-        container_name_eligible, leaf_tex_rect, leaf_text_body, runs_from_spans, truncate_to_width,
+        code_line, container_body, container_header_bg_h, container_header_layout,
+        container_header_px, leaf_tex_rect, leaf_text_body, runs_from_spans, truncate_to_width,
         wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
@@ -2643,17 +2681,49 @@ mod tests {
         assert!((container_header_px(1.0) - natural).abs() < 1e-9);
         assert!((container_header_px(0.5) - natural * 0.5).abs() < 1e-9);
         assert!((container_header_px(0.1) - HEADER).abs() < 1e-9);
-        assert!((container_header_px(0.0) - HEADER).abs() < 1e-9);
+
+        // Camera zoom is positive. Check the adjacent representable values
+        // around the exact clamp transition rather than implying zero or
+        // negative zoom support.
+        let transition = HEADER / natural;
+        let below = f64::from_bits(transition.to_bits() - 1);
+        let above = f64::from_bits(transition.to_bits() + 1);
+        assert!((container_header_px(below) - HEADER).abs() < 1e-9);
+        assert!((container_header_px(transition) - HEADER).abs() < 1e-9);
+        assert!(container_header_px(above) > HEADER);
     }
 
     #[test]
-    fn pinned_container_name_eligibility_uses_rung_before_clipped_height() {
-        assert!(!container_name_eligible(Rung::Dot, 100.0));
-        assert!(!container_name_eligible(Rung::Label, 13.99));
-        assert!(container_name_eligible(Rung::Label, 14.0));
-        assert!(container_name_eligible(Rung::Card, 1.0));
-        assert!(container_name_eligible(Rung::Detail, 1.0));
-        assert!(container_name_eligible(Rung::Full, 1.0));
+    fn container_header_layout_respects_trailing_edge_and_ancestor_stack() {
+        for rung in [Rung::Card, Rung::Detail, Rung::Full] {
+            assert!(container_header_layout(rung, 597.0, 3.0, 597.0, 1.0).is_none());
+            assert!(container_header_layout(rung, 600.0, 2.0, 600.0, 1.0).is_none());
+
+            let exact = container_header_layout(rung, 100.0, HEADER, 100.0, 1.0).unwrap();
+            assert!((exact.pin_y - 100.0).abs() < 1e-9);
+            assert!((exact.max_h - HEADER).abs() < 1e-9);
+
+            let available = HEADER + 5.0;
+            let capped = container_header_layout(rung, 100.0, available, 100.0, 1.0).unwrap();
+            assert!((capped.max_h - available).abs() < 1e-9);
+            assert!(capped.pin_y + capped.max_h <= 100.0 + available);
+
+            let stacked =
+                container_header_layout(rung, 100.0, 2.0 * HEADER, 100.0 + HEADER - 2.0, 1.0)
+                    .unwrap();
+            assert!((stacked.max_h - (HEADER + 2.0)).abs() < 1e-9);
+            assert!(
+                container_header_layout(rung, 100.0, 2.0 * HEADER, 100.0 + HEADER + 1.0, 1.0,)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn container_header_layout_preserves_label_and_dot_policy() {
+        assert!(container_header_layout(Rung::Dot, 0.0, 100.0, 0.0, 1.0).is_none());
+        assert!(container_header_layout(Rung::Label, 0.0, 13.99, 0.0, 1.0).is_none());
+        assert!(container_header_layout(Rung::Label, 0.0, 14.0, 0.0, 1.0).is_some());
     }
 
     #[test]
