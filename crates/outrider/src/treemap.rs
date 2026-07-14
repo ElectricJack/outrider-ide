@@ -394,6 +394,14 @@ fn focused_width(max_chars: usize) -> f64 {
     needed.clamp(world::PAGE_W, 2.0 * world::PAGE_W)
 }
 
+fn expanded_leaf_bounds(packed: Rect, expanded_w: f64, extra_rows: usize) -> Rect {
+    Rect {
+        w: expanded_w,
+        h: packed.h + extra_rows as f64 * LINE_STEP,
+        ..packed
+    }
+}
+
 fn defer_leaf_to_overlay(is_focused: bool, is_leaf: bool) -> bool {
     is_focused && is_leaf
 }
@@ -814,29 +822,57 @@ impl TreemapView {
     /// Framing target for the current focus: leaf pages at natural size
     /// (capped END fit), containers at FOCUS_FRACTION — both nudged below
     /// any pinned ancestor headers so the focus is never underlapped.
-    fn frame_focus(
-        &self,
-        index: &TreeIndex,
-        vw: f64,
-        vh: f64,
-        min_zoom: f64,
-        max_zoom: f64,
-    ) -> Option<Camera> {
-        let r = *self.layout.rects.get(&self.focus.current)?;
-        let leaf = index
-            .node(&self.focus.current)
-            .is_some_and(content::is_leaf_item);
-        Some(self.frame_below_headers(index, r, vw, vh, |vh_eff| {
+    fn frame_focus(&mut self, vw: f64, vh: f64, min_zoom: f64, max_zoom: f64) -> Option<Camera> {
+        let packed = *self.layout.rects.get(&self.focus.current)?;
+        let index = TreeIndex::new(&self.tree);
+        let node = index.node(&self.focus.current)?;
+        let leaf = content::is_leaf_item(node);
+        let framed = if leaf {
+            let max_chars = max_line_chars(node, &mut self.buffers, &self.file_symbols);
+            let expanded_w = focused_width(max_chars);
+            let zoom_floor = min_zoom.max(leaf_text_zoom_floor(packed));
+            let mut bounds = expanded_leaf_bounds(packed, expanded_w, 0);
+            for _ in 0..2 {
+                let provisional = camera::frame_page(bounds, vw, vh, zoom_floor, max_zoom);
+                let (_, extra_rows) = leaf_text_body(
+                    node,
+                    0.0,
+                    0.0,
+                    packed.h * provisional.zoom,
+                    expanded_w * provisional.zoom,
+                    f64::INFINITY,
+                    &mut self.buffers,
+                    &self.file_symbols,
+                    true,
+                );
+                let next = expanded_leaf_bounds(packed, expanded_w, extra_rows);
+                if next.h == bounds.h {
+                    break;
+                }
+                bounds = next;
+            }
+            bounds
+        } else {
+            packed
+        };
+        Some(self.frame_below_headers(&index, framed, vw, vh, |vh_eff| {
             if leaf {
                 camera::frame_page(
-                    r,
+                    framed,
                     vw,
                     vh_eff,
-                    min_zoom.max(leaf_text_zoom_floor(r)),
+                    min_zoom.max(leaf_text_zoom_floor(packed)),
                     max_zoom,
                 )
             } else {
-                camera::frame_rect(r, vw, vh_eff, camera::FOCUS_FRACTION, min_zoom, max_zoom)
+                camera::frame_rect(
+                    framed,
+                    vw,
+                    vh_eff,
+                    camera::FOCUS_FRACTION,
+                    min_zoom,
+                    max_zoom,
+                )
             }
         }))
     }
@@ -1721,7 +1757,7 @@ impl TreemapView {
                     let (vw, vh) = Self::map_viewport(window);
                     let max_zoom = camera::MAX_ZOOM;
                     let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
-                    if let Some(to) = self.frame_focus(&index, vw, vh, min_zoom, max_zoom) {
+                    if let Some(to) = self.frame_focus(vw, vh, min_zoom, max_zoom) {
                         self.start_tween(to);
                     }
                 }
@@ -1770,14 +1806,14 @@ impl TreemapView {
                     return;
                 }
                 self.nav_history.push(self.focus.current.clone());
-                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "escape" => {
                 if !self.focus.step_out(&index) {
                     return;
                 }
                 self.nav_history.push(self.focus.current.clone());
-                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "end" => self
                 .layout
@@ -1801,7 +1837,7 @@ impl TreemapView {
                 self.focus.current = id;
                 self.focus.record_visit(&index);
                 self.neighbors = None;
-                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "right" if e.keystroke.modifiers.alt => {
                 let Some(id) = self.nav_history.forward().cloned() else {
@@ -1810,7 +1846,7 @@ impl TreemapView {
                 self.focus.current = id;
                 self.focus.record_visit(&index);
                 self.neighbors = None;
-                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "up" | "down" | "left" | "right" => {
                 let dir = match e.keystroke.key.as_str() {
@@ -1827,7 +1863,7 @@ impl TreemapView {
                 if !self.focus.set(next, &index) {
                     return;
                 }
-                self.frame_focus(&index, vw, vh, min_zoom, max_zoom)
+                self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             _ => return,
         };
@@ -2606,6 +2642,24 @@ mod tests {
         );
         assert!((focused_width(10) - world::PAGE_W).abs() < 1e-9);
         assert!((focused_width(200) - 2.0 * world::PAGE_W).abs() < 1e-9);
+    }
+
+    #[test]
+    fn expanded_leaf_bounds_move_the_center_to_the_rendered_dimensions() {
+        use super::expanded_leaf_bounds;
+
+        let packed = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 640.0,
+            h: 100.0,
+        };
+        let expanded = expanded_leaf_bounds(packed, 1_000.0, 3);
+
+        assert_eq!(expanded.w, 1_000.0);
+        assert!((expanded.h - (100.0 + 3.0 * LINE_STEP)).abs() < 1e-9);
+        assert_eq!(expanded.x + expanded.w / 2.0, 510.0);
+        assert_eq!(expanded.y + expanded.h / 2.0, 20.0 + expanded.h / 2.0);
     }
 
     #[test]
