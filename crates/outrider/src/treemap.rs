@@ -22,8 +22,8 @@ use crate::interaction::InteractionAction;
 use crate::navigation::NavigationHistory;
 use crate::overlays::{ContextMenu, Notification, Notifications};
 use crate::paint_model::{
-    code_line, runs_from_spans, truncate_to_width, wrap_doc, BodyText, DocPanel, NameRow,
-    PaintItem, TexQuad,
+    char_budget, code_line, runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc,
+    wrap_to_budget, BodyText, DocPanel, NameRow, PaintItem, TexQuad,
 };
 use crate::palette;
 use crate::project_loader::{LoadProgress, LoadResult, LoaderPoll, ProjectLoader};
@@ -220,6 +220,7 @@ pub struct TreemapView {
 /// stacked below ancestor headers when multiple containers are pinned).
 /// `max_h` caps body text to the zoomed container-header area so it
 /// never bleeds into the children zone.
+#[allow(clippy::too_many_arguments)]
 fn container_body(
     node: &SymbolNode,
     rung: Rung,
@@ -228,14 +229,16 @@ fn container_body(
     vh: f64,
     pin_y: f64,
     max_h: f64,
+    focused: bool,
 ) -> Vec<BodyText> {
     if rung == Rung::Dot || rung == Rung::Label {
         return Vec::new();
     }
     let font = FONT_PX as f32;
     let mut out = Vec::new();
-    for (k, line) in content::body_lines(node, rung).into_iter().enumerate() {
-        let y = header_paint_y(pin_y + HEADER + k as f64 * LINE_STEP);
+    let mut row = 0usize;
+    for line in content::body_lines(node, rung) {
+        let y = header_paint_y(pin_y + HEADER + row as f64 * LINE_STEP);
         if y + LINE_STEP > pin_y + max_h || y + LINE_STEP > px.y + px.h || y > vh {
             break;
         }
@@ -243,14 +246,32 @@ fn container_body(
             BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
             BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
         };
-        if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
-            let len = shown.len();
-            out.push(BodyText {
-                x: (px.x + BODY_PAD) as f32,
-                y: y as f32,
-                text: shown,
-                runs: vec![(len, color)],
-            });
+        if focused {
+            for shown in wrap_to_budget(&text, char_budget(label_w as f32, font)) {
+                let y = header_paint_y(pin_y + HEADER + row as f64 * LINE_STEP);
+                if y + LINE_STEP > pin_y + max_h || y + LINE_STEP > px.y + px.h || y > vh {
+                    break;
+                }
+                let len = shown.len();
+                out.push(BodyText {
+                    x: (px.x + BODY_PAD) as f32,
+                    y: y as f32,
+                    text: shown,
+                    runs: vec![(len, color)],
+                });
+                row += 1;
+            }
+        } else {
+            if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
+                let len = shown.len();
+                out.push(BodyText {
+                    x: (px.x + BODY_PAD) as f32,
+                    y: y as f32,
+                    text: shown,
+                    runs: vec![(len, color)],
+                });
+            }
+            row += 1;
         }
     }
     out
@@ -270,64 +291,137 @@ fn leaf_text_body(
     vh: f64,
     buffers: &mut BufferManager,
     file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
-) -> Vec<BodyText> {
+    focused: bool,
+) -> (Vec<BodyText>, usize) {
     let scale = full_h / content::natural_px(node);
     let font = (FONT_PX * scale) as f32;
     let step = LINE_STEP * scale;
     let x = (left + BODY_PAD * scale) as f32;
     let content_y0 = HEADER.max(HEADER * scale);
     let mut out = Vec::new();
+    let mut display_row = 0usize;
     let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
     let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
     if let Some(m) = buffers.get(&rel, syms) {
         if let Some(start) = m.symbol_start_line(&node.id) {
             let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
             for j in 0..count {
-                let y = top + content_y0 + j as f64 * LINE_STEP * scale;
-                if y > vh {
+                let y = top + content_y0 + display_row as f64 * step;
+                if y > vh && !focused {
                     break;
                 }
-                if y + step < 0.0 {
-                    continue;
-                }
                 if let Some((text, spans)) = m.buffer.line(start + j) {
-                    if let Some((shown, runs)) = code_line(&text, spans, label_w as f32, font) {
-                        out.push(BodyText {
-                            x,
-                            y: y as f32,
-                            text: shown,
-                            runs,
-                        });
+                    if focused {
+                        for (shown, runs) in wrap_code_line(&text, spans, label_w as f32, font) {
+                            let y = top + content_y0 + display_row as f64 * step;
+                            if y <= vh && y + step >= 0.0 {
+                                out.push(BodyText {
+                                    x,
+                                    y: y as f32,
+                                    text: shown,
+                                    runs,
+                                });
+                            }
+                            display_row += 1;
+                        }
+                    } else {
+                        if y + step >= 0.0 {
+                            if let Some((shown, runs)) =
+                                code_line(&text, spans, label_w as f32, font)
+                            {
+                                out.push(BodyText {
+                                    x,
+                                    y: y as f32,
+                                    text: shown,
+                                    runs,
+                                });
+                            }
+                        }
+                        display_row += 1;
                     }
+                } else {
+                    display_row += 1;
                 }
             }
-            return out;
+            return (out, display_row.saturating_sub(count));
         }
     }
     let lines = content::body_lines(node, Rung::Full);
-    for (k, line) in lines.into_iter().enumerate() {
-        let y = top + content_y0 + k as f64 * LINE_STEP * scale;
-        if y > vh {
+    let source_count = lines.len();
+    for line in lines {
+        let y = top + content_y0 + display_row as f64 * step;
+        if y > vh && !focused {
             break;
-        }
-        if y + step < 0.0 {
-            continue;
         }
         let (text, color) = match line {
             BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
             BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
         };
-        if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
-            let len = shown.len();
-            out.push(BodyText {
-                x,
-                y: y as f32,
-                text: shown,
-                runs: vec![(len, color)],
-            });
+        if focused {
+            for shown in wrap_to_budget(&text, char_budget(label_w as f32, font)) {
+                let y = top + content_y0 + display_row as f64 * step;
+                if y <= vh && y + step >= 0.0 {
+                    let len = shown.len();
+                    out.push(BodyText {
+                        x,
+                        y: y as f32,
+                        text: shown,
+                        runs: vec![(len, color)],
+                    });
+                }
+                display_row += 1;
+            }
+        } else {
+            if y + step >= 0.0 {
+                if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
+                    let len = shown.len();
+                    out.push(BodyText {
+                        x,
+                        y: y as f32,
+                        text: shown,
+                        runs: vec![(len, color)],
+                    });
+                }
+            }
+            display_row += 1;
         }
     }
-    out
+    (out, display_row.saturating_sub(source_count))
+}
+
+fn focused_width(max_chars: usize) -> f64 {
+    let needed = max_chars as f64 * FONT_PX * 0.62 + 2.0 * BODY_PAD;
+    needed.clamp(world::PAGE_W, 2.0 * world::PAGE_W)
+}
+
+fn max_line_chars(
+    node: &SymbolNode,
+    buffers: &mut BufferManager,
+    file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
+) -> usize {
+    let mut max_chars = content::body_lines(node, Rung::Full)
+        .into_iter()
+        .map(|line| match line {
+            BodyLine::Plain(text) | BodyLine::Dim(text) => text.chars().count(),
+        })
+        .max()
+        .unwrap_or(0);
+    if content::is_leaf_item(node) {
+        let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
+        let symbols = file_symbols.get(&rel).map(Vec::as_slice).unwrap_or(&[]);
+        if let Some(materialized) = buffers.get(&rel, symbols) {
+            if let Some(start) = materialized.symbol_start_line(&node.id) {
+                let count = (node.measure as usize)
+                    .min(materialized.buffer.len_lines().saturating_sub(start));
+                for offset in 0..count {
+                    if let Some((text, _)) = materialized.buffer.line(start + offset) {
+                        max_chars = max_chars.max(text.chars().count());
+                    }
+                }
+            }
+        }
+    }
+    max_chars
 }
 
 /// Unclipped screen rect of a leaf's line area: full page width, rows
@@ -824,6 +918,7 @@ impl TreemapView {
                 .is_some_and(|textures| textures.contains(id))
         });
         let mut out = Vec::with_capacity(items.len());
+        let mut focused_paint_idx = None;
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
         let mut panel_doc: Option<(String, f32, f32, f32, f32)> = None;
         for item in items {
@@ -835,6 +930,7 @@ impl TreemapView {
                 }
             }
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
+            let is_focused = item.node.id == focus_id;
             let box_kind = if is_leaf {
                 theme::BoxKind::Leaf
             } else if item.node.id.kind == SymbolKind::Folder {
@@ -852,6 +948,8 @@ impl TreemapView {
             let mut name = None;
             let mut body = Vec::new();
             let mut tex: Option<TexQuad> = None;
+            let mut focused_extra_h = 0.0f64;
+            let mut expanded_w = 0.0f32;
             match item.draw {
                 Draw::Container(rung) => {
                     let stack_bottom = header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
@@ -876,6 +974,7 @@ impl TreemapView {
                             vh,
                             header.pin_y,
                             header.max_h,
+                            is_focused,
                         );
                         if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
                             header_bg_h = container_header_bg_h(body.len(), header.max_h) as f32;
@@ -918,17 +1017,32 @@ impl TreemapView {
                     let use_text =
                         font >= content::MIN_TEXT_FONT_PX && item.label_w >= world::CODE_MIN_W;
                     if use_text {
+                        let effective_label_w = if is_focused {
+                            let max_chars =
+                                max_line_chars(item.node, &mut self.buffers, &self.file_symbols);
+                            focused_width(max_chars) * camera.zoom
+                        } else {
+                            item.label_w
+                        };
+                        if is_focused {
+                            expanded_w = effective_label_w as f32;
+                        }
                         tex_opacity = 0.0;
-                        body = leaf_text_body(
+                        let (text_body, extra_rows) = leaf_text_body(
                             item.node,
                             item.left,
                             item.top,
                             item.full_h,
-                            item.label_w,
+                            effective_label_w,
                             vh,
                             &mut self.buffers,
                             &self.file_symbols,
+                            is_focused,
                         );
+                        body = text_body;
+                        if is_focused && extra_rows > 0 {
+                            focused_extra_h = extra_rows as f64 * LINE_STEP * scale;
+                        }
                         if !body.is_empty() {
                             let refreshed = self.textures.as_mut().is_some_and(|textures| {
                                 textures.refresh_from_live_text(
@@ -969,22 +1083,37 @@ impl TreemapView {
                     }
                 }
             }
-            let is_focused = item.node.id == focus_id;
             let is_hovered = self.hover_id.as_ref() == Some(&item.node.id);
             if item.node.doc.is_some() && (is_hovered || (is_focused && panel_doc.is_none())) {
                 panel_doc = Some((
                     item.node.doc.clone().unwrap(),
                     item.px.x as f32,
                     item.px.y as f32,
-                    item.px.w as f32,
-                    item.px.h as f32,
+                    if expanded_w > 0.0 {
+                        expanded_w
+                    } else {
+                        item.px.w as f32
+                    },
+                    if expanded_w > 0.0 {
+                        (item.full_h + focused_extra_h) as f32
+                    } else {
+                        item.px.h as f32
+                    },
                 ));
             }
             out.push(PaintItem {
                 x: item.px.x as f32,
                 y: item.px.y as f32,
-                w: item.px.w as f32,
-                h: item.px.h as f32,
+                w: if is_focused && is_leaf && expanded_w > 0.0 {
+                    expanded_w
+                } else {
+                    item.px.w as f32
+                },
+                h: if is_focused && is_leaf && expanded_w > 0.0 {
+                    (item.full_h + focused_extra_h) as f32
+                } else {
+                    item.px.h as f32
+                },
                 fill,
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
@@ -999,6 +1128,13 @@ impl TreemapView {
                 body,
                 tex,
             });
+            if is_focused && is_leaf && expanded_w > 0.0 {
+                focused_paint_idx = Some(out.len() - 1);
+            }
+        }
+        if let Some(index) = focused_paint_idx {
+            let focused = out.remove(index);
+            out.push(focused);
         }
         let doc_panel = panel_doc.and_then(|(doc, fx, fy, fw, _fh)| {
             let panel_w = fw.max(DOC_PANEL_W as f32);
@@ -2436,10 +2572,11 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, container_children_have_images, container_header_bg_h,
-        container_header_layout, container_header_px, header_bg_paint_h, header_paint_y,
-        leaf_tex_rect, leaf_text_body, leaf_texture_is_visible, runs_from_spans, truncate_to_width,
-        wrap_doc, HEADER, LINE_STEP,
+        char_budget, code_line, container_body, container_children_have_images,
+        container_header_bg_h, container_header_layout, container_header_px, focused_width,
+        header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body, leaf_texture_is_visible,
+        runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc, wrap_to_budget, HEADER,
+        LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2462,6 +2599,41 @@ mod tests {
             truncate_to_width("ééééééééééééé", w, 12.0),
             Some("ééééééééé…".into())
         );
+    }
+
+    #[test]
+    fn focused_text_width_and_wrapping_are_bounded() {
+        let width = 12.0 + 10.0 * 0.62 * 12.0;
+        assert_eq!(char_budget(width as f32, 12.0), 10);
+        assert_eq!(
+            wrap_to_budget("alpha beta gamma", 10),
+            vec!["alpha beta", "gamma"]
+        );
+        assert_eq!(
+            wrap_to_budget("abcdefghijklmno", 10),
+            vec!["abcdefghij", "klmno"]
+        );
+        assert!((focused_width(10) - world::PAGE_W).abs() < 1e-9);
+        assert!((focused_width(200) - 2.0 * world::PAGE_W).abs() < 1e-9);
+    }
+
+    #[test]
+    fn focused_code_wrap_preserves_run_coverage() {
+        use outrider_index::buffer::{HighlightKind, HighlightSpan};
+
+        let width = 12.0 + 10.0 * 0.62 * 12.0;
+        let spans = vec![HighlightSpan {
+            range: 0..2,
+            kind: HighlightKind::Keyword,
+        }];
+        let lines = wrap_code_line("fn frobnicate()", &spans, width as f32, 12.0);
+        assert_eq!(
+            lines.iter().map(|line| line.0.as_str()).collect::<Vec<_>>(),
+            vec!["fn frobnic", "ate()"]
+        );
+        assert!(lines
+            .iter()
+            .all(|(text, runs)| { runs.iter().map(|run| run.0).sum::<usize>() == text.len() }));
     }
 
     fn node(
@@ -2530,7 +2702,7 @@ mod tests {
             w: 400.0,
             h: 300.0,
         };
-        let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0);
+        let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0, false);
         // churn readout only (doc shown via hover panel, no children → no kinds)
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - (HEADER - 1.0)).abs() < 1e-3);
@@ -2564,15 +2736,16 @@ mod tests {
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let natural = crate::content::natural_px(&leaf);
         // scale 1.0: full_h == natural
-        let body = leaf_text_body(
+        let (body, _extra) = leaf_text_body(
             &leaf,
             0.0,
             0.0,
             natural,
-            480.0,
+            640.0,
             600.0,
             &mut mgr,
             &file_symbols,
+            false,
         );
         // code only — no separate signature row (the code line IS the signature)
         assert_eq!(body.len(), 1);
@@ -2603,32 +2776,71 @@ mod tests {
         file_symbols.insert("a.rs".to_string(), vec![(leaf.id.clone(), 12)]);
         let natural = crate::content::natural_px(&leaf);
         // zoom 2× (full_h = 2·natural): code row y doubles, still no clip
-        let body = leaf_text_body(
+        let (body, _extra) = leaf_text_body(
             &leaf,
             0.0,
             0.0,
             2.0 * natural,
-            960.0,
+            1280.0,
             100_000.0,
             &mut mgr,
             &file_symbols,
+            false,
         );
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - 2.0 * HEADER).abs() < 1e-3);
         // buffer unavailable → signature only, no code
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
-        let body = leaf_text_body(
+        let (body, _extra) = leaf_text_body(
             &leaf,
             0.0,
             0.0,
             natural,
-            480.0,
+            640.0,
             600.0,
             &mut broken,
             &BTreeMap::new(),
+            false,
         );
         assert_eq!(body.len(), 1);
         assert_eq!(body[0].text, "fn two()");
+    }
+
+    #[test]
+    fn focused_leaf_height_counts_wrapped_rows_below_viewport() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "abcdefghijklmno\npqrstuvwxyzabcd\n",
+        )
+        .unwrap();
+        let leaf = node(
+            SymbolKind::Item { label: "fn".into() },
+            "a.rs::two",
+            Some(0..31),
+            2,
+            None,
+            None,
+        );
+        let mut manager = BufferManager::new(dir.path().to_path_buf());
+        let file_symbols = BTreeMap::from([("a.rs".to_string(), vec![(leaf.id.clone(), 0)])]);
+        let natural = crate::content::natural_px(&leaf);
+        let ten_chars_wide = 12.0 + 10.0 * 0.62 * 12.0;
+
+        let (body, extra_rows) = leaf_text_body(
+            &leaf,
+            0.0,
+            0.0,
+            natural,
+            ten_chars_wide,
+            HEADER + 0.1,
+            &mut manager,
+            &file_symbols,
+            true,
+        );
+
+        assert_eq!(body.len(), 1, "only the first wrapped row is visible");
+        assert_eq!(extra_rows, 2, "both source lines wrap below the viewport");
     }
 
     fn make_node(kind: SymbolKind, name: &str) -> SymbolNode {
@@ -2787,10 +2999,10 @@ mod tests {
         let normal_page = Rect {
             x: 0.0,
             y: 0.0,
-            w: 480.0,
+            w: world::PAGE_W,
             h: 2_000.0,
         };
-        assert!((leaf_text_zoom_floor(normal_page) - 0.625).abs() < 1e-9);
+        assert!((leaf_text_zoom_floor(normal_page) - 7.0 / 12.0).abs() < 1e-9);
 
         let narrow_page = Rect {
             w: 200.0,
@@ -2967,7 +3179,7 @@ mod tests {
             Rect {
                 x: 30.0,
                 y: 0.0,
-                w: 480.0,
+                w: 640.0,
                 h: 200.0,
             },
         );

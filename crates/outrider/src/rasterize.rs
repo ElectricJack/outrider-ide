@@ -32,7 +32,8 @@ pub const MAX_TEX_H: usize = 1024;
 /// Maximum pixel dimension (longer side) for a container thumbnail.
 const CONTAINER_TEX_MAX: f64 = 1024.0;
 /// Increment whenever rasterization semantics change incompatibly.
-pub const RENDER_SCHEMA_VERSION: u64 = 1;
+// Version 2 invalidates textures baked with the former 480-world-unit page width.
+pub const RENDER_SCHEMA_VERSION: u64 = 2;
 
 /// One source line: text plus colored runs (byte length, 0xRRGGBB).
 pub type Line = (String, Vec<(usize, u32)>);
@@ -1476,9 +1477,9 @@ mod tests {
         let lines: Vec<Line> = (0..10).map(|_| plain("fn foo() {}")).collect();
         let tex = Rasterizer::new().bake(&lines);
         let img = tex.image.as_ref().unwrap();
-        assert_eq!(img.size(0).width.0, 123);
+        assert_eq!(img.size(0).width.0, 164);
         assert_eq!(img.size(0).height.0, 40);
-        assert_eq!(tex.bytes, 123 * 40 * 4);
+        assert_eq!(tex.bytes, 164 * 40 * 4);
     }
 
     #[test]

@@ -71,6 +71,67 @@ pub(crate) fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<S
     }
 }
 
+pub(crate) fn char_budget(w_px: f32, font_px: f32) -> usize {
+    let budget = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
+    if budget < 2 {
+        0
+    } else {
+        budget as usize
+    }
+}
+
+pub(crate) fn wrap_to_budget(text: &str, budget: usize) -> Vec<String> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    if text.chars().count() <= budget {
+        return vec![text.to_string()];
+    }
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    let mut line_len = 0usize;
+    for word in text.split(' ') {
+        let mut word = word;
+        let mut word_len = word.chars().count();
+        while word_len > budget {
+            if line_len > 0 {
+                rows.push(std::mem::take(&mut line));
+                line_len = 0;
+            }
+            let cut = word
+                .char_indices()
+                .nth(budget)
+                .map_or(word.len(), |(i, _)| i);
+            rows.push(word[..cut].to_string());
+            word = &word[cut..];
+            word_len = word.chars().count();
+        }
+        if word_len == 0 {
+            continue;
+        }
+        let need = if line_len == 0 {
+            word_len
+        } else {
+            line_len + 1 + word_len
+        };
+        if need > budget {
+            rows.push(std::mem::take(&mut line));
+            line.push_str(word);
+            line_len = word_len;
+        } else {
+            if line_len > 0 {
+                line.push(' ');
+            }
+            line.push_str(word);
+            line_len = need;
+        }
+    }
+    if line_len > 0 {
+        rows.push(line);
+    }
+    rows
+}
+
 pub(crate) fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
     let budget = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
     if budget < 2 {
@@ -83,47 +144,7 @@ pub(crate) fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
         if joined.is_empty() {
             continue;
         }
-        let mut line = String::new();
-        let mut line_len = 0usize;
-        for word in joined.split(' ') {
-            let mut word = word;
-            let mut word_len = word.chars().count();
-            while word_len > budget {
-                if line_len > 0 {
-                    rows.push(std::mem::take(&mut line));
-                    line_len = 0;
-                }
-                let cut = word
-                    .char_indices()
-                    .nth(budget)
-                    .map_or(word.len(), |(i, _)| i);
-                rows.push(word[..cut].to_string());
-                word = &word[cut..];
-                word_len = word.chars().count();
-            }
-            if word_len == 0 {
-                continue;
-            }
-            let need = if line_len == 0 {
-                word_len
-            } else {
-                line_len + 1 + word_len
-            };
-            if need > budget {
-                rows.push(std::mem::take(&mut line));
-                line.push_str(word);
-                line_len = word_len;
-            } else {
-                if line_len > 0 {
-                    line.push(' ');
-                }
-                line.push_str(word);
-                line_len = need;
-            }
-        }
-        if line_len > 0 {
-            rows.push(line);
-        }
+        rows.extend(wrap_to_budget(&joined, budget));
     }
     rows
 }
@@ -166,4 +187,51 @@ pub(crate) fn code_line(
         runs.push(('…'.len_utf8(), theme::TEXT_PRIMARY));
     }
     Some((shown, runs))
+}
+
+pub(crate) fn wrap_code_line(
+    text: &str,
+    spans: &[HighlightSpan],
+    width: f32,
+    font_px: f32,
+) -> Vec<(String, Vec<(usize, u32)>)> {
+    let budget = char_budget(width, font_px);
+    if budget == 0 {
+        return Vec::new();
+    }
+    if text.chars().count() <= budget {
+        return vec![(text.to_string(), runs_from_spans(text.len(), spans))];
+    }
+    let full_runs = runs_from_spans(text.len(), spans);
+    let mut result = Vec::new();
+    let mut text_off = 0usize;
+    let mut run_idx = 0usize;
+    let mut run_off = 0usize;
+    while text_off < text.len() {
+        let rest = &text[text_off..];
+        let take_chars = budget.min(rest.chars().count());
+        let take_bytes = rest
+            .char_indices()
+            .nth(take_chars)
+            .map_or(rest.len(), |(i, _)| i);
+        let segment = rest[..take_bytes].to_string();
+        let mut segment_runs = Vec::new();
+        let mut left = take_bytes;
+        while left > 0 && run_idx < full_runs.len() {
+            let (run_len, color) = full_runs[run_idx];
+            let available = run_len - run_off;
+            let used = available.min(left);
+            segment_runs.push((used, color));
+            left -= used;
+            if used == available {
+                run_idx += 1;
+                run_off = 0;
+            } else {
+                run_off += used;
+            }
+        }
+        result.push((segment, segment_runs));
+        text_off += take_bytes;
+    }
+    result
 }
