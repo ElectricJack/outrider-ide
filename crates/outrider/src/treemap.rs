@@ -448,6 +448,15 @@ fn loading_texture_cache() -> Option<TextureCache> {
     None
 }
 
+fn format_cache_status(memory_bytes: usize, memory_max_mb: u64, disk_bytes: Option<u64>) -> String {
+    let memory_mb = memory_bytes as f64 / (1024.0 * 1024.0);
+    let disk = disk_bytes.map_or_else(
+        || "Disk preparing…".to_owned(),
+        |bytes| format!("Disk {:.0} MB", bytes as f64 / (1024.0 * 1024.0)),
+    );
+    format!("Memory {memory_mb:.0} / {memory_max_mb} MB · {disk}")
+}
+
 /// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
     fn apply_action(&mut self, action: InteractionAction) {
@@ -561,14 +570,16 @@ impl TreemapView {
     }
 
     fn memory_status(&self) -> String {
-        let bytes = self
+        let memory_bytes = self
             .textures
             .as_ref()
             .map(TextureCache::used_bytes)
             .unwrap_or(0);
-        let mb = bytes as f64 / (1024.0 * 1024.0);
-        let max_mb = self.settings.cache_mb;
-        format!("{mb:.0} / {max_mb} MB")
+        let disk_bytes = self
+            .textures
+            .as_ref()
+            .and_then(TextureCache::disk_used_bytes);
+        format_cache_status(memory_bytes, u64::from(self.settings.cache_mb), disk_bytes)
     }
 
     /// Window title shown in the client titlebar and taskbar.
@@ -1139,6 +1150,29 @@ impl TreemapView {
                                 this.notifications.push(Notification::warning(message));
                             }
                             this.start_loading(folder);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name("menu-clear-project-disk-cache".into()))
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .text_size(px(12.))
+                    .hover(|s| {
+                        s.text_color(rgb(theme::TEXT_PRIMARY))
+                            .bg(rgb(chrome::MENU_HOVER))
+                    })
+                    .child("Clear Project Disk Cache")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        if let Some(textures) = this.textures.as_mut() {
+                            textures.request_clear_disk_cache();
+                            this.bake_pending = true;
                         }
                         cx.notify();
                     })),
@@ -1797,6 +1831,16 @@ impl Render for TreemapView {
 
         let (items, doc_panel) = self.paint_items(vw, vh);
 
+        // Disk results are applied while building paint items. Drain their
+        // diagnostics afterwards so a terminal worker failure is visible in
+        // this frame even when no further animation frame is needed.
+        if let Some(textures) = self.textures.as_mut() {
+            for diagnostic in textures.drain_disk_diagnostics() {
+                self.notifications
+                    .push(Notification::warning(diagnostic.to_string()));
+            }
+        }
+
         if let Some(textures) = self.textures.as_mut() {
             for img in textures.take_retired() {
                 let _ = window.drop_image(img);
@@ -2157,6 +2201,18 @@ impl Render for TreemapView {
 #[cfg(test)]
 mod tests {
     use super::{parse_gibibytes, SettingsDraft};
+
+    #[test]
+    fn cache_status_reports_memory_and_current_project_disk_usage() {
+        assert_eq!(
+            super::format_cache_status(3 * 1024 * 1024, 128, Some(5 * 1024 * 1024)),
+            "Memory 3 / 128 MB · Disk 5 MB"
+        );
+        assert_eq!(
+            super::format_cache_status(0, 128, None),
+            "Memory 0 / 128 MB · Disk preparing…"
+        );
+    }
 
     #[test]
     fn loading_shell_texture_cache_is_lazy() {

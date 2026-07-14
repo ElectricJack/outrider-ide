@@ -111,7 +111,14 @@ pub fn index_repo_outcome(
     filter_extensions: &[String],
     filter_folders: &[String],
 ) -> anyhow::Result<IndexOutcome> {
-    index_repo_outcome_impl(repo_root, filter_extensions, filter_folders, None, None)
+    index_repo_outcome_impl(
+        repo_root,
+        filter_extensions,
+        filter_folders,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Full indexing pipeline with an explicit application cache root.
@@ -127,6 +134,7 @@ pub fn index_repo_outcome_with_cache(
         filter_folders,
         None,
         Some(cache_root),
+        None,
     )
 }
 
@@ -136,16 +144,22 @@ fn index_repo_outcome_impl(
     filter_folders: &[String],
     progress: Option<&IndexProgress>,
     cache_root: Option<&Path>,
+    is_cancelled: Option<&dyn Fn() -> bool>,
 ) -> anyhow::Result<IndexOutcome> {
+    cancellation_checkpoint(is_cancelled)?;
     if let Some(progress) = progress {
         progress.phase.store(0, Ordering::Relaxed);
     }
     let paths = discover_files(repo_root, filter_extensions, filter_folders)?;
     if let Some(progress) = progress {
         progress.files_total.store(paths.len(), Ordering::Relaxed);
+    }
+    cancellation_checkpoint(is_cancelled)?;
+    if let Some(progress) = progress {
         progress.phase.store(1, Ordering::Relaxed);
     }
     let files = index_discovered_files(&FsFileSource::new(repo_root), &paths, progress)?;
+    cancellation_checkpoint(is_cancelled)?;
     let source_fingerprints = files
         .iter()
         .filter_map(|file| {
@@ -162,11 +176,13 @@ fn index_repo_outcome_impl(
     }
     let mut tree = build_indexed_tree(repo_root, &files);
     dedupe_ids(&mut tree.root);
+    cancellation_checkpoint(is_cancelled)?;
     let churn = match cache_root {
         Some(cache_root) => crate::churn::churn_counts_with_cache(repo_root, cache_root)?,
         None => crate::churn::churn_outcome(repo_root)?,
     };
     crate::churn::annotate(&mut tree, &churn.counts);
+    cancellation_checkpoint(is_cancelled)?;
     if let Some(progress) = progress {
         progress.phase.store(3, Ordering::Relaxed);
     }
@@ -175,6 +191,13 @@ fn index_repo_outcome_impl(
         warnings: churn.warning.into_iter().collect(),
         source_fingerprints,
     })
+}
+
+fn cancellation_checkpoint(is_cancelled: Option<&dyn Fn() -> bool>) -> anyhow::Result<()> {
+    if is_cancelled.is_some_and(|is_cancelled| is_cancelled()) {
+        anyhow::bail!("indexing cancelled");
+    }
+    Ok(())
 }
 
 /// Full indexing pipeline with atomic progress reporting.
@@ -203,6 +226,29 @@ pub fn index_repo_with_progress_outcome(
         filter_folders,
         Some(progress),
         None,
+        None,
+    )
+}
+
+/// Full indexing pipeline with progress reporting and cooperative cancellation.
+///
+/// `is_cancelled` is checked before discovery and between discovery,
+/// materialization, tree assembly, churn annotation, and publication. Existing
+/// non-cancellable entry points preserve their behavior.
+pub fn index_repo_with_progress_outcome_cancellable(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+    progress: &IndexProgress,
+    is_cancelled: &dyn Fn() -> bool,
+) -> anyhow::Result<IndexOutcome> {
+    index_repo_outcome_impl(
+        repo_root,
+        filter_extensions,
+        filter_folders,
+        Some(progress),
+        None,
+        Some(is_cancelled),
     )
 }
 
@@ -592,5 +638,24 @@ mod tests {
             assert_eq!(lines, expected_lines, "bytes={bytes:?}");
             assert_eq!(byte_count, bytes.len() as u64);
         }
+    }
+
+    #[test]
+    fn cancellable_pipeline_stops_after_discovery_before_materialization() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let progress = IndexProgress::new();
+        let checkpoints = AtomicUsize::new(0);
+
+        let error =
+            index_repo_with_progress_outcome_cancellable(repo.path(), &[], &[], &progress, &|| {
+                checkpoints.fetch_add(1, Ordering::SeqCst) >= 1
+            })
+            .err()
+            .expect("second checkpoint should cancel the pipeline");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(progress.files_total.load(Ordering::SeqCst), 1);
+        assert_eq!(progress.files_parsed.load(Ordering::SeqCst), 0);
     }
 }

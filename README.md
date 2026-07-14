@@ -19,7 +19,10 @@ Git churn is visualized as a heat stripe on each box, so you can immediately spo
 
 ## Build
 
-Requires Rust 1.89+.
+Requires Rust 1.89+. The locked dependency graph cannot support Rust 1.80:
+`cosmic-text` 0.19.0 and `smol_str` 0.3.6 both declare Rust 1.89 as their
+minimum supported version. CI has a dedicated Rust 1.89 job to prevent the
+project's effective minimum from drifting upward unnoticed.
 
 ```bash
 cargo build --release

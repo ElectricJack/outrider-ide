@@ -138,20 +138,25 @@ impl TextureStore {
     }
 
     pub fn save(&mut self, key: &TextureKey, payload: &TexturePayload) -> io::Result<()> {
-        self.save_with_replace(key, payload, replace_file_atomically)
+        self.save_with_io(key, payload, replace_file_atomically, |path| {
+            fs::remove_file(path)
+        })
     }
 
-    fn save_with_replace(
+    fn save_with_io(
         &mut self,
         key: &TextureKey,
         payload: &TexturePayload,
         replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        mut remove: impl FnMut(&Path) -> io::Result<()>,
     ) -> io::Result<()> {
         let payload_len = validate_payload(payload)?;
         let file_bytes = HEADER_LEN as u64 + payload_len;
         if file_bytes > self.max_bytes {
             return Ok(());
         }
+        self.rebuild_index()?;
+        self.reserve_physical_space(file_bytes, &mut remove)?;
         let access = self.next_access();
         let path = self.path(*key);
         let temp = path.with_extension("tmp");
@@ -194,7 +199,18 @@ impl TextureStore {
         payload: &TexturePayload,
         replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
-        self.save_with_replace(key, payload, replace)
+        self.save_with_io(key, payload, replace, |path| fs::remove_file(path))
+    }
+
+    #[cfg(test)]
+    fn save_with_io_for_test(
+        &mut self,
+        key: &TextureKey,
+        payload: &TexturePayload,
+        replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        remove: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.save_with_io(key, payload, replace, remove)
     }
 
     #[allow(dead_code)] // Public store API; UI wiring lands in a later task.
@@ -219,6 +235,9 @@ impl TextureStore {
     }
 
     fn rebuild_index(&mut self) -> io::Result<()> {
+        self.entries.clear();
+        self.used_bytes = 0;
+        self.clock = 0;
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
             if path.extension().and_then(|value| value.to_str()) == Some("tmp") {
@@ -245,6 +264,31 @@ impl TextureStore {
                     drop(file);
                     let _ = fs::remove_file(path);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn reserve_physical_space(
+        &mut self,
+        file_bytes: u64,
+        remove: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        while self.used_bytes.saturating_add(file_bytes) > self.max_bytes {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(key, metadata)| (metadata.last_access, key.0))
+                .map(|(key, _)| *key)
+            else {
+                return Err(io::Error::other("unable to reserve texture cache space"));
+            };
+            match remove(&self.path(victim)) {
+                Ok(()) => self.remove_metadata(victim),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.remove_metadata(victim)
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -606,6 +650,31 @@ mod tests {
         assert!(store.load(&key("old.rs", 1)).unwrap().is_none());
         assert!(store.load(&key("new.rs", 1)).unwrap().is_some());
         assert!(store.used_bytes() <= limit);
+    }
+
+    #[test]
+    fn failed_pre_eviction_never_writes_past_the_hard_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let mut store = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        store.save(&key("old.rs", 1), &payload(16)).unwrap();
+
+        let result = store.save_with_io_for_test(
+            &key("new.rs", 1),
+            &payload(16),
+            |_, _| Ok(()),
+            |_| Err(std::io::Error::other("injected eviction failure")),
+        );
+
+        assert!(result.is_err());
+        let physical_bytes: u64 = std::fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(physical_bytes <= entry_bytes);
+        assert!(store.used_bytes() <= entry_bytes);
+        assert!(store.load(&key("old.rs", 1)).unwrap().is_some());
+        assert!(store.load(&key("new.rs", 1)).unwrap().is_none());
     }
 
     #[test]

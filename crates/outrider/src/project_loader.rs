@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
@@ -40,6 +40,32 @@ struct LoadingState {
     folder_name: String,
     progress: Arc<IndexProgress>,
     result: Receiver<Result<LoadResult, String>>,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
+struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn checkpoint(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            Err("project load cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Owns background project loads and rejects results from superseded generations.
@@ -70,15 +96,20 @@ impl ProjectLoader {
 
     pub fn start(&mut self, project_root: PathBuf, settings: Settings) -> u64 {
         let worker_root = project_root.clone();
-        self.start_with(project_root, move |progress, generation| {
-            load_project(&worker_root, &settings, progress, generation)
+        self.start_with(project_root, move |progress, generation, cancellation| {
+            load_project_cancellable(&worker_root, &settings, progress, generation, cancellation)
         })
     }
 
     fn start_with<F>(&mut self, project_root: PathBuf, load: F) -> u64
     where
-        F: FnOnce(&IndexProgress, u64) -> Result<LoadResult, String> + Send + 'static,
+        F: FnOnce(&IndexProgress, u64, &CancellationToken) -> Result<LoadResult, String>
+            + Send
+            + 'static,
     {
+        if let Some(loading) = &self.loading {
+            loading.cancellation.cancel();
+        }
         let generation = self.begin_generation();
         let folder_name = project_root
             .file_name()
@@ -87,9 +118,12 @@ impl ProjectLoader {
         let progress = Arc::new(IndexProgress::new());
         let (result_sender, result) = mpsc::sync_channel(1);
         let worker_progress = Arc::clone(&progress);
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
         std::thread::spawn(move || {
             let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                load(&worker_progress, generation)
+                worker_cancellation.checkpoint()?;
+                load(&worker_progress, generation, &worker_cancellation)
             }))
             .unwrap_or_else(|panic| {
                 let message = panic
@@ -106,6 +140,7 @@ impl ProjectLoader {
             folder_name,
             progress,
             result,
+            cancellation,
         });
         generation
     }
@@ -150,29 +185,53 @@ impl Default for ProjectLoader {
     }
 }
 
-pub fn load_project(
+#[cfg(test)]
+fn load_project(
     project_root: &Path,
     settings: &Settings,
     progress: &IndexProgress,
     generation: u64,
 ) -> Result<LoadResult, String> {
-    let outcome = outrider_index::index_repo_with_progress_outcome(
+    load_project_cancellable(
+        project_root,
+        settings,
+        progress,
+        generation,
+        &CancellationToken::new(),
+    )
+}
+
+fn load_project_cancellable(
+    project_root: &Path,
+    settings: &Settings,
+    progress: &IndexProgress,
+    generation: u64,
+    cancellation: &CancellationToken,
+) -> Result<LoadResult, String> {
+    cancellation.checkpoint()?;
+    let outcome = outrider_index::index_repo_with_progress_outcome_cancellable(
         project_root,
         &settings.filter_extensions,
         &settings.filter_folders,
         progress,
+        &|| cancellation.is_cancelled(),
     )
     .map_err(|error| format!("{error:#}"))?;
+    cancellation.checkpoint()?;
     let tree = outcome.tree;
+    cancellation.checkpoint()?;
     let layout = outrider_layout::pack(&tree, &crate::world::pack_config());
-    Ok(LoadResult {
+    cancellation.checkpoint()?;
+    let result = LoadResult {
         generation,
         project_root: project_root.to_path_buf(),
         tree,
         layout,
         warnings: outcome.warnings,
         source_fingerprints: outcome.source_fingerprints,
-    })
+    };
+    cancellation.checkpoint()?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -243,7 +302,7 @@ mod tests {
     #[test]
     fn worker_panic_becomes_a_recoverable_error() {
         let mut loader = ProjectLoader::new();
-        loader.start_with(std::path::PathBuf::from("panic-project"), |_, _| {
+        loader.start_with(std::path::PathBuf::from("panic-project"), |_, _, _| {
             panic!("simulated worker failure")
         });
 
@@ -280,6 +339,7 @@ mod tests {
             folder_name: "disconnected-project".into(),
             progress: std::sync::Arc::new(outrider_index::IndexProgress::new()),
             result,
+            cancellation: super::CancellationToken::new(),
         });
 
         let LoaderPoll::Ready(result) = loader.poll() else {
@@ -300,6 +360,7 @@ mod tests {
         let first_path = first_repo.path().to_path_buf();
         let second_path = second_repo.path().to_path_buf();
         let (release_first, wait_first) = std::sync::mpsc::channel();
+        let (first_started, wait_first_started) = std::sync::mpsc::channel();
         let (first_finished, first_done) = std::sync::mpsc::channel();
         let (release_second, wait_second) = std::sync::mpsc::channel();
         let settings = Settings::default();
@@ -313,13 +374,15 @@ mod tests {
             .into_owned();
         let mut loader = ProjectLoader::new();
 
-        let first_generation = loader.start_with(first_path, move |progress, generation| {
+        let first_generation = loader.start_with(first_path, move |progress, generation, _| {
+            first_started.send(()).unwrap();
             wait_first.recv().unwrap();
             let result = load_project(&first_worker_path, &first_settings, progress, generation);
             first_finished.send(()).unwrap();
             result
         });
-        let second_generation = loader.start_with(second_path, move |progress, generation| {
+        wait_first_started.recv().unwrap();
+        let second_generation = loader.start_with(second_path, move |progress, generation, _| {
             wait_second.recv().unwrap();
             load_project(&second_worker_path, &settings, progress, generation)
         });
@@ -347,5 +410,44 @@ mod tests {
                 LoaderPoll::Idle => panic!("newer load disappeared"),
             }
         }
+    }
+
+    #[test]
+    fn superseding_a_load_cancels_old_work_before_later_phases() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let old_reached_discovery = Arc::new(AtomicUsize::new(0));
+        let old_reached_materialization = Arc::new(AtomicUsize::new(0));
+        let (release_discovery, wait_for_release) = std::sync::mpsc::channel();
+        let (old_exited, wait_for_old_exit) = std::sync::mpsc::channel();
+        let reached_discovery = Arc::clone(&old_reached_discovery);
+        let reached_materialization = Arc::clone(&old_reached_materialization);
+        let mut loader = ProjectLoader::new();
+
+        loader.start_with(
+            std::path::PathBuf::from("old-project"),
+            move |_, _, cancellation| {
+                reached_discovery.fetch_add(1, Ordering::SeqCst);
+                wait_for_release.recv().unwrap();
+                let checkpoint = cancellation.checkpoint();
+                old_exited.send(()).unwrap();
+                checkpoint?;
+                reached_materialization.fetch_add(1, Ordering::SeqCst);
+                unreachable!("test stops at the cancellation checkpoint")
+            },
+        );
+
+        while old_reached_discovery.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        loader.start_with(std::path::PathBuf::from("new-project"), |_, _, _| {
+            Err("new load intentionally left incomplete".into())
+        });
+        release_discovery.send(()).unwrap();
+        wait_for_old_exit
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("cancelled old worker did not exit");
+        assert_eq!(old_reached_materialization.load(Ordering::SeqCst), 0);
     }
 }
