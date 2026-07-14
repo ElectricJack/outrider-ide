@@ -348,6 +348,18 @@ fn container_header_px(zoom: f64) -> f64 {
     ((HEADER + 2.0 * LINE_STEP) * zoom.min(1.0)).max(HEADER)
 }
 
+fn container_header_bg_h(body_len: usize, max_h: f64) -> f64 {
+    (HEADER + body_len as f64 * LINE_STEP).min(max_h)
+}
+
+fn container_name_eligible(rung: Rung, clipped_h: f64) -> bool {
+    match rung {
+        Rung::Dot => false,
+        Rung::Label => clipped_h >= 14.0,
+        Rung::Card | Rung::Detail | Rung::Full => true,
+    }
+}
+
 /// Predicted height of the pinned ancestor-header stack above `focus` under
 /// camera `cam`, mirroring paint_items' stacking: each named ancestor's
 /// header pins at max(its screen top clamped to the viewport, the previous
@@ -765,13 +777,13 @@ impl TreemapView {
                     let stack_bottom = header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
                     let pin_y = item.px.y.max(stack_bottom);
                     let ch_px = container_header_px(camera.zoom);
-                    if rung != Rung::Dot && item.px.h >= 14.0 {
+                    if container_name_eligible(rung, item.px.h) {
                         name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
                     }
                     body =
                         container_body(item.node, rung, &item.px, item.label_w, vh, pin_y, ch_px);
                     if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
-                        header_bg_h = (HEADER + body.len() as f64 * LINE_STEP).min(ch_px) as f32;
+                        header_bg_h = container_header_bg_h(body.len(), ch_px) as f32;
                         header_bg_y = pin_y as f32;
                         header_stack.push((item.level, pin_y + header_bg_h as f64));
                     }
@@ -2316,8 +2328,9 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, container_header_px, leaf_tex_rect, leaf_text_body,
-        runs_from_spans, truncate_to_width, wrap_doc, HEADER, LINE_STEP,
+        code_line, container_body, container_header_bg_h, container_header_px,
+        container_name_eligible, leaf_tex_rect, leaf_text_body, runs_from_spans, truncate_to_width,
+        wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2631,6 +2644,22 @@ mod tests {
         assert!((container_header_px(0.5) - natural * 0.5).abs() < 1e-9);
         assert!((container_header_px(0.1) - HEADER).abs() < 1e-9);
         assert!((container_header_px(0.0) - HEADER).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pinned_container_name_eligibility_uses_rung_before_clipped_height() {
+        assert!(!container_name_eligible(Rung::Dot, 100.0));
+        assert!(!container_name_eligible(Rung::Label, 13.99));
+        assert!(container_name_eligible(Rung::Label, 14.0));
+        assert!(container_name_eligible(Rung::Card, 1.0));
+        assert!(container_name_eligible(Rung::Detail, 1.0));
+        assert!(container_name_eligible(Rung::Full, 1.0));
+    }
+
+    #[test]
+    fn named_container_header_background_keeps_one_line_without_body_rows() {
+        let h = container_header_bg_h(0, container_header_px(0.1));
+        assert!((h - HEADER).abs() < 1e-9);
     }
 
     fn screen_y(cam: &Camera, wy: f64, vh: f64) -> f64 {
