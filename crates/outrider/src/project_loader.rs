@@ -8,6 +8,7 @@ use outrider_index::{IndexProgress, SymbolTree};
 use outrider_layout::PackLayout;
 
 use crate::settings::Settings;
+use crate::texture_store::ProjectTextureNamespace;
 
 /// Project data prepared off the UI thread. Textures are intentionally absent:
 /// the view creates an empty, project-scoped cache after accepting this result.
@@ -18,6 +19,9 @@ pub struct LoadResult {
     pub layout: PackLayout,
     pub warnings: Vec<String>,
     pub source_fingerprints: BTreeMap<String, u64>,
+    /// Canonical project cache identity prepared off the UI thread. Failure is
+    /// non-fatal so the tree and layout remain usable without disk caching.
+    pub project_namespace: Result<ProjectTextureNamespace, String>,
 }
 
 /// A cheap snapshot of the indexer's atomic progress counters.
@@ -209,6 +213,9 @@ fn load_project_cancellable(
     cancellation: &CancellationToken,
 ) -> Result<LoadResult, String> {
     cancellation.checkpoint()?;
+    let project_namespace =
+        ProjectTextureNamespace::prepare(project_root).map_err(|error| error.to_string());
+    cancellation.checkpoint()?;
     let outcome = outrider_index::index_repo_with_progress_outcome_cancellable(
         project_root,
         &settings.filter_extensions,
@@ -229,6 +236,7 @@ fn load_project_cancellable(
         layout,
         warnings: outcome.warnings,
         source_fingerprints: outcome.source_fingerprints,
+        project_namespace,
     };
     cancellation.checkpoint()?;
     Ok(result)
@@ -263,6 +271,7 @@ mod tests {
             layout,
             warnings,
             source_fingerprints,
+            project_namespace,
         } = result;
 
         assert_eq!(generation, 7);
@@ -271,6 +280,7 @@ mod tests {
         assert!(!layout.rects.is_empty());
         assert!(warnings.is_empty());
         assert!(source_fingerprints.contains_key("main.rs"));
+        assert!(project_namespace.is_ok());
     }
 
     #[test]
@@ -449,5 +459,37 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("cancelled old worker did not exit");
         assert_eq!(old_reached_materialization.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn background_load_prepares_the_same_namespace_for_canonical_path_aliases() {
+        fn await_result(loader: &mut ProjectLoader) -> LoadResult {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match loader.poll() {
+                    LoaderPoll::Loading(_) => {
+                        assert!(std::time::Instant::now() < deadline, "load timed out");
+                        std::thread::yield_now();
+                    }
+                    LoaderPoll::Ready(result) => return result.unwrap(),
+                    LoaderPoll::Idle => panic!("loader became idle before returning its result"),
+                }
+            }
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("alias-segment")).unwrap();
+        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let alias = repo.path().join("alias-segment").join("..");
+
+        let mut canonical_loader = ProjectLoader::new();
+        canonical_loader.start(repo.path().to_path_buf(), Settings::default());
+        let canonical = await_result(&mut canonical_loader);
+
+        let mut alias_loader = ProjectLoader::new();
+        alias_loader.start(alias, Settings::default());
+        let aliased = await_result(&mut alias_loader);
+
+        assert!(canonical.project_namespace == aliased.project_namespace);
     }
 }

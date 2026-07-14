@@ -1622,6 +1622,7 @@ impl TreemapView {
             layout,
             warnings,
             source_fingerprints,
+            project_namespace,
         } = project;
         debug_assert!(self.loader.accepts(generation));
         self.file_symbols = collect_file_symbols(&tree);
@@ -1636,8 +1637,8 @@ impl TreemapView {
         self.palette = palette::Palette::new();
         self.tree = tree;
         self.layout = layout;
-        self.textures = Some(TextureCache::new(
-            &project_root,
+        self.textures = Some(TextureCache::new_prepared(
+            project_namespace,
             source_fingerprints,
             self.settings.cache_mb as usize * 1024 * 1024,
             self.settings.disk_cache_bytes(&project_root),

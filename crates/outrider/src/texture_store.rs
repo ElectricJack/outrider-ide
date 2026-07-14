@@ -69,24 +69,13 @@ pub struct TextureStore {
 }
 
 impl TextureStore {
-    pub(crate) fn prepare_replacement(
-        project_root: &Path,
-        max_bytes: u64,
-    ) -> io::Result<PreparedTextureStore> {
-        let cache_root = dirs::cache_dir()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cache directory unavailable"))?
-            .join("outrider")
-            .join("textures");
-        Self::prepare_project_replacement_at(&cache_root, project_root, max_bytes)
-    }
-
+    #[cfg(test)]
     fn prepare_project_replacement_at(
         cache_root: &Path,
         project_root: &Path,
         max_bytes: u64,
     ) -> io::Result<PreparedTextureStore> {
-        let identity = canonical_project_identity(project_root);
-        Self::prepare_namespace(namespace_derivation(cache_root, &identity), max_bytes)
+        Ok(project_namespace_at(cache_root, project_root).claim(max_bytes))
     }
 
     #[cfg(test)]
@@ -95,22 +84,13 @@ impl TextureStore {
         project_identity: &str,
         max_bytes: u64,
     ) -> io::Result<PreparedTextureStore> {
-        Self::prepare_namespace(
-            namespace_derivation(cache_root, project_identity),
-            max_bytes,
+        Ok(
+            ProjectTextureNamespace::from_derivation(namespace_derivation(
+                cache_root,
+                project_identity,
+            ))
+            .claim(max_bytes),
         )
-    }
-
-    fn prepare_namespace(
-        namespace: NamespaceDerivation,
-        max_bytes: u64,
-    ) -> io::Result<PreparedTextureStore> {
-        let generation = namespace.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        Ok(PreparedTextureStore {
-            namespace,
-            max_bytes,
-            generation,
-        })
     }
 
     #[cfg(test)]
@@ -553,14 +533,50 @@ pub(crate) struct PreparedTextureStore {
     generation: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct ProjectTextureNamespace(Arc<NamespaceDerivation>);
+
+impl ProjectTextureNamespace {
+    pub(crate) fn prepare(project_root: &Path) -> io::Result<Self> {
+        let cache_root = dirs::cache_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cache directory unavailable"))?
+            .join("outrider")
+            .join("textures");
+        Ok(project_namespace_at(&cache_root, project_root))
+    }
+
+    fn from_derivation(namespace: NamespaceDerivation) -> Self {
+        Self(Arc::new(namespace))
+    }
+
+    pub(crate) fn claim(&self, max_bytes: u64) -> PreparedTextureStore {
+        let generation = self.0.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        PreparedTextureStore {
+            namespace: (*self.0).clone(),
+            max_bytes,
+            generation,
+        }
+    }
+}
+
+impl PartialEq for ProjectTextureNamespace {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.key == other.0.key
+    }
+}
+
+impl Eq for ProjectTextureNamespace {}
+
 impl PreparedTextureStore {
     pub(crate) fn open(self) -> io::Result<TextureStore> {
         TextureStore::open_namespace(self.namespace, self.max_bytes, self.generation)
     }
 }
 
+#[derive(Clone)]
 struct NamespaceDerivation {
     dir: PathBuf,
+    key: String,
     shared: Arc<NamespaceResources>,
 }
 
@@ -580,6 +596,11 @@ fn canonical_project_identity(project_root: &Path) -> String {
     identity
 }
 
+fn project_namespace_at(cache_root: &Path, project_root: &Path) -> ProjectTextureNamespace {
+    let identity = canonical_project_identity(project_root);
+    ProjectTextureNamespace::from_derivation(namespace_derivation(cache_root, &identity))
+}
+
 fn namespace_derivation(cache_root: &Path, project_identity: &str) -> NamespaceDerivation {
     let mut hash = Fnv1a::new();
     hash.field(project_identity.replace('\\', "/").as_bytes());
@@ -590,7 +611,8 @@ fn namespace_derivation(cache_root: &Path, project_identity: &str) -> NamespaceD
     key.make_ascii_lowercase();
     NamespaceDerivation {
         dir,
-        shared: namespace_resources(key),
+        shared: namespace_resources(key.clone()),
+        key,
     }
 }
 

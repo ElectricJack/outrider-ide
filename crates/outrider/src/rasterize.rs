@@ -4,10 +4,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use gpui::RenderImage;
@@ -18,7 +20,7 @@ use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::BufferManager;
 use crate::content::LINE_STEP;
-use crate::texture_store::{TextureKey, TexturePayload, TextureStore};
+use crate::texture_store::{ProjectTextureNamespace, TextureKey, TexturePayload, TextureStore};
 use crate::theme;
 use crate::treemap::BODY_PAD;
 use crate::world;
@@ -400,6 +402,7 @@ fn rgb_u8(c: u32) -> (u8, u8, u8) {
 pub const BAKES_PER_FRAME: usize = 4;
 const DISK_QUEUE_CAPACITY: usize = 64;
 const DISK_RESULT_CAPACITY: usize = 16;
+const DISK_START_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const DEFAULT_CACHE_MB: u32 = 256;
 
@@ -477,6 +480,8 @@ struct TextureDiskWorker {
 
 struct PendingDiskStart {
     prepared: crate::texture_store::PreparedTextureStore,
+    claimant: u64,
+    deadline: Instant,
 }
 
 struct WorkerControl {
@@ -502,6 +507,8 @@ impl WorkerControl {
 
 struct WorkerSlot {
     current: Mutex<Option<Weak<WorkerControl>>>,
+    next_claimant: AtomicU64,
+    newest_claimant: AtomicU64,
     started: AtomicUsize,
     retired: AtomicUsize,
 }
@@ -510,19 +517,45 @@ impl WorkerSlot {
     fn new() -> Self {
         Self {
             current: Mutex::new(None),
+            next_claimant: AtomicU64::new(0),
+            newest_claimant: AtomicU64::new(0),
             started: AtomicUsize::new(0),
             retired: AtomicUsize::new(0),
         }
     }
 
-    fn try_claim(&self) -> Option<Arc<WorkerControl>> {
+    fn designate_successor(&self) -> u64 {
+        let claimant = self.next_claimant.fetch_add(1, Ordering::AcqRel) + 1;
+        self.newest_claimant.fetch_max(claimant, Ordering::AcqRel);
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_newest(claimant) {
+            if let Some(worker) = current.as_ref().and_then(Weak::upgrade) {
+                worker.retire();
+            }
+        }
+        claimant
+    }
+
+    fn is_newest(&self, claimant: u64) -> bool {
+        self.newest_claimant.load(Ordering::Acquire) == claimant
+    }
+
+    fn try_claim(&self, claimant: u64) -> SlotClaim {
+        if !self.is_newest(claimant) {
+            return SlotClaim::Superseded;
+        }
         let mut current = self
             .current
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(worker) = current.as_ref().and_then(Weak::upgrade) {
-            worker.retire();
-            return None;
+        if !self.is_newest(claimant) {
+            return SlotClaim::Superseded;
+        }
+        if current.as_ref().and_then(Weak::upgrade).is_some() {
+            return SlotClaim::Deferred;
         }
         let worker = Arc::new(WorkerControl {
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -530,7 +563,7 @@ impl WorkerSlot {
             wake: Mutex::new(None),
         });
         *current = Some(Arc::downgrade(&worker));
-        Some(worker)
+        SlotClaim::Granted(worker)
     }
 
     fn finish(&self, worker: &Arc<WorkerControl>) {
@@ -549,6 +582,24 @@ impl WorkerSlot {
     }
 }
 
+enum SlotClaim {
+    Granted(Arc<WorkerControl>),
+    Deferred,
+    Superseded,
+}
+
+trait RetryClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct SystemRetryClock;
+
+impl RetryClock for SystemRetryClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 fn global_worker_slot() -> Arc<WorkerSlot> {
     static SLOT: OnceLock<Arc<WorkerSlot>> = OnceLock::new();
     Arc::clone(SLOT.get_or_init(|| Arc::new(WorkerSlot::new())))
@@ -558,12 +609,15 @@ enum WorkerStart {
     Started(TextureDiskWorker),
     Deferred(PendingDiskStart),
     Failed(io::Error),
+    Superseded,
 }
 
 impl TextureDiskWorker {
     fn start(prepared: PendingDiskStart, slot: Arc<WorkerSlot>) -> WorkerStart {
-        let Some(control) = slot.try_claim() else {
-            return WorkerStart::Deferred(prepared);
+        let control = match slot.try_claim(prepared.claimant) {
+            SlotClaim::Granted(control) => control,
+            SlotClaim::Deferred => return WorkerStart::Deferred(prepared),
+            SlotClaim::Superseded => return WorkerStart::Superseded,
         };
         let opener = move || prepared.prepared.open();
         match Self::try_spawn_with_opener_and_control(opener, Some((control, slot))) {
@@ -584,7 +638,10 @@ impl TextureDiskWorker {
         opener: impl FnOnce() -> io::Result<TextureStore> + Send + 'static,
         slot: Arc<WorkerSlot>,
     ) -> Self {
-        let control = slot.try_claim().expect("test worker slot was occupied");
+        let claimant = slot.designate_successor();
+        let SlotClaim::Granted(control) = slot.try_claim(claimant) else {
+            panic!("test worker slot was occupied")
+        };
         Self::try_spawn_with_opener_and_control(opener, Some((control, slot)))
             .expect("failed to spawn gated test texture cache worker")
     }
@@ -803,6 +860,8 @@ pub struct TextureCache {
     disk_worker: Option<TextureDiskWorker>,
     pending_disk_start: Option<PendingDiskStart>,
     worker_slot: Arc<WorkerSlot>,
+    worker_claimant: u64,
+    retry_clock: Arc<dyn RetryClock>,
     waiting_disk: HashMap<SymbolId, f64>,
     disk_inflight: HashSet<SymbolId>,
     disk_worker_starting: bool,
@@ -810,25 +869,29 @@ pub struct TextureCache {
     clear_disk_inflight: usize,
     pending_disk_saves: usize,
     disk_diagnostics: Vec<DiskDiagnostic>,
+    disk_superseded_reported: bool,
     source_fingerprints: BTreeMap<String, u64>,
 }
 
 impl TextureCache {
-    pub fn new(
-        project_root: &Path,
+    pub fn new_prepared(
+        namespace: Result<ProjectTextureNamespace, String>,
         source_fingerprints: BTreeMap<String, u64>,
         max_bytes: usize,
         disk_max_bytes: u64,
     ) -> Self {
-        Self::new_with_slot(
-            project_root,
+        Self::new_prepared_with(
+            namespace,
             source_fingerprints,
             max_bytes,
             disk_max_bytes,
             global_worker_slot(),
+            Arc::new(SystemRetryClock),
+            DISK_START_TIMEOUT,
         )
     }
 
+    #[cfg(test)]
     fn new_with_slot(
         project_root: &Path,
         source_fingerprints: BTreeMap<String, u64>,
@@ -836,20 +899,55 @@ impl TextureCache {
         disk_max_bytes: u64,
         worker_slot: Arc<WorkerSlot>,
     ) -> Self {
-        let start = TextureStore::prepare_replacement(project_root, disk_max_bytes)
-            .map(|prepared| PendingDiskStart { prepared })
-            .map(|pending| TextureDiskWorker::start(pending, Arc::clone(&worker_slot)));
+        Self::new_prepared_with(
+            ProjectTextureNamespace::prepare(project_root).map_err(|error| error.to_string()),
+            source_fingerprints,
+            max_bytes,
+            disk_max_bytes,
+            worker_slot,
+            Arc::new(SystemRetryClock),
+            DISK_START_TIMEOUT,
+        )
+    }
+
+    fn new_prepared_with(
+        namespace: Result<ProjectTextureNamespace, String>,
+        source_fingerprints: BTreeMap<String, u64>,
+        max_bytes: usize,
+        disk_max_bytes: u64,
+        worker_slot: Arc<WorkerSlot>,
+        retry_clock: Arc<dyn RetryClock>,
+        retry_timeout: Duration,
+    ) -> Self {
+        let worker_claimant = worker_slot.designate_successor();
+        let pending = namespace.map(|namespace| PendingDiskStart {
+            prepared: namespace.claim(disk_max_bytes),
+            claimant: worker_claimant,
+            deadline: retry_clock.now() + retry_timeout,
+        });
+        let start =
+            pending.map(|pending| TextureDiskWorker::start(pending, Arc::clone(&worker_slot)));
         let (disk_worker, pending_disk_start, disk_worker_starting, disk_diagnostics) = match start
         {
             Ok(WorkerStart::Started(worker)) => (Some(worker), None, true, Vec::new()),
             Ok(WorkerStart::Deferred(pending)) => (None, Some(pending), false, Vec::new()),
-            Ok(WorkerStart::Failed(error)) | Err(error) => (
+            Ok(WorkerStart::Superseded) => (None, None, false, Vec::new()),
+            Ok(WorkerStart::Failed(error)) => (
                 None,
                 None,
                 false,
                 vec![DiskDiagnostic {
                     operation: DiskOperation::Open,
                     message: error.to_string(),
+                }],
+            ),
+            Err(message) => (
+                None,
+                None,
+                false,
+                vec![DiskDiagnostic {
+                    operation: DiskOperation::Open,
+                    message,
                 }],
             ),
         };
@@ -865,6 +963,8 @@ impl TextureCache {
             disk_worker,
             pending_disk_start,
             worker_slot,
+            worker_claimant,
+            retry_clock,
             waiting_disk: HashMap::new(),
             disk_inflight: HashSet::new(),
             disk_worker_starting,
@@ -872,6 +972,7 @@ impl TextureCache {
             clear_disk_inflight: 0,
             pending_disk_saves: 0,
             disk_diagnostics,
+            disk_superseded_reported: false,
             source_fingerprints,
         }
     }
@@ -893,6 +994,9 @@ impl TextureCache {
     }
 
     pub fn disk_state(&self) -> DiskState {
+        if !self.worker_slot.is_newest(self.worker_claimant) {
+            return DiskState::Unavailable;
+        }
         let Some(worker) = &self.disk_worker else {
             return if self.pending_disk_start.is_some() {
                 DiskState::Preparing
@@ -939,7 +1043,10 @@ impl TextureCache {
             e.last_used = self.clock;
             return Some(&e.tex);
         }
-        if self.disk_key(id).is_some() && self.disk_worker.is_some() {
+        if self.worker_slot.is_newest(self.worker_claimant)
+            && self.disk_key(id).is_some()
+            && self.disk_worker.is_some()
+        {
             let priority = self.waiting_disk.entry(id.clone()).or_insert(screen_area);
             *priority = priority.max(screen_area);
             return None;
@@ -1020,6 +1127,7 @@ impl TextureCache {
         &mut self,
         mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
     ) -> bool {
+        self.handle_disk_superseded();
         self.retry_disk_worker_start();
         self.apply_disk_results();
         self.dispatch_clear_request();
@@ -1087,6 +1195,11 @@ impl TextureCache {
         let Some(worker) = &self.disk_worker else {
             return;
         };
+        if !self.worker_slot.is_newest(self.worker_claimant)
+            || worker.cancelled.load(Ordering::Acquire)
+        {
+            return;
+        }
         let Some(key) = self.disk_key(id) else { return };
         let Some(image) = &tex.image else { return };
         let size = image.size(0);
@@ -1111,18 +1224,50 @@ impl TextureCache {
         let Some(pending) = self.pending_disk_start.take() else {
             return;
         };
+        if self.retry_clock.now() >= pending.deadline {
+            self.disk_diagnostics.push(DiskDiagnostic {
+                operation: DiskOperation::Open,
+                message: "timed out waiting for the previous texture cache worker to retire".into(),
+            });
+            return;
+        }
         match TextureDiskWorker::start(pending, Arc::clone(&self.worker_slot)) {
             WorkerStart::Started(worker) => {
                 self.disk_worker = Some(worker);
                 self.disk_worker_starting = true;
             }
             WorkerStart::Deferred(pending) => self.pending_disk_start = Some(pending),
+            WorkerStart::Superseded => self.handle_disk_superseded(),
             WorkerStart::Failed(error) => {
                 self.disk_diagnostics.push(DiskDiagnostic {
                     operation: DiskOperation::Open,
                     message: error.to_string(),
                 });
             }
+        }
+    }
+
+    fn handle_disk_superseded(&mut self) {
+        if self.worker_slot.is_newest(self.worker_claimant) {
+            return;
+        }
+        self.pending_disk_start = None;
+        self.disk_worker = None;
+        let waiting = std::mem::take(&mut self.waiting_disk);
+        self.disk_inflight.clear();
+        for (id, priority) in waiting {
+            self.request(id, priority);
+        }
+        self.disk_worker_starting = false;
+        self.clear_disk_pending = false;
+        self.clear_disk_inflight = 0;
+        self.pending_disk_saves = 0;
+        if !self.disk_superseded_reported {
+            self.disk_superseded_reported = true;
+            self.disk_diagnostics.push(DiskDiagnostic {
+                operation: DiskOperation::Open,
+                message: "texture cache superseded by a newer project".into(),
+            });
         }
     }
 
@@ -1254,6 +1399,8 @@ impl TextureCache {
 
     #[cfg(test)]
     fn new_memory_only(max_bytes: usize) -> Self {
+        let worker_slot = Arc::new(WorkerSlot::new());
+        let worker_claimant = worker_slot.designate_successor();
         Self {
             raster: Rasterizer::new(),
             entries: HashMap::new(),
@@ -1265,7 +1412,9 @@ impl TextureCache {
             retired: Vec::new(),
             disk_worker: None,
             pending_disk_start: None,
-            worker_slot: Arc::new(WorkerSlot::new()),
+            worker_slot,
+            worker_claimant,
+            retry_clock: Arc::new(SystemRetryClock),
             waiting_disk: HashMap::new(),
             disk_inflight: HashSet::new(),
             disk_worker_starting: false,
@@ -1273,6 +1422,7 @@ impl TextureCache {
             clear_disk_inflight: 0,
             pending_disk_saves: 0,
             disk_diagnostics: Vec::new(),
+            disk_superseded_reported: false,
             source_fingerprints: BTreeMap::new(),
         }
     }
@@ -1437,6 +1587,11 @@ mod tests {
         assert!(current.pending_disk_start.is_some());
         assert_eq!(current.pending_disk_saves, 0);
         assert_eq!(current.disk_state(), DiskState::Preparing);
+        middle.request(sid("memory-only"), 100.0);
+        middle.process_requests(|_, _| Some(texture(1)));
+        assert!(middle.contains(&sid("memory-only")));
+        assert_eq!(middle.disk_state(), DiskState::Unavailable);
+        assert!(middle.pending_disk_start.is_none());
         drop(middle);
 
         allow_retirement.send(()).unwrap();
@@ -1451,6 +1606,95 @@ mod tests {
         assert!(current.disk_worker.is_some());
         wait_for_counter_for_test(&slot.started, 2);
         assert_eq!(slot.started.load(Ordering::Acquire), 2);
+        assert!(!current
+            .disk_worker
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .load(Ordering::Acquire));
+    }
+
+    struct FakeRetryClock {
+        base: Instant,
+        elapsed_millis: AtomicU64,
+    }
+
+    impl FakeRetryClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                elapsed_millis: AtomicU64::new(0),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.elapsed_millis
+                .fetch_add(duration.as_millis() as u64, Ordering::AcqRel);
+        }
+    }
+
+    impl RetryClock for FakeRetryClock {
+        fn now(&self) -> Instant {
+            self.base + Duration::from_millis(self.elapsed_millis.load(Ordering::Acquire))
+        }
+    }
+
+    #[test]
+    fn deferred_worker_times_out_once_and_future_cache_can_claim() {
+        let project = tempfile::tempdir().unwrap();
+        let slot = Arc::new(WorkerSlot::new());
+        let clock = Arc::new(FakeRetryClock::new());
+        let (release_retiree, blocked_retiree) = mpsc::channel();
+        let retiree = TextureDiskWorker::spawn_with_opener_and_slot(
+            move || {
+                blocked_retiree.recv().unwrap();
+                Err(std::io::Error::other("released retiree"))
+            },
+            Arc::clone(&slot),
+        );
+        wait_for_counter_for_test(&slot.started, 1);
+
+        let namespace = ProjectTextureNamespace::prepare(project.path()).unwrap();
+        let mut deferred = TextureCache::new_prepared_with(
+            Ok(namespace.clone()),
+            BTreeMap::new(),
+            1024,
+            1024,
+            Arc::clone(&slot),
+            clock.clone(),
+            Duration::from_secs(10),
+        );
+        assert_eq!(deferred.disk_state(), DiskState::Preparing);
+        assert!(deferred.has_queued());
+
+        clock.advance(Duration::from_secs(11));
+        deferred.process_requests(|_, _| None);
+        assert_eq!(deferred.disk_state(), DiskState::Unavailable);
+        assert!(!deferred.has_queued());
+        assert_eq!(deferred.drain_disk_diagnostics().len(), 1);
+        deferred.process_requests(|_, _| None);
+        assert!(deferred.drain_disk_diagnostics().is_empty());
+
+        drop(retiree);
+        release_retiree.send(()).unwrap();
+        wait_for_counter_for_test(&slot.retired, 1);
+        let mut future = TextureCache::new_prepared_with(
+            Ok(namespace),
+            BTreeMap::new(),
+            1024,
+            1024,
+            Arc::clone(&slot),
+            clock,
+            Duration::from_secs(10),
+        );
+        for _ in 0..100 {
+            future.process_requests(|_, _| None);
+            if future.disk_worker.is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(future.disk_worker.is_some());
     }
 
     fn wait_for_counter_for_test(counter: &AtomicUsize, expected: usize) {
