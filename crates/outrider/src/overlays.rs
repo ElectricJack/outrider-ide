@@ -1,4 +1,3 @@
-/// Severity controls the visual treatment of a transient notification.
 use gpui::{div, prelude::*, px, rgb, rgba, ElementId, Pixels};
 use outrider_index::SymbolId;
 
@@ -10,6 +9,7 @@ pub(crate) struct ContextMenu {
     pub(crate) target: SymbolId,
 }
 
+/// Severity controls the visual treatment of a transient notification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NotificationLevel {
     Warning,
@@ -31,7 +31,8 @@ impl Notification {
     }
 }
 
-/// Notification stack; the newest entry is visible until dismissed.
+/// Notification stack; the newest entry is visible until dismissed. The
+/// oldest warning is evicted when the stack grows beyond 64 entries.
 #[derive(Default)]
 pub(crate) struct Notifications {
     entries: Vec<Notification>,
@@ -40,6 +41,9 @@ pub(crate) struct Notifications {
 impl Notifications {
     pub(crate) fn push(&mut self, notification: Notification) {
         self.entries.push(notification);
+        if self.entries.len() > 64 {
+            self.entries.remove(0);
+        }
     }
 
     pub(crate) fn visible(&self) -> Option<&Notification> {
@@ -382,5 +386,20 @@ mod tests {
         notifications.push(Notification::warning("second"));
         notifications.dismiss_visible();
         assert_eq!(notifications.visible().unwrap().message, "first");
+    }
+
+    #[test]
+    fn notification_stack_evicts_the_oldest_beyond_64_entries() {
+        let mut notifications = Notifications::default();
+        for index in 0..=64 {
+            notifications.push(Notification::warning(index.to_string()));
+        }
+        assert_eq!(notifications.visible().unwrap().message, "64");
+        for _ in 0..63 {
+            notifications.dismiss_visible();
+        }
+        assert_eq!(notifications.visible().unwrap().message, "1");
+        notifications.dismiss_visible();
+        assert!(notifications.visible().is_none());
     }
 }
