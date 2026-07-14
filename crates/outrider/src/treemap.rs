@@ -460,6 +460,12 @@ fn inset_top(mut cam: Camera, r: Rect, inset: f64, vh: f64) -> Camera {
     cam
 }
 
+/// The smallest zoom at which a focused leaf remains in the live Text tier:
+/// both the font and its code column must clear their rendering thresholds.
+fn leaf_text_zoom_floor(r: Rect) -> f64 {
+    (content::MIN_TEXT_FONT_PX / FONT_PX).max(world::CODE_MIN_W / r.w)
+}
+
 /// Map a symbol node to the semantic tint for its box background.
 fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     match &node.id.kind {
@@ -720,7 +726,13 @@ impl TreemapView {
             .is_some_and(content::is_leaf_item);
         Some(self.frame_below_headers(index, r, vw, vh, |vh_eff| {
             if leaf {
-                camera::frame_page(r, vw, vh_eff, min_zoom, max_zoom)
+                camera::frame_page(
+                    r,
+                    vw,
+                    vh_eff,
+                    min_zoom.max(leaf_text_zoom_floor(r)),
+                    max_zoom,
+                )
             } else {
                 camera::frame_rect(r, vw, vh_eff, camera::FOCUS_FRACTION, min_zoom, max_zoom)
             }
@@ -2746,7 +2758,7 @@ mod tests {
         ));
     }
 
-    use super::{inset_top, pinned_stack_h};
+    use super::{inset_top, leaf_text_zoom_floor, pinned_stack_h};
     use crate::camera::Camera;
     use crate::focus::TreeIndex;
     use outrider_index::SymbolTree;
@@ -2768,6 +2780,46 @@ mod tests {
         assert!((container_header_px(below) - HEADER).abs() < 1e-9);
         assert!((container_header_px(transition) - HEADER).abs() < 1e-9);
         assert!(container_header_px(above) > HEADER);
+    }
+
+    #[test]
+    fn focused_leaf_zoom_floor_keeps_live_text_and_code_width() {
+        let normal_page = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 480.0,
+            h: 2_000.0,
+        };
+        assert!((leaf_text_zoom_floor(normal_page) - 0.625).abs() < 1e-9);
+
+        let narrow_page = Rect {
+            w: 200.0,
+            ..normal_page
+        };
+        assert!((leaf_text_zoom_floor(narrow_page) - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inset_top_pins_a_tall_leaf_below_headers() {
+        let page = Rect {
+            x: 10.0,
+            y: 200.0,
+            w: 480.0,
+            h: 2_000.0,
+        };
+        let vh = 600.0;
+        let inset = 48.0;
+        let cam = inset_top(
+            Camera {
+                center_x: page.x + page.w / 2.0,
+                center_y: page.y + page.h / 2.0,
+                zoom: leaf_text_zoom_floor(page),
+            },
+            page,
+            inset,
+            vh,
+        );
+        assert!((screen_y(&cam, page.y, vh) - inset).abs() < 1e-9);
     }
 
     #[test]
