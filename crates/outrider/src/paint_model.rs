@@ -46,6 +46,7 @@ pub(crate) struct PaintItem {
     pub(crate) border: u32,
     pub(crate) stripe: Option<u32>,
     pub(crate) focused: bool,
+    pub(crate) deferred_overlay: bool,
     pub(crate) neighbor: bool,
     pub(crate) body_font_px: f32,
     pub(crate) header_bg_h: f32,

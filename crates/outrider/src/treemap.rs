@@ -394,6 +394,10 @@ fn focused_width(max_chars: usize) -> f64 {
     needed.clamp(world::PAGE_W, 2.0 * world::PAGE_W)
 }
 
+fn defer_leaf_to_overlay(is_focused: bool, is_leaf: bool) -> bool {
+    is_focused && is_leaf
+}
+
 fn max_line_chars(
     node: &SymbolNode,
     buffers: &mut BufferManager,
@@ -1118,6 +1122,7 @@ impl TreemapView {
                 border: theme::border_for(fill),
                 stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
                 focused: is_focused,
+                deferred_overlay: defer_leaf_to_overlay(is_focused, is_leaf),
                 neighbor: !is_focused && neighbor_ids.iter().flatten().any(|n| *n == item.node.id),
                 body_font_px,
                 header_bg_h,
@@ -2182,8 +2187,7 @@ impl Render for TreemapView {
                             underline: None,
                             strikethrough: None,
                         };
-                        // Pass 1: quads, stripes, texture quads (back to front).
-                        for item in &items {
+                        let paint_surface = |item: &PaintItem, window: &mut Window| {
                             let b = Bounds::new(
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
                                 size(px(item.w), px(item.h)),
@@ -2245,13 +2249,8 @@ impl Render for TreemapView {
                                     },
                                 );
                             }
-                        }
-                        // Pass 2a: leaf / non-header text (rendered under
-                        // pinned headers so code doesn't bleed through).
-                        for item in &items {
-                            if item.header_bg_h > 0.0 {
-                                continue;
-                            }
+                        };
+                        let paint_text = |item: &PaintItem, window: &mut Window, cx: &mut App| {
                             if let Some(n) = &item.name {
                                 let line = window.text_system().shape_line(
                                     n.text.clone().into(),
@@ -2265,7 +2264,7 @@ impl Render for TreemapView {
                                     TextAlign::Left,
                                     None,
                                     window,
-                                    _cx,
+                                    cx,
                                 );
                             }
                             let body_line_height = px(item.body_font_px * 1.3);
@@ -2296,9 +2295,23 @@ impl Render for TreemapView {
                                     TextAlign::Left,
                                     None,
                                     window,
-                                    _cx,
+                                    cx,
                                 );
                             }
+                        };
+                        // Pass 1: quads, stripes, texture quads (back to front).
+                        for item in &items {
+                            if !item.deferred_overlay {
+                                paint_surface(item, window);
+                            }
+                        }
+                        // Pass 2a: leaf / non-header text (rendered under
+                        // pinned headers so code doesn't bleed through).
+                        for item in &items {
+                            if item.header_bg_h > 0.0 || item.deferred_overlay {
+                                continue;
+                            }
+                            paint_text(item, window, _cx);
                         }
                         // Pass 2b: headers, background + text interleaved per
                         // item in DFS order, so a later (right/below) header's
@@ -2326,47 +2339,13 @@ impl Render for TreemapView {
                                 rgb(item.fill),
                                 BorderStyle::default(),
                             ));
-                            if let Some(n) = &item.name {
-                                let line = window.text_system().shape_line(
-                                    n.text.clone().into(),
-                                    px(n.font_px),
-                                    &[run(n.text.len(), theme::TEXT_PRIMARY)],
-                                    None,
-                                );
-                                let _ = line.paint(
-                                    point(origin.x + px(n.x), origin.y + px(n.y)),
-                                    px(n.font_px * 1.3),
-                                    TextAlign::Left,
-                                    None,
-                                    window,
-                                    _cx,
-                                );
-                            }
-                            let body_line_height = px(item.body_font_px * 1.3);
-                            for bt in &item.body {
-                                if bt.text.is_empty() {
-                                    continue;
-                                }
-                                let runs: Vec<TextRun> = bt
-                                    .runs
-                                    .iter()
-                                    .map(|&(len, color)| run(len, color))
-                                    .collect();
-                                let line = window.text_system().shape_line(
-                                    bt.text.clone().into(),
-                                    px(item.body_font_px),
-                                    &runs,
-                                    None,
-                                );
-                                let _ = line.paint(
-                                    point(origin.x + px(bt.x), origin.y + px(bt.y)),
-                                    body_line_height,
-                                    TextAlign::Left,
-                                    None,
-                                    window,
-                                    _cx,
-                                );
-                            }
+                            paint_text(item, window, _cx);
+                        }
+                        // Pass 2c: selected leaf surface and text above every
+                        // regular box, texture, body row, and pinned header.
+                        if let Some(item) = items.iter().find(|item| item.deferred_overlay) {
+                            paint_surface(item, window);
+                            paint_text(item, window, _cx);
                         }
                         // Pass 3: focus + neighbor rings on top of everything,
                         // so child boxes, text, and headers never occlude them.
@@ -2615,6 +2594,15 @@ mod tests {
         );
         assert!((focused_width(10) - world::PAGE_W).abs() < 1e-9);
         assert!((focused_width(200) - 2.0 * world::PAGE_W).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_focused_leaves_are_deferred_to_the_overlay_pass() {
+        use super::defer_leaf_to_overlay;
+
+        assert!(defer_leaf_to_overlay(true, true));
+        assert!(!defer_leaf_to_overlay(true, false));
+        assert!(!defer_leaf_to_overlay(false, true));
     }
 
     #[test]
