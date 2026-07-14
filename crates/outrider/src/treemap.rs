@@ -357,6 +357,15 @@ fn leaf_texture_is_visible(
     left < viewport_w && left + width > 0.0 && top < viewport_h && top + height > 0.0
 }
 
+/// A composite texture is valid only when every direct child already has a
+/// renderable texture image. This prevents color-only placeholders in folders.
+fn container_children_have_images(
+    node: &SymbolNode,
+    mut has_image: impl FnMut(&SymbolId) -> bool,
+) -> bool {
+    node.children.iter().all(|child| has_image(&child.id))
+}
+
 /// Rendered container-header height for a positive [`Camera`] zoom.
 fn container_header_px(zoom: f64) -> f64 {
     ((HEADER + 2.0 * LINE_STEP) * zoom.min(1.0)).max(HEADER)
@@ -867,32 +876,22 @@ impl TreemapView {
                     {
                         let area = item.label_w * item.full_h;
                         if let Some(textures) = self.textures.as_mut() {
-                            if let Some(t) = textures.get(&item.node.id, area) {
-                                if let Some(img) = &t.image {
-                                    tex = Some(TexQuad {
-                                        x: item.left as f32,
-                                        y: item.top as f32,
-                                        w: item.label_w as f32,
-                                        h: item.full_h as f32,
-                                        image: img.clone(),
-                                    });
-                                }
-                            } else if textures.needs_dependency_pass(&item.node.id) {
-                                let mut dependencies_ready = true;
-                                for child in &item.node.children {
-                                    let child_area = self
-                                        .layout
-                                        .rects
-                                        .get(&child.id)
-                                        .map(|rect| rect.w * rect.h * camera.zoom * camera.zoom)
-                                        .unwrap_or(0.0);
-                                    if textures.get(&child.id, area + child_area).is_none() {
-                                        dependencies_ready = false;
+                            if textures.has_image(&item.node.id) {
+                                if let Some(t) = textures.get(&item.node.id, area) {
+                                    if let Some(img) = &t.image {
+                                        tex = Some(TexQuad {
+                                            x: item.left as f32,
+                                            y: item.top as f32,
+                                            w: item.label_w as f32,
+                                            h: item.full_h as f32,
+                                            image: img.clone(),
+                                        });
                                     }
                                 }
-                                if !dependencies_ready {
-                                    textures.defer_request_once(&item.node.id);
-                                }
+                            } else if container_children_have_images(item.node, |id| {
+                                textures.has_image(id)
+                            }) {
+                                textures.request(item.node.id.clone(), area);
                             }
                         }
                     }
@@ -918,6 +917,24 @@ impl TreemapView {
                             &mut self.buffers,
                             &self.file_symbols,
                         );
+                        if !body.is_empty() {
+                            let refreshed = self.textures.as_mut().is_some_and(|textures| {
+                                textures.refresh_from_live_text(
+                                    &item.node.id,
+                                    item.label_w * item.full_h,
+                                )
+                            });
+                            if refreshed {
+                                let index = TreeIndex::new(&self.tree);
+                                let mut parent = index.parent(&item.node.id);
+                                while let Some(id) = parent {
+                                    if let Some(textures) = self.textures.as_mut() {
+                                        textures.invalidate(id);
+                                    }
+                                    parent = index.parent(id);
+                                }
+                            }
+                        }
                     } else {
                         let (tx, ty, tw, th) =
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
@@ -2407,9 +2424,10 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, container_header_bg_h, container_header_layout,
-        container_header_px, header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body,
-        leaf_texture_is_visible, runs_from_spans, truncate_to_width, wrap_doc, HEADER, LINE_STEP,
+        code_line, container_body, container_children_have_images, container_header_bg_h,
+        container_header_layout, container_header_px, header_bg_paint_h, header_paint_y,
+        leaf_tex_rect, leaf_text_body, leaf_texture_is_visible, runs_from_spans, truncate_to_width,
+        wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2504,6 +2522,17 @@ mod tests {
         // churn readout only (doc shown via hover panel, no children → no kinds)
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - (HEADER - 1.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn container_texture_waits_for_each_child_image() {
+        let mut folder = node(SymbolKind::Folder, "src", None, 2, None, None);
+        let first = node(SymbolKind::File, "src/a.rs", Some(0..1), 1, None, None);
+        let second = node(SymbolKind::File, "src/b.rs", Some(0..1), 1, None, None);
+        folder.children = vec![first.clone(), second.clone()];
+
+        assert!(!container_children_have_images(&folder, |id| id == &first.id));
+        assert!(container_children_have_images(&folder, |_| true));
     }
 
     #[test]

@@ -855,7 +855,7 @@ pub struct TextureCache {
     bytes: usize,
     max_bytes: usize,
     queue: HashMap<SymbolId, f64>,
-    deferred_once: HashSet<SymbolId>,
+    refreshed_from_live_text: HashSet<SymbolId>,
     retired: Vec<Arc<RenderImage>>,
     disk_worker: Option<TextureDiskWorker>,
     pending_disk_start: Option<PendingDiskStart>,
@@ -958,7 +958,7 @@ impl TextureCache {
             bytes: 0,
             max_bytes,
             queue: HashMap::new(),
-            deferred_once: HashSet::new(),
+            refreshed_from_live_text: HashSet::new(),
             retired: Vec::new(),
             disk_worker,
             pending_disk_start,
@@ -1035,6 +1035,14 @@ impl TextureCache {
         self.entries.contains_key(id)
     }
 
+    /// Whether the cache contains a renderable image, rather than an empty
+    /// placeholder produced while its source buffer was unavailable.
+    pub fn has_image(&self, id: &SymbolId) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|entry| entry.tex.image.is_some())
+    }
+
     /// Cache lookup. Hit refreshes LRU; miss checks disk, then queues.
     pub fn get(&mut self, id: &SymbolId, screen_area: f64) -> Option<&NodeTexture> {
         self.clock += 1;
@@ -1070,18 +1078,18 @@ impl TextureCache {
             .or_insert(screen_area);
     }
 
-    /// Give a container's dependencies one bounded processing pass.
-    pub fn defer_request_once(&mut self, id: &SymbolId) -> bool {
-        if self.deferred_once.insert(id.clone()) {
-            self.queue.remove(id);
-            true
-        } else {
-            false
+    /// Queue one replacement bake after live text proves the source buffer is
+    /// available. A fresh cache is created for each project load, so one
+    /// refresh per node keeps scrolling responsive without rebaking every frame.
+    pub fn refresh_from_live_text(&mut self, id: &SymbolId, screen_area: f64) -> bool {
+        if !self.refreshed_from_live_text.insert(id.clone()) {
+            return false;
         }
-    }
-
-    pub fn needs_dependency_pass(&self, id: &SymbolId) -> bool {
-        !self.deferred_once.contains(id)
+        self.queue
+            .entry(id.clone())
+            .and_modify(|priority| *priority = priority.max(screen_area))
+            .or_insert(screen_area);
+        true
     }
 
     pub fn has_queued(&self) -> bool {
@@ -1149,8 +1157,19 @@ impl TextureCache {
         self.insert_entry(id, tex);
     }
 
+    /// Remove a composited texture so it is rebuilt from its refreshed child
+    /// images. The next paint keeps rendering its visible children meanwhile.
+    pub fn invalidate(&mut self, id: &SymbolId) {
+        let Some(replaced) = self.entries.remove(id) else {
+            return;
+        };
+        self.bytes -= replaced.tex.bytes;
+        if let Some(image) = replaced.tex.image {
+            self.retired.push(image);
+        }
+    }
+
     fn insert_entry(&mut self, id: SymbolId, tex: NodeTexture) {
-        self.deferred_once.remove(&id);
         if let Some(replaced) = self.entries.remove(&id) {
             self.bytes -= replaced.tex.bytes;
             if let Some(image) = replaced.tex.image {
@@ -1408,7 +1427,7 @@ impl TextureCache {
             bytes: 0,
             max_bytes,
             queue: HashMap::new(),
-            deferred_once: HashSet::new(),
+            refreshed_from_live_text: HashSet::new(),
             retired: Vec::new(),
             disk_worker: None,
             pending_disk_start: None,
@@ -1522,6 +1541,40 @@ mod tests {
         cache.request(sid("b"), 50.0);
 
         assert_eq!(cache.queued_ids(), vec![sid("a"), sid("b")]);
+    }
+
+    #[test]
+    fn image_readiness_rejects_empty_cached_texture() {
+        let mut cache = TextureCache::new_memory_only(1024 * 1024);
+        cache.insert(sid("empty"), texture(0));
+        assert!(!cache.has_image(&sid("empty")));
+
+        cache.insert(
+            sid("rendered"),
+            some_tex(1, &mut Rasterizer::new()).unwrap(),
+        );
+        assert!(cache.has_image(&sid("rendered")));
+    }
+
+    #[test]
+    fn live_text_refresh_queues_cached_texture_once() {
+        let mut cache = TextureCache::new_memory_only(1024);
+        cache.insert(sid("leaf"), some_tex(1, &mut Rasterizer::new()).unwrap());
+
+        assert!(cache.refresh_from_live_text(&sid("leaf"), 100.0));
+        assert_eq!(cache.queued_ids(), vec![sid("leaf")]);
+        assert!(!cache.refresh_from_live_text(&sid("leaf"), 100.0));
+    }
+
+    #[test]
+    fn invalidating_a_texture_removes_its_renderable_image() {
+        let mut cache = TextureCache::new_memory_only(1024 * 1024);
+        cache.insert(sid("folder"), some_tex(1, &mut Rasterizer::new()).unwrap());
+
+        cache.invalidate(&sid("folder"));
+
+        assert!(!cache.contains(&sid("folder")));
+        assert!(!cache.has_image(&sid("folder")));
     }
 
     #[test]
@@ -2019,31 +2072,6 @@ mod tests {
         cache.process_requests(|_, _| Some(texture(1)));
 
         assert!(cache.contains(&sid("a")));
-    }
-
-    #[test]
-    fn parent_is_deferred_once_without_losing_dependency_requests() {
-        let mut cache = TextureCache::new_memory_only(100);
-        for i in 0..6 {
-            cache.insert(sid(&format!("child-{i}")), texture(80));
-        }
-
-        cache.request(sid("parent"), 100.0);
-        for i in 0..5 {
-            cache.request(sid(&format!("child-{i}")), 110.0);
-        }
-
-        assert!(cache.defer_request_once(&sid("parent")));
-        assert!(cache.process_requests(|_, _| Some(texture(80))));
-        assert!(!cache.needs_dependency_pass(&sid("parent")));
-
-        cache.request(sid("parent"), 100.0);
-        assert!(!cache.defer_request_once(&sid("parent")));
-        assert!(!cache.process_requests(|_, _| Some(texture(80))));
-        assert!(
-            cache.contains(&sid("parent")),
-            "parent gets a reserved turn"
-        );
     }
 
     #[test]
