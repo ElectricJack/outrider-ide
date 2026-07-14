@@ -398,6 +398,10 @@ fn defer_leaf_to_overlay(is_focused: bool, is_leaf: bool) -> bool {
     is_focused && is_leaf
 }
 
+fn ring_paints_after_leaf_overlay(is_focused: bool, is_neighbor: bool) -> bool {
+    is_focused && !is_neighbor
+}
+
 fn max_line_chars(
     node: &SymbolNode,
     buffers: &mut BufferManager,
@@ -2341,18 +2345,7 @@ impl Render for TreemapView {
                             ));
                             paint_text(item, window, _cx);
                         }
-                        // Pass 2c: selected leaf surface and text above every
-                        // regular box, texture, body row, and pinned header.
-                        if let Some(item) = items.iter().find(|item| item.deferred_overlay) {
-                            paint_surface(item, window);
-                            paint_text(item, window, _cx);
-                        }
-                        // Pass 3: focus + neighbor rings on top of everything,
-                        // so child boxes, text, and headers never occlude them.
-                        for item in &items {
-                            if !item.focused && !item.neighbor {
-                                continue;
-                            }
+                        let paint_ring = |item: &PaintItem, window: &mut Window| {
                             let b = Bounds::new(
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
                                 size(px(item.w), px(item.h)),
@@ -2370,6 +2363,25 @@ impl Render for TreemapView {
                                 bc,
                                 BorderStyle::default(),
                             ));
+                        };
+                        // Pass 2c: neighbor rings remain above regular content
+                        // but below the selected leaf when their bounds overlap.
+                        for item in &items {
+                            if item.neighbor {
+                                paint_ring(item, window);
+                            }
+                        }
+                        // Pass 2d: selected leaf surface and text above every
+                        // regular box, texture, body row, header, and neighbor.
+                        if let Some(item) = items.iter().find(|item| item.deferred_overlay) {
+                            paint_surface(item, window);
+                            paint_text(item, window, _cx);
+                        }
+                        // Pass 3: only the selected focus ring paints above it.
+                        for item in &items {
+                            if ring_paints_after_leaf_overlay(item.focused, item.neighbor) {
+                                paint_ring(item, window);
+                            }
                         }
                         // Pass 4: focused-leaf doc panel (floats to the right).
                         if let Some(dp) = &doc_panel {
@@ -2603,6 +2615,14 @@ mod tests {
         assert!(defer_leaf_to_overlay(true, true));
         assert!(!defer_leaf_to_overlay(true, false));
         assert!(!defer_leaf_to_overlay(false, true));
+    }
+
+    #[test]
+    fn only_focus_ring_paints_after_the_leaf_overlay() {
+        use super::ring_paints_after_leaf_overlay;
+
+        assert!(ring_paints_after_leaf_overlay(true, false));
+        assert!(!ring_paints_after_leaf_overlay(false, true));
     }
 
     #[test]
