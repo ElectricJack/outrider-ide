@@ -235,7 +235,7 @@ fn container_body(
     let font = FONT_PX as f32;
     let mut out = Vec::new();
     for (k, line) in content::body_lines(node, rung).into_iter().enumerate() {
-        let y = pin_y + HEADER + k as f64 * LINE_STEP;
+        let y = header_paint_y(pin_y + HEADER + k as f64 * LINE_STEP);
         if y + LINE_STEP > pin_y + max_h || y + LINE_STEP > px.y + px.h || y > vh {
             break;
         }
@@ -354,7 +354,12 @@ fn container_header_bg_h(body_len: usize, max_h: f64) -> f64 {
 }
 
 fn header_bg_paint_h(logical_h: f32) -> f32 {
-    (logical_h - 1.0).max(0.0)
+    logical_h
+}
+
+/// Screen-space paint offset shared by container header background and text.
+fn header_paint_y(y: f64) -> f64 {
+    y - 1.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -726,13 +731,23 @@ impl TreemapView {
     /// A name pinned at 12px to the clipped box corner; `center` vertically
     /// centers it in the box (the Label tier). `pin_y` is the stacked header
     /// y for containers with pinned headers.
-    fn pinned_name(item: &world::DrawItem, center: bool, pin_y: f64) -> Option<NameRow> {
+    fn pinned_name(
+        item: &world::DrawItem,
+        center: bool,
+        pin_y: f64,
+        shift_as_header: bool,
+    ) -> Option<NameRow> {
         let font = FONT_PX as f32;
         let text = truncate_to_width(&item.node.name, item.label_w as f32, font)?;
         let y = if center {
             item.px.y + (item.px.h - f64::from(font) * 1.3) / 2.0
         } else {
             pin_y + 4.0
+        };
+        let y = if shift_as_header {
+            header_paint_y(y)
+        } else {
+            y
         };
         Some(NameRow {
             x: (item.px.x + BODY_PAD) as f32,
@@ -813,7 +828,12 @@ impl TreemapView {
                         stack_bottom,
                         camera.zoom,
                     ) {
-                        name = Self::pinned_name(&item, rung == Rung::Label, header.pin_y);
+                        name = Self::pinned_name(
+                            &item,
+                            rung == Rung::Label,
+                            header.pin_y,
+                            rung != Rung::Label,
+                        );
                         body = container_body(
                             item.node,
                             rung,
@@ -869,7 +889,7 @@ impl TreemapView {
                     let font = FONT_PX * scale;
                     body_font_px = (FONT_PX * scale) as f32;
                     if tier != LeafDraw::Dot && item.px.h >= 14.0 {
-                        name = Self::pinned_name(&item, false, item.px.y);
+                        name = Self::pinned_name(&item, false, item.px.y, false);
                     }
                     let use_text =
                         font >= content::MIN_TEXT_FONT_PX && item.label_w >= world::CODE_MIN_W;
@@ -2112,7 +2132,8 @@ impl Render for TreemapView {
                             let hb = Bounds::new(
                                 point(
                                     origin.x + px(item.x + 1.0),
-                                    origin.y + px(item.header_bg_y + 1.0),
+                                    origin.y
+                                        + px(header_paint_y(f64::from(item.header_bg_y)) as f32),
                                 ),
                                 size(
                                     px((item.w - 2.0).max(0.0)),
@@ -2374,8 +2395,8 @@ mod tests {
 
     use super::{
         code_line, container_body, container_header_bg_h, container_header_layout,
-        container_header_px, header_bg_paint_h, leaf_tex_rect, leaf_text_body, runs_from_spans,
-        truncate_to_width, wrap_doc, HEADER, LINE_STEP,
+        container_header_px, header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body,
+        runs_from_spans, truncate_to_width, wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2469,7 +2490,7 @@ mod tests {
         let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0);
         // churn readout only (doc shown via hover panel, no children → no kinds)
         assert_eq!(body.len(), 1);
-        assert!((f64::from(body[0].y) - HEADER).abs() < 1e-3);
+        assert!((f64::from(body[0].y) - (HEADER - 1.0)).abs() < 1e-3);
     }
 
     #[test]
@@ -2740,14 +2761,14 @@ mod tests {
     }
 
     #[test]
-    fn header_background_paint_height_accounts_for_top_inset() {
+    fn header_paint_group_is_shifted_up_without_losing_height() {
         let logical_h = HEADER as f32;
-        let paint_y = 1.0;
+        let paint_y = header_paint_y(1.0) as f32;
+        assert_eq!(paint_y, 0.0);
         assert_eq!(paint_y + header_bg_paint_h(logical_h), logical_h);
         assert_eq!(header_bg_paint_h(0.0), 0.0);
-        assert_eq!(header_bg_paint_h(0.5), 0.0);
-        assert_eq!(header_bg_paint_h(1.0), 0.0);
-        assert_eq!(header_bg_paint_h(1.5), 0.5);
+        assert_eq!(header_bg_paint_h(0.5), 0.5);
+        assert_eq!(header_paint_y(104.0), 103.0);
     }
 
     fn screen_y(cam: &Camera, wy: f64, vh: f64) -> f64 {
