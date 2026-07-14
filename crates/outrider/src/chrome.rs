@@ -71,8 +71,12 @@ pub fn titlebar(
                 .text_size(px(11.))
                 .child(status.into()),
         )
-        .child(control_btn("–", BTN_HOVER, |window, _cx| window.minimize_window()))
-        .child(control_btn(maximize_glyph, BTN_HOVER, |window, _cx| window.zoom_window()))
+        .child(control_btn("–", BTN_HOVER, |window, _cx| {
+            window.minimize_window()
+        }))
+        .child(control_btn(maximize_glyph, BTN_HOVER, |window, _cx| {
+            window.zoom_window()
+        }))
         .child(control_btn("✕", CLOSE_HOVER, |_window, cx| cx.quit()))
 }
 
@@ -99,7 +103,9 @@ fn control_btn(
         .text_size(px(13.))
         .hover(move |s| s.bg(rgb(hover_bg)))
         .child(glyph)
-        .on_mouse_down(MouseButton::Left, move |_e, window, cx| on_press(window, cx))
+        .on_mouse_down(MouseButton::Left, move |_e, window, cx| {
+            on_press(window, cx)
+        })
 }
 
 /// Invisible window-resize strips over the window perimeter — eight
@@ -171,12 +177,12 @@ impl Edge {
 
 /// Builds a single absolutely-positioned hit strip for one resize edge or corner.
 fn strip(edge: Edge) -> gpui::Div {
-    let base = div()
-        .absolute()
-        .cursor(edge.cursor())
-        .on_mouse_down(MouseButton::Left, move |_e, window, _cx| {
+    let base = div().absolute().cursor(edge.cursor()).on_mouse_down(
+        MouseButton::Left,
+        move |_e, window, _cx| {
             window.start_window_resize(edge.resize());
-        });
+        },
+    );
     let rim = px(RIM as f32);
     let corner = px(CORNER as f32);
     match edge {

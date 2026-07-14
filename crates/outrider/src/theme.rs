@@ -32,6 +32,48 @@ const DEPTH_FILL_8: u32 = 0x3C3C46;
 /// Editor background for boxes that render code (Full leaf items).
 pub const CODE_BG: u32 = 0x101014;
 
+/// Deterministic identity of every theme input used by texture rendering.
+pub fn fingerprint() -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut update = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    for color in [
+        BG,
+        FILL_COLD,
+        FILL_HOT,
+        TEXT_PRIMARY,
+        TEXT_SECONDARY,
+        FOCUS_BORDER,
+        DOC_COLOR,
+        DEPTH_FILL_0,
+        DEPTH_FILL_8,
+        CODE_BG,
+        TINT_DOCS,
+        TINT_TEST,
+        TINT_TYPEDEF,
+        FILE_TINT,
+        0xc586c0,
+        0xdcdcaa,
+        0x4ec9b0,
+        0xce9178,
+        0x6a9955,
+        0xb5cea8,
+        0x9cdcfe,
+    ] {
+        update(&color.to_le_bytes());
+    }
+    update(FONT_FAMILY.as_bytes());
+    update(FONT_FAMILY_SANS.as_bytes());
+    update(&TINT_BLEND.to_bits().to_le_bytes());
+    update(&FILE_BLEND.to_bits().to_le_bytes());
+    update(&STRIPE_W.to_bits().to_le_bytes());
+    hash
+}
+
 /// Semantic tint targets (blended at TINT_BLEND toward the base fill).
 const TINT_DOCS: u32 = 0x3060a0;
 const TINT_TEST: u32 = 0x306030;
@@ -147,6 +189,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn renderer_theme_fingerprint_is_stable_and_nonzero() {
+        assert_eq!(fingerprint(), fingerprint());
+        assert_ne!(fingerprint(), 0);
+    }
+
+    #[test]
     fn churn_endpoints_and_clamp() {
         assert_eq!(churn_heat(0.0), FILL_COLD);
         assert_eq!(churn_heat(1.0), FILL_HOT);
@@ -181,7 +229,7 @@ mod tests {
         assert_eq!(depth_fill(0), 0x17171B);
         assert_eq!(depth_fill(8), 0x3C3C46);
         assert_eq!(depth_fill(12), 0x3C3C46); // clamps at level 8
-        // t = 0.5 per channel: r,g 23+18.5→42 (0x2a); b 27+21.5→49 (0x31)
+                                              // t = 0.5 per channel: r,g 23+18.5→42 (0x2a); b 27+21.5→49 (0x31)
         assert_eq!(depth_fill(4), 0x2a2a31);
     }
 
@@ -198,7 +246,10 @@ mod tests {
         for level in [0, 3, 8] {
             let folder = box_fill(BoxKind::Folder, level, BoxTint::Normal);
             let file = box_fill(BoxKind::File, level, BoxTint::Normal);
-            assert_ne!(file, folder, "file and folder fills must differ at level {level}");
+            assert_ne!(
+                file, folder,
+                "file and folder fills must differ at level {level}"
+            );
             assert_eq!(file, file_fill(level));
         }
     }
@@ -231,5 +282,4 @@ mod tests {
             }
         }
     }
-
 }

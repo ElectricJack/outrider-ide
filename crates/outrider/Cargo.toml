@@ -2,6 +2,9 @@
 name = "outrider"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 # gpui and gpui_platform must stay pinned at the same rev; gpui_platform provides the entry point (application()) and the linux backend features

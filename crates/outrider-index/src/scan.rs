@@ -1,24 +1,19 @@
 //! Filesystem scanner and symbol-tree assembler.
 //! `scan_files` discovers repo source files (respecting .gitignore); `build_tree`
-//! wires them together with parsed items into the folder/file/item `SymbolTree`.
+//! is the legacy pure structural assembler. The normal `index_repo*` pipeline
+//! uses materialized `IndexedFile` values for parsing, docs, and chunks.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use ignore::WalkBuilder;
 
-use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
-use crate::types::{finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
+pub use crate::types::ParsedFile;
+use crate::types::{finalize_children, IndexedFile, SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
-/// Parsed per-file payload: item nodes plus the file's `//!` doc block.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ParsedFile {
-    pub items: Vec<SymbolNode>,
-    pub doc: Option<String>,
-}
-
-/// A discovered source file: its repo-relative path and raw size metrics.
+/// A discovered source file and its raw size metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedFile {
     pub rel_path: PathBuf,
@@ -38,6 +33,57 @@ pub fn scan_files(
     filter_extensions: &[String],
     filter_folders: &[String],
 ) -> anyhow::Result<Vec<ScannedFile>> {
+    let paths = discover_files(repo_root, filter_extensions, filter_folders)?;
+    paths
+        .into_iter()
+        .map(|rel_path| {
+            let file = std::fs::File::open(repo_root.join(&rel_path))
+                .with_context(|| format!("reading {}", rel_path.display()))?;
+            let (lines, bytes) = count_stream(BufReader::new(file))?;
+            Ok(ScannedFile {
+                rel_path,
+                lines,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn count_stream(mut reader: impl BufRead) -> anyhow::Result<(u64, u64)> {
+    let mut newlines = 0;
+    let mut bytes = 0;
+    let mut ends_with_newline = false;
+    loop {
+        let (len, chunk_newlines, last_is_newline) = {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+            (
+                chunk.len(),
+                chunk.iter().filter(|&&byte| byte == b'\n').count() as u64,
+                chunk.last() == Some(&b'\n'),
+            )
+        };
+        newlines += chunk_newlines;
+        bytes += len as u64;
+        ends_with_newline = last_is_newline;
+        reader.consume(len);
+    }
+    let lines = if bytes == 0 {
+        0
+    } else {
+        newlines + u64::from(!ends_with_newline)
+    };
+    Ok((lines, bytes))
+}
+
+/// Discover eligible repo-relative paths without reading file contents.
+pub fn discover_files(
+    repo_root: &Path,
+    filter_extensions: &[String],
+    filter_folders: &[String],
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(repo_root).require_git(false).build();
     for entry in walker {
@@ -50,7 +96,10 @@ pub fn scan_files(
         }
         // Skip files with filtered extensions
         if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-            if filter_extensions.iter().any(|f| f.eq_ignore_ascii_case(ext)) {
+            if filter_extensions
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(ext))
+            {
                 continue;
             }
         }
@@ -61,48 +110,26 @@ pub fn scan_files(
             .to_path_buf();
         // Skip files inside filtered folders
         if rel_path.components().any(|c| {
-            filter_folders.iter().any(|f| c.as_os_str().to_string_lossy() == f.as_str())
+            filter_folders
+                .iter()
+                .any(|f| c.as_os_str().to_string_lossy() == f.as_str())
         }) {
             continue;
         }
-        let bytes = std::fs::read(entry.path())
-            .with_context(|| format!("reading {}", entry.path().display()))?;
-        files.push(ScannedFile {
-            rel_path,
-            lines: count_lines(&bytes),
-            bytes: bytes.len() as u64,
-        });
+        files.push(rel_path);
     }
-    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    files.sort();
     Ok(files)
 }
 
-/// Counts lines in a byte slice, treating a trailing newline as part of the last line.
-fn count_lines(bytes: &[u8]) -> u64 {
-    if bytes.is_empty() {
-        return 0;
-    }
-    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
-    if bytes.ends_with(b"\n") {
-        newlines
-    } else {
-        newlines + 1
-    }
-}
-
-/// Build the folder/file skeleton. `parsed_children` maps a file's rel_path to its
-/// parsed contents (item nodes plus the file's `//!` doc block).
-pub fn build_tree(
-    repo_root: &Path,
-    files: &[ScannedFile],
-    parsed_children: &BTreeMap<PathBuf, ParsedFile>,
-) -> SymbolTree {
+/// Build the folder/file skeleton directly from materialized file products.
+pub(crate) fn build_indexed_tree(repo_root: &Path, files: &[IndexedFile]) -> SymbolTree {
     let root_name = repo_root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string());
     // decompose rel paths into components once
-    let decomposed: Vec<(Vec<String>, &ScannedFile)> = files
+    let decomposed: Vec<(Vec<String>, &IndexedFile)> = files
         .iter()
         .map(|f| {
             let comps = f
@@ -113,30 +140,124 @@ pub fn build_tree(
             (comps, f)
         })
         .collect();
-    let root = build_folder(repo_root, &root_name, "", &decomposed, parsed_children);
+    let root = build_indexed_folder(&root_name, "", &decomposed);
     SymbolTree {
         root,
         repo_root: repo_root.to_path_buf(),
     }
 }
 
-/// Recursively constructs a `Folder` node from a pre-decomposed file list,
-/// injecting parsed items and chunk-splitting large unparsed files.
-fn build_folder(
+/// Compatibility assembler for callers that separately scan and parse files.
+/// This function is pure over its arguments and never accesses the filesystem;
+/// use `index_repo*` for the full parse/docs/chunk pipeline.
+pub fn build_tree(
     repo_root: &Path,
+    files: &[ScannedFile],
+    parsed_children: &BTreeMap<PathBuf, ParsedFile>,
+) -> SymbolTree {
+    let root_name = repo_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".to_string());
+    let decomposed: Vec<(Vec<String>, &ScannedFile)> = files
+        .iter()
+        .map(|file| {
+            let components = file
+                .rel_path
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            (components, file)
+        })
+        .collect();
+    SymbolTree {
+        root: build_legacy_folder(&root_name, "", &decomposed, parsed_children),
+        repo_root: repo_root.to_path_buf(),
+    }
+}
+
+fn build_legacy_folder(
     name: &str,
     qualified: &str,
     entries: &[(Vec<String>, &ScannedFile)],
     parsed_children: &BTreeMap<PathBuf, ParsedFile>,
 ) -> SymbolNode {
-    let mut children: Vec<SymbolNode> = Vec::new();
+    let mut children = Vec::new();
     let mut by_subfolder: BTreeMap<String, Vec<(Vec<String>, &ScannedFile)>> = BTreeMap::new();
+    for (components, file) in entries {
+        match components.as_slice() {
+            [file_name] => {
+                let qualified_path = join_path(qualified, file_name);
+                let parsed = parsed_children
+                    .get(&file.rel_path)
+                    .cloned()
+                    .unwrap_or_default();
+                let node = SymbolNode {
+                    id: SymbolId {
+                        kind: SymbolKind::File,
+                        qualified_path: qualified_path.clone(),
+                        ordinal: 0,
+                    },
+                    name: file_name.clone(),
+                    byte_range: Some(0..file.bytes as usize),
+                    signature: None,
+                    doc: parsed.doc,
+                    measure: file.lines,
+                    churn: 0.0,
+                    churn_count: 0,
+                    children: parsed.items,
+                };
+                children.push(node);
+            }
+            [folder, ..] => by_subfolder
+                .entry(folder.clone())
+                .or_default()
+                .push((components[1..].to_vec(), *file)),
+            [] => {}
+        }
+    }
+    for (folder_name, sub_entries) in &by_subfolder {
+        let qualified_path = join_path(qualified, folder_name);
+        children.push(build_legacy_folder(
+            folder_name,
+            &qualified_path,
+            sub_entries,
+            parsed_children,
+        ));
+    }
+    finalize_children(&mut children);
+    SymbolNode {
+        id: SymbolId {
+            kind: SymbolKind::Folder,
+            qualified_path: qualified.to_string(),
+            ordinal: 0,
+        },
+        name: name.to_string(),
+        byte_range: None,
+        signature: None,
+        doc: None,
+        measure: children.iter().map(|child| child.measure).sum(),
+        churn: 0.0,
+        churn_count: 0,
+        children,
+    }
+}
+
+/// Recursively constructs a `Folder` node from a pre-decomposed file list,
+/// injecting parsed items and chunk-splitting large unparsed files.
+fn build_indexed_folder(
+    name: &str,
+    qualified: &str,
+    entries: &[(Vec<String>, &IndexedFile)],
+) -> SymbolNode {
+    let mut children: Vec<SymbolNode> = Vec::new();
+    let mut by_subfolder: BTreeMap<String, Vec<(Vec<String>, &IndexedFile)>> = BTreeMap::new();
 
     for (comps, file) in entries {
         match comps.as_slice() {
             [file_name] => {
                 let qual = join_path(qualified, file_name);
-                let parsed = parsed_children.get(&file.rel_path).cloned().unwrap_or_default();
+                let parsed = file.parsed.clone();
                 let mut node = SymbolNode {
                     id: SymbolId {
                         kind: SymbolKind::File,
@@ -152,37 +273,8 @@ fn build_folder(
                     churn_count: 0,
                     children: parsed.items,
                 };
-                if node.children.is_empty() && file.lines > CHUNK_MAX_LINES as u64 {
-                    if let Ok(text) = std::fs::read_to_string(repo_root.join(&file.rel_path)) {
-                        let ext = file
-                            .rel_path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        let chunks = strategy_for(ext).chunks(&text);
-                        if chunks.len() > 1 {
-                            node.children = chunks
-                                .iter()
-                                .enumerate()
-                                .map(|(i, ch)| SymbolNode {
-                                    id: SymbolId {
-                                        kind: SymbolKind::Chunk,
-                                        qualified_path: format!("{qual}#{i}"),
-                                        ordinal: 0,
-                                    },
-                                    name: ch.label.clone(),
-                                    byte_range: Some(ch.start_byte..ch.end_byte),
-                                    signature: None,
-                                    doc: None,
-                                    measure: (ch.end_line - ch.start_line) as u64,
-                                    churn: 0.0,
-                                    churn_count: 0,
-                                    children: vec![],
-                                })
-                                .collect();
-                            finalize_children(&mut node.children);
-                        }
-                    }
+                if node.children.is_empty() {
+                    node.children = file.chunks.clone().unwrap_or_default();
                 }
                 children.push(node);
             }
@@ -198,7 +290,7 @@ fn build_folder(
 
     for (folder_name, sub_entries) in &by_subfolder {
         let qual = join_path(qualified, folder_name);
-        children.push(build_folder(repo_root, folder_name, &qual, sub_entries, parsed_children));
+        children.push(build_indexed_folder(folder_name, &qual, sub_entries));
     }
 
     finalize_children(&mut children);
@@ -232,7 +324,6 @@ fn join_path(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SymbolKind;
 
     fn scan_tree(dir: &std::path::Path) -> SymbolTree {
         let files = scan_files(dir, &[], &[]).unwrap();
@@ -240,36 +331,10 @@ mod tests {
     }
 
     fn child<'a>(root: &'a SymbolNode, name: &str) -> &'a SymbolNode {
-        root.children.iter().find(|c| c.name == name).expect("child present")
-    }
-
-    #[test]
-    fn large_markdown_file_becomes_a_chunk_container() {
-        let dir = tempfile::tempdir().unwrap();
-        // 3 headed sections, each long enough to be its own chunk.
-        let mut text = String::new();
-        for h in ["Alpha", "Beta", "Gamma"] {
-            text.push_str(&format!("# {h}\n"));
-            for i in 0..25 {
-                text.push_str(&format!("line {i}\n"));
-            }
-        }
-        std::fs::write(dir.path().join("BIG.md"), &text).unwrap();
-        let tree = scan_tree(dir.path());
-        let f = child(&tree.root, "BIG.md");
-        assert_eq!(f.id.kind, SymbolKind::File);
-        assert_eq!(f.children.len(), 3);
-        assert!(f.children.iter().all(|c| c.id.kind == SymbolKind::Chunk));
-        // byte ranges are contiguous and cover the whole file, in source order
-        let mut sorted: Vec<&SymbolNode> = f.children.iter().collect();
-        sorted.sort_by_key(|c| c.byte_range.as_ref().unwrap().start);
-        assert_eq!(sorted[0].byte_range.as_ref().unwrap().start, 0);
-        assert_eq!(sorted.last().unwrap().byte_range.as_ref().unwrap().end, text.len());
-        for w in sorted.windows(2) {
-            assert_eq!(w[0].byte_range.as_ref().unwrap().end, w[1].byte_range.as_ref().unwrap().start);
-        }
-        // chunk qualified_path is "{file}#{i}"
-        assert!(f.children.iter().all(|c| c.id.qualified_path.starts_with("BIG.md#")));
+        root.children
+            .iter()
+            .find(|c| c.name == name)
+            .expect("child present")
     }
 
     #[test]

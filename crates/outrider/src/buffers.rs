@@ -39,7 +39,10 @@ pub struct BufferManager {
 impl BufferManager {
     /// Create a manager rooted at `repo_root`; no files are read yet.
     pub fn new(repo_root: PathBuf) -> Self {
-        Self { repo_root, entries: Vec::new() }
+        Self {
+            repo_root,
+            entries: Vec::new(),
+        }
     }
 
     /// The file-path portion of a qualified_path: everything before the
@@ -68,7 +71,8 @@ impl BufferManager {
                 .iter()
                 .map(|(id, start)| (id.clone(), buffer.create_anchor(*start)))
                 .collect();
-            self.entries.push((rel_path.to_string(), Materialized { buffer, anchors }));
+            self.entries
+                .push((rel_path.to_string(), Materialized { buffer, anchors }));
             if self.entries.len() > MAX_BUFFERS {
                 self.entries.remove(0);
             }
@@ -116,7 +120,7 @@ pub fn collect_file_symbols(tree: &SymbolTree) -> BTreeMap<String, Vec<(SymbolId
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferManager, MAX_BUFFERS, collect_file_symbols};
+    use super::{collect_file_symbols, BufferManager, MAX_BUFFERS};
     use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
     fn write_file(dir: &std::path::Path, name: &str, text: &str) {
@@ -124,12 +128,19 @@ mod tests {
     }
 
     fn fn_id(qual: &str) -> SymbolId {
-        SymbolId { kind: SymbolKind::Item { label: "fn".into() }, qualified_path: qual.into(), ordinal: 0 }
+        SymbolId {
+            kind: SymbolKind::Item { label: "fn".into() },
+            qualified_path: qual.into(),
+            ordinal: 0,
+        }
     }
 
     #[test]
     fn file_path_of_splits_at_first_colons() {
-        assert_eq!(BufferManager::file_path_of("src/lib.rs::Point::norm"), "src/lib.rs");
+        assert_eq!(
+            BufferManager::file_path_of("src/lib.rs::Point::norm"),
+            "src/lib.rs"
+        );
         assert_eq!(BufferManager::file_path_of("src/lib.rs"), "src/lib.rs");
         assert_eq!(BufferManager::file_path_of("BIG.md#0"), "BIG.md");
         assert_eq!(BufferManager::file_path_of("dir/f.rs#2"), "dir/f.rs");
@@ -182,9 +193,18 @@ mod tests {
 
     #[test]
     fn collect_file_symbols_maps_items_by_file() {
-        fn node(kind: SymbolKind, qual: &str, byte_range: Option<std::ops::Range<usize>>, children: Vec<SymbolNode>) -> SymbolNode {
+        fn node(
+            kind: SymbolKind,
+            qual: &str,
+            byte_range: Option<std::ops::Range<usize>>,
+            children: Vec<SymbolNode>,
+        ) -> SymbolNode {
             SymbolNode {
-                id: SymbolId { kind, qualified_path: qual.into(), ordinal: 0 },
+                id: SymbolId {
+                    kind,
+                    qualified_path: qual.into(),
+                    ordinal: 0,
+                },
                 name: qual.rsplit("::").next().unwrap_or(qual).to_string(),
                 byte_range,
                 signature: None,
@@ -205,10 +225,17 @@ mod tests {
                     "a.rs",
                     Some(0..40),
                     vec![node(
-                        SymbolKind::Item { label: "impl".into() },
+                        SymbolKind::Item {
+                            label: "impl".into(),
+                        },
                         "a.rs::T",
                         Some(0..30),
-                        vec![node(SymbolKind::Item { label: "fn".into() }, "a.rs::T::m", Some(10..25), vec![])],
+                        vec![node(
+                            SymbolKind::Item { label: "fn".into() },
+                            "a.rs::T::m",
+                            Some(10..25),
+                            vec![],
+                        )],
                     )],
                 )],
             ),
@@ -224,15 +251,33 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![("a.rs::T", SymbolKind::Item { label: "impl".into() }, 0), ("a.rs::T::m", SymbolKind::Item { label: "fn".into() }, 10)]
+            vec![
+                (
+                    "a.rs::T",
+                    SymbolKind::Item {
+                        label: "impl".into()
+                    },
+                    0
+                ),
+                ("a.rs::T::m", SymbolKind::Item { label: "fn".into() }, 10)
+            ]
         );
     }
 
     #[test]
     fn collect_file_symbols_anchors_childless_files_at_zero() {
-        fn node(kind: SymbolKind, qual: &str, byte_range: Option<std::ops::Range<usize>>, children: Vec<SymbolNode>) -> SymbolNode {
+        fn node(
+            kind: SymbolKind,
+            qual: &str,
+            byte_range: Option<std::ops::Range<usize>>,
+            children: Vec<SymbolNode>,
+        ) -> SymbolNode {
             SymbolNode {
-                id: SymbolId { kind, qualified_path: qual.into(), ordinal: 0 },
+                id: SymbolId {
+                    kind,
+                    qualified_path: qual.into(),
+                    ordinal: 0,
+                },
                 name: qual.rsplit("::").next().unwrap_or(qual).to_string(),
                 byte_range,
                 signature: None,
@@ -254,7 +299,12 @@ mod tests {
                         SymbolKind::File,
                         "a.rs",
                         Some(0..40),
-                        vec![node(SymbolKind::Item { label: "fn".into() }, "a.rs::f", Some(5..30), vec![])],
+                        vec![node(
+                            SymbolKind::Item { label: "fn".into() },
+                            "a.rs::f",
+                            Some(5..30),
+                            vec![],
+                        )],
                     ),
                 ],
             ),
@@ -275,9 +325,18 @@ mod tests {
 
     #[test]
     fn collect_file_symbols_anchors_each_chunk_at_its_start() {
-        fn node(kind: SymbolKind, qual: &str, byte_range: Option<std::ops::Range<usize>>, children: Vec<SymbolNode>) -> SymbolNode {
+        fn node(
+            kind: SymbolKind,
+            qual: &str,
+            byte_range: Option<std::ops::Range<usize>>,
+            children: Vec<SymbolNode>,
+        ) -> SymbolNode {
             SymbolNode {
-                id: SymbolId { kind, qualified_path: qual.into(), ordinal: 0 },
+                id: SymbolId {
+                    kind,
+                    qualified_path: qual.into(),
+                    ordinal: 0,
+                },
                 name: qual.rsplit(['#', ':']).next().unwrap_or(qual).to_string(),
                 byte_range,
                 signature: None,

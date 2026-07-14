@@ -3663,6 +3663,7 @@ name = "outrider-index"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "ignore",
  "rayon",
  "ropey",

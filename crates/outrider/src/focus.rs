@@ -25,7 +25,10 @@ impl<'a> TreeIndex<'a> {
                 walk(c, idx);
             }
         }
-        let mut idx = TreeIndex { nodes: BTreeMap::new(), parents: BTreeMap::new() };
+        let mut idx = TreeIndex {
+            nodes: BTreeMap::new(),
+            parents: BTreeMap::new(),
+        };
         walk(&tree.root, &mut idx);
         idx
     }
@@ -66,7 +69,10 @@ pub struct Focus {
 impl Focus {
     /// Create focus starting at `root`; last-child memory is empty.
     pub fn new(root: SymbolId) -> Self {
-        Focus { current: root, last_child: BTreeMap::new() }
+        Focus {
+            current: root,
+            last_child: BTreeMap::new(),
+        }
     }
 
     /// Land on `next`, recording last-visited on the parent. Landing on the
@@ -89,7 +95,9 @@ impl Focus {
 
     /// Enter: last-visited child if still valid, else largest child by measure.
     pub fn step_in(&mut self, index: &TreeIndex) -> bool {
-        let Some(node) = index.node(&self.current) else { return false };
+        let Some(node) = index.node(&self.current) else {
+            return false;
+        };
         if node.children.is_empty() {
             return false;
         }
@@ -111,7 +119,9 @@ impl Focus {
 
     /// Esc: move to the structural parent (no-op at the root).
     pub fn step_out(&mut self, index: &TreeIndex) -> bool {
-        let Some(p) = index.parent(&self.current) else { return false };
+        let Some(p) = index.parent(&self.current) else {
+            return false;
+        };
         self.land(p.clone(), index)
     }
 
@@ -147,7 +157,9 @@ pub fn spatial_step(
 ) -> Option<SymbolId> {
     let cur = pack.rects.get(current)?;
     let depth = index.depth(current)?;
-    let leaf_mode = index.node(current).is_some_and(crate::content::is_leaf_item);
+    let leaf_mode = index
+        .node(current)
+        .is_some_and(crate::content::is_leaf_item);
     let mut best: Option<(f64, f64, &SymbolId)> = None;
     for (id, r) in &pack.rects {
         if id == current {
@@ -164,12 +176,20 @@ pub fn spatial_step(
         let (overlap, primary, misalign) = match dir {
             Dir::Left | Dir::Right => (
                 r.y < cur.y + cur.h && r.y + r.h > cur.y,
-                if dir == Dir::Left { cur.x - (r.x + r.w) } else { r.x - (cur.x + cur.w) },
+                if dir == Dir::Left {
+                    cur.x - (r.x + r.w)
+                } else {
+                    r.x - (cur.x + cur.w)
+                },
                 ((r.y + r.h / 2.0) - (cur.y + cur.h / 2.0)).abs(),
             ),
             Dir::Up | Dir::Down => (
                 r.x < cur.x + cur.w && r.x + r.w > cur.x,
-                if dir == Dir::Up { cur.y - (r.y + r.h) } else { r.y - (cur.y + cur.h) },
+                if dir == Dir::Up {
+                    cur.y - (r.y + r.h)
+                } else {
+                    r.y - (cur.y + cur.h)
+                },
                 ((r.x + r.w / 2.0) - (cur.x + cur.w / 2.0)).abs(),
             ),
         };
@@ -212,7 +232,11 @@ mod tests {
         children: Vec<outrider_index::SymbolNode>,
     ) -> outrider_index::SymbolNode {
         outrider_index::SymbolNode {
-            id: SymbolId { kind, qualified_path: qp.into(), ordinal: 0 },
+            id: SymbolId {
+                kind,
+                qualified_path: qp.into(),
+                ordinal: 0,
+            },
             name: name.into(),
             byte_range: None,
             signature: None,
@@ -231,8 +255,18 @@ mod tests {
             "b.rs",
             "b.rs",
             vec![
-                n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![]),
-                n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", vec![]),
+                n(
+                    SymbolKind::Item { label: "fn".into() },
+                    "b.rs::f",
+                    "f",
+                    vec![],
+                ),
+                n(
+                    SymbolKind::Item { label: "fn".into() },
+                    "b.rs::g",
+                    "g",
+                    vec![],
+                ),
             ],
         );
         b.measure = 2;
@@ -241,17 +275,18 @@ mod tests {
                 SymbolKind::Folder,
                 "",
                 "",
-                vec![
-                    n(SymbolKind::File, "a.rs", "a.rs", vec![]),
-                    b,
-                ],
+                vec![n(SymbolKind::File, "a.rs", "a.rs", vec![]), b],
             ),
             repo_root: std::path::PathBuf::from("/x"),
         }
     }
 
     fn id(kind: SymbolKind, qp: &str) -> SymbolId {
-        SymbolId { kind, qualified_path: qp.into(), ordinal: 0 }
+        SymbolId {
+            kind,
+            qualified_path: qp.into(),
+            ordinal: 0,
+        }
     }
 
     #[test]
@@ -289,7 +324,10 @@ mod tests {
         f.set(id(SymbolKind::Item { label: "fn".into() }, "b.rs::g"), &idx);
         f.step_out(&idx); // b.rs
         assert!(f.step_in(&idx));
-        assert_eq!(f.current, id(SymbolKind::Item { label: "fn".into() }, "b.rs::g")); // last visited, not first
+        assert_eq!(
+            f.current,
+            id(SymbolKind::Item { label: "fn".into() }, "b.rs::g")
+        ); // last visited, not first
     }
 
     #[test]
@@ -345,7 +383,12 @@ mod tests {
                         "a.rs",
                         vec![outrider_index::SymbolNode {
                             measure: 6,
-                            ..n(SymbolKind::Item { label: "fn".into() }, "a.rs::x", "x", vec![])
+                            ..n(
+                                SymbolKind::Item { label: "fn".into() },
+                                "a.rs::x",
+                                "x",
+                                vec![],
+                            )
                         }],
                     ),
                     n(
@@ -353,8 +396,18 @@ mod tests {
                         "b.rs",
                         "b.rs",
                         vec![
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![]),
-                            n(SymbolKind::Item { label: "fn".into() }, "b.rs::g", "g", vec![]),
+                            n(
+                                SymbolKind::Item { label: "fn".into() },
+                                "b.rs::f",
+                                "f",
+                                vec![],
+                            ),
+                            n(
+                                SymbolKind::Item { label: "fn".into() },
+                                "b.rs::g",
+                                "g",
+                                vec![],
+                            ),
                         ],
                     ),
                 ],
@@ -369,8 +422,14 @@ mod tests {
         let idx = TreeIndex::new(&t);
         assert_eq!(idx.depth(&t.root.id), Some(0));
         assert_eq!(idx.depth(&id(SymbolKind::File, "b.rs")), Some(1));
-        assert_eq!(idx.depth(&id(SymbolKind::Item { label: "fn".into() }, "b.rs::g")), Some(2));
-        assert_eq!(idx.depth(&id(SymbolKind::Item { label: "fn".into() }, "nope")), None);
+        assert_eq!(
+            idx.depth(&id(SymbolKind::Item { label: "fn".into() }, "b.rs::g")),
+            Some(2)
+        );
+        assert_eq!(
+            idx.depth(&id(SymbolKind::Item { label: "fn".into() }, "nope")),
+            None
+        );
     }
 
     #[test]
@@ -390,7 +449,7 @@ mod tests {
         assert_eq!(spatial_step(&g, Dir::Up, &p, &idx), Some(f.clone())); // nearest, not x
         assert_eq!(spatial_step(&g, Dir::Down, &p, &idx), None); // no wrap
         assert_eq!(spatial_step(&f, Dir::Right, &p, &idx), None); // nothing beyond the right edge → dead key
-        // depth 1: the two files stack vertically (a.rs above b.rs)
+                                                                  // depth 1: the two files stack vertically (a.rs above b.rs)
         let a = id(SymbolKind::File, "a.rs");
         let b = id(SymbolKind::File, "b.rs");
         assert_eq!(spatial_step(&a, Dir::Down, &p, &idx), Some(b.clone()));
@@ -400,7 +459,9 @@ mod tests {
     }
 
     fn hand_layout(entries: &[(SymbolId, Rect)]) -> PackLayout {
-        PackLayout { rects: entries.iter().cloned().collect() }
+        PackLayout {
+            rects: entries.iter().cloned().collect(),
+        }
     }
 
     /// root { c, p, q } with hand-placed rects to probe the scoring rule.
@@ -431,17 +492,73 @@ mod tests {
         // 11..21 vs c's 0..10); p is farther but on-beam. Old center
         // scoring picked q for Left — the "Left moves down" bug.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
-            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (p.clone(), Rect { x: -60.0, y: 2.0, w: 10.0, h: 6.0 }),
-            (q.clone(), Rect { x: -15.0, y: 11.0, w: 10.0, h: 10.0 }),
+            (
+                t.root.id.clone(),
+                Rect {
+                    x: -100.0,
+                    y: -100.0,
+                    w: 300.0,
+                    h: 300.0,
+                },
+            ),
+            (
+                c.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                p.clone(),
+                Rect {
+                    x: -60.0,
+                    y: 2.0,
+                    w: 10.0,
+                    h: 6.0,
+                },
+            ),
+            (
+                q.clone(),
+                Rect {
+                    x: -15.0,
+                    y: 11.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
         ]);
         assert_eq!(spatial_step(&c, Dir::Left, &lay, &idx), Some(p.clone()));
         // Only the off-beam candidate remains → Left is a dead key.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
-            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: -15.0, y: 11.0, w: 10.0, h: 10.0 }),
+            (
+                t.root.id.clone(),
+                Rect {
+                    x: -100.0,
+                    y: -100.0,
+                    w: 300.0,
+                    h: 300.0,
+                },
+            ),
+            (
+                c.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                q.clone(),
+                Rect {
+                    x: -15.0,
+                    y: 11.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
         ]);
         assert_eq!(spatial_step(&c, Dir::Left, &lay, &idx), None);
         // A node missing from the layout steps nowhere.
@@ -459,10 +576,42 @@ mod tests {
         // p's (x=20, distance 10) even though p is perfectly centered
         // and q's center is 10 off-axis.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
-            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (p.clone(), Rect { x: 20.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: 14.0, y: -30.0, w: 10.0, h: 50.0 }),
+            (
+                t.root.id.clone(),
+                Rect {
+                    x: -100.0,
+                    y: -100.0,
+                    w: 300.0,
+                    h: 300.0,
+                },
+            ),
+            (
+                c.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                p.clone(),
+                Rect {
+                    x: 20.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                q.clone(),
+                Rect {
+                    x: 14.0,
+                    y: -30.0,
+                    w: 10.0,
+                    h: 50.0,
+                },
+            ),
         ]);
         assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(q.clone()));
     }
@@ -477,19 +626,83 @@ mod tests {
         // Equal edge distance (both at x=20). p center-y 11 → misalign 6;
         // q center-y -4 → misalign 9. Better-centered p wins.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
-            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (p.clone(), Rect { x: 20.0, y: 6.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: 20.0, y: -9.0, w: 10.0, h: 10.0 }),
+            (
+                t.root.id.clone(),
+                Rect {
+                    x: -100.0,
+                    y: -100.0,
+                    w: 300.0,
+                    h: 300.0,
+                },
+            ),
+            (
+                c.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                p.clone(),
+                Rect {
+                    x: 20.0,
+                    y: 6.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                q.clone(),
+                Rect {
+                    x: 20.0,
+                    y: -9.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
         ]);
         assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
         // Exact tie on distance AND misalignment (6 each): lesser SymbolId
         // wins → p.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
-            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (p.clone(), Rect { x: 20.0, y: 6.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: 20.0, y: -6.0, w: 10.0, h: 10.0 }),
+            (
+                t.root.id.clone(),
+                Rect {
+                    x: -100.0,
+                    y: -100.0,
+                    w: 300.0,
+                    h: 300.0,
+                },
+            ),
+            (
+                c.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                p.clone(),
+                Rect {
+                    x: 20.0,
+                    y: 6.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                q.clone(),
+                Rect {
+                    x: 20.0,
+                    y: -6.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
         ]);
         assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
     }
@@ -504,10 +717,42 @@ mod tests {
         // p shares c's right edge (distance 0) → reachable. q touches only
         // at the bottom-right corner → not reachable Down or Right.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
-            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (p.clone(), Rect { x: 10.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: 10.0, y: 10.0, w: 10.0, h: 10.0 }),
+            (
+                t.root.id.clone(),
+                Rect {
+                    x: -100.0,
+                    y: -100.0,
+                    w: 300.0,
+                    h: 300.0,
+                },
+            ),
+            (
+                c.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                p.clone(),
+                Rect {
+                    x: 10.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                q.clone(),
+                Rect {
+                    x: 10.0,
+                    y: 10.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
         ]);
         assert_eq!(spatial_step(&c, Dir::Right, &lay, &idx), Some(p.clone()));
         assert_eq!(spatial_step(&c, Dir::Down, &lay, &idx), None);
@@ -522,10 +767,42 @@ mod tests {
         let q = id(SymbolKind::Item { label: "fn".into() }, "q");
         // p directly right, q directly below; nothing left or up.
         let lay = hand_layout(&[
-            (t.root.id.clone(), Rect { x: -100.0, y: -100.0, w: 300.0, h: 300.0 }),
-            (c.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (p.clone(), Rect { x: 20.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (q.clone(), Rect { x: 0.0, y: 20.0, w: 10.0, h: 10.0 }),
+            (
+                t.root.id.clone(),
+                Rect {
+                    x: -100.0,
+                    y: -100.0,
+                    w: 300.0,
+                    h: 300.0,
+                },
+            ),
+            (
+                c.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                p.clone(),
+                Rect {
+                    x: 20.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                q.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 20.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
         ]);
         assert_eq!(
             neighbors(&c, &lay, &idx),
@@ -540,7 +817,10 @@ mod tests {
         name: &str,
         children: Vec<outrider_index::SymbolNode>,
     ) -> outrider_index::SymbolNode {
-        outrider_index::SymbolNode { byte_range: Some(0..1), ..n(kind, qp, name, children) }
+        outrider_index::SymbolNode {
+            byte_range: Some(0..1),
+            ..n(kind, qp, name, children)
+        }
     }
 
     /// root { a.md (leaf, d1), dir (empty folder, d1), b.rs (container, d1) { f (leaf, d2) } }
@@ -557,7 +837,12 @@ mod tests {
                         SymbolKind::File,
                         "b.rs",
                         "b.rs",
-                        vec![leaf(SymbolKind::Item { label: "fn".into() }, "b.rs::f", "f", vec![])],
+                        vec![leaf(
+                            SymbolKind::Item { label: "fn".into() },
+                            "b.rs::f",
+                            "f",
+                            vec![],
+                        )],
                     ),
                 ],
             ),
@@ -574,10 +859,42 @@ mod tests {
         // Column top→bottom: a.md (leaf d1), dir (empty folder d1),
         // b.rs (container d1), f (leaf d2). Only a.md and f are leaf pages.
         let lay = hand_layout(&[
-            (a_md.clone(), Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }),
-            (id(SymbolKind::Folder, "dir"), Rect { x: 0.0, y: 15.0, w: 10.0, h: 10.0 }),
-            (id(SymbolKind::File, "b.rs"), Rect { x: 0.0, y: 30.0, w: 10.0, h: 10.0 }),
-            (f.clone(), Rect { x: 0.0, y: 45.0, w: 10.0, h: 10.0 }),
+            (
+                a_md.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                id(SymbolKind::Folder, "dir"),
+                Rect {
+                    x: 0.0,
+                    y: 15.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                id(SymbolKind::File, "b.rs"),
+                Rect {
+                    x: 0.0,
+                    y: 30.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
+            (
+                f.clone(),
+                Rect {
+                    x: 0.0,
+                    y: 45.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+            ),
         ]);
         // Down from the shallow leaf skips the nearer folder+container and
         // lands on the deeper leaf (crosses depth 1 → 2).

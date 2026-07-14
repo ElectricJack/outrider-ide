@@ -1,6 +1,6 @@
 mod common;
 
-use outrider_index::{index_repo, SymbolKind, SymbolNode};
+use outrider_index::{index_repo, index_repo_outcome, SymbolKind, SymbolNode};
 
 fn find<'a>(node: &'a SymbolNode, qual: &str) -> Option<&'a SymbolNode> {
     if node.id.qualified_path == qual {
@@ -28,10 +28,28 @@ fn index_repo_parses_rust_files_into_items() {
     assert_eq!(
         kids,
         vec![
-            ("Point", SymbolKind::Item { label: "struct".into() }, 0), // struct appears before impl in source
-            ("Point", SymbolKind::Item { label: "impl".into() }, 1),
+            (
+                "Point",
+                SymbolKind::Item {
+                    label: "struct".into()
+                },
+                0
+            ), // struct appears before impl in source
+            (
+                "Point",
+                SymbolKind::Item {
+                    label: "impl".into()
+                },
+                1
+            ),
             ("free", SymbolKind::Item { label: "fn".into() }, 0),
-            ("inner", SymbolKind::Item { label: "module".into() }, 0),
+            (
+                "inner",
+                SymbolKind::Item {
+                    label: "module".into()
+                },
+                0
+            ),
         ]
     );
 
@@ -80,4 +98,19 @@ fn symbol_ids_are_unique_tree_wide() {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), total, "duplicate SymbolIds in indexed tree");
+}
+
+#[test]
+fn index_outcome_preserves_normalized_retained_source_fingerprints() {
+    let dir = common::copy_fixture("mini_repo");
+    std::fs::write(dir.path().join("opaque"), b"not retained").unwrap();
+    let outcome = index_repo_outcome(dir.path(), &[], &[]).unwrap();
+
+    assert!(outcome.source_fingerprints.contains_key("src/lib.rs"));
+    assert!(outcome.source_fingerprints.contains_key("README.md"));
+    assert!(outcome
+        .source_fingerprints
+        .keys()
+        .all(|path| !path.contains('\\')));
+    assert!(!outcome.source_fingerprints.contains_key("opaque"));
 }

@@ -24,6 +24,9 @@ pub struct RawItem {
     pub children: Vec<RawItem>,
 }
 
+type KindClassifier = dyn for<'tree> Fn(&str, Node<'tree>, &[u8]) -> Option<&'static str>;
+type NameExtractor = dyn for<'tree> Fn(Node<'tree>, &[u8]) -> String;
+
 /// Extract mod/struct/enum/trait/impl/fn items, nested per the syntax tree
 /// (spec §5.2). Items are returned in source order.
 pub fn parse_rust_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
@@ -31,7 +34,9 @@ pub fn parse_rust_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .context("loading tree-sitter-rust grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
     let kind_fn = |node_kind: &str, _node: Node, _src: &[u8]| -> Option<&'static str> {
         match node_kind {
             "mod_item" => Some("module"),
@@ -43,7 +48,12 @@ pub fn parse_rust_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(tree.root_node(), source, &kind_fn, &rust_item_name))
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &kind_fn,
+        &rust_item_name,
+    ))
 }
 
 /// Extract class/fn items from Python source, including decorated definitions.
@@ -52,20 +62,28 @@ pub fn parse_python_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .context("loading tree-sitter-python grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
     let kind_fn = |node_kind: &str, node: Node, _src: &[u8]| -> Option<&'static str> {
         match node_kind {
             "function_definition" => {
                 // Skip inner definition when it is directly owned by a decorated_definition;
                 // the decorated_definition node itself will be the top-level item.
-                if node.parent().is_some_and(|p| p.kind() == "decorated_definition") {
+                if node
+                    .parent()
+                    .is_some_and(|p| p.kind() == "decorated_definition")
+                {
                     None
                 } else {
                     Some("fn")
                 }
             }
             "class_definition" => {
-                if node.parent().is_some_and(|p| p.kind() == "decorated_definition") {
+                if node
+                    .parent()
+                    .is_some_and(|p| p.kind() == "decorated_definition")
+                {
                     None
                 } else {
                     Some("class")
@@ -85,7 +103,12 @@ pub fn parse_python_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(tree.root_node(), source, &kind_fn, &python_item_name))
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &kind_fn,
+        &python_item_name,
+    ))
 }
 
 /// Python-specific name extraction: unwraps decorated_definition to find the inner name.
@@ -107,7 +130,9 @@ pub fn parse_c_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_c::LANGUAGE.into())
         .context("loading tree-sitter-c grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
     let kind_fn = |node_kind: &str, node: Node, _src: &[u8]| -> Option<&'static str> {
         match node_kind {
             "function_definition" => Some("fn"),
@@ -117,7 +142,12 @@ pub fn parse_c_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(tree.root_node(), source, &kind_fn, &c_item_name))
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &kind_fn,
+        &c_item_name,
+    ))
 }
 
 /// C-specific name extraction.
@@ -128,11 +158,10 @@ pub fn parse_c_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
 ///   whose own `declarator` field is the identifier.
 fn c_item_name(node: Node, src: &[u8]) -> String {
     match node.kind() {
-        "struct_specifier" | "enum_specifier" => {
-            node.child_by_field_name("name")
-                .map(|n| node_text(n, src))
-                .unwrap_or_else(|| "<anon>".to_string())
-        }
+        "struct_specifier" | "enum_specifier" => node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, src))
+            .unwrap_or_else(|| "<anon>".to_string()),
         "type_definition" => {
             // The alias identifier is the last type_identifier child.
             let mut cursor = node.walk();
@@ -169,7 +198,9 @@ pub fn parse_cpp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .context("loading tree-sitter-cpp grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
     let kind_fn = |node_kind: &str, node: Node, _src: &[u8]| -> Option<&'static str> {
         match node_kind {
             "function_definition" => Some("fn"),
@@ -182,7 +213,12 @@ pub fn parse_cpp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(tree.root_node(), source, &kind_fn, &cpp_item_name))
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &kind_fn,
+        &cpp_item_name,
+    ))
 }
 
 /// C++-specific name extraction.
@@ -190,16 +226,14 @@ pub fn parse_cpp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
 /// (`Foo::bar`), destructors (`~Foo`), and operator overloads.
 fn cpp_item_name(node: Node, src: &[u8]) -> String {
     match node.kind() {
-        "class_specifier" | "struct_specifier" | "enum_specifier" => {
-            node.child_by_field_name("name")
-                .map(|n| node_text(n, src))
-                .unwrap_or_else(|| "<anon>".to_string())
-        }
-        "namespace_definition" => {
-            node.child_by_field_name("name")
-                .map(|n| node_text(n, src))
-                .unwrap_or_else(|| "<anon>".to_string())
-        }
+        "class_specifier" | "struct_specifier" | "enum_specifier" => node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, src))
+            .unwrap_or_else(|| "<anon>".to_string()),
+        "namespace_definition" => node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, src))
+            .unwrap_or_else(|| "<anon>".to_string()),
         "type_definition" => {
             let mut cursor = node.walk();
             let mut last_ident = None;
@@ -303,8 +337,15 @@ pub fn parse_ts_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
         .context("loading tree-sitter-typescript grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
-    Ok(collect_items(tree.root_node(), source, &ts_kind_fn, &js_item_name))
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &ts_kind_fn,
+        &js_item_name,
+    ))
 }
 
 /// Extract TypeScript/JSX items using the TSX grammar for `.tsx` files.
@@ -313,8 +354,15 @@ pub fn parse_tsx_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
         .context("loading tree-sitter-tsx grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
-    Ok(collect_items(tree.root_node(), source, &ts_kind_fn, &js_item_name))
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &ts_kind_fn,
+        &js_item_name,
+    ))
 }
 
 /// Extract JavaScript items (function/class/arrow-fn declarations).
@@ -323,8 +371,15 @@ pub fn parse_js_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_javascript::LANGUAGE.into())
         .context("loading tree-sitter-javascript grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
-    Ok(collect_items(tree.root_node(), source, &js_kind_fn, &js_item_name))
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &js_kind_fn,
+        &js_item_name,
+    ))
 }
 
 /// Extract C# items (namespace/class/record/interface/struct/enum/method).
@@ -333,7 +388,9 @@ pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     parser
         .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
         .context("loading tree-sitter-c-sharp grammar")?;
-    let tree = parser.parse(source, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
     let kind_fn = |node_kind: &str, _node: Node, _src: &[u8]| -> Option<&'static str> {
         match node_kind {
             "class_declaration" | "record_declaration" => Some("class"),
@@ -345,7 +402,12 @@ pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(tree.root_node(), source, &kind_fn, &item_name_default))
+    Ok(collect_items(
+        tree.root_node(),
+        source,
+        &kind_fn,
+        &item_name_default,
+    ))
 }
 
 /// Recursively walks a syntax tree, collecting nodes accepted by `kind_fn` into
@@ -353,15 +415,17 @@ pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
 fn collect_items(
     node: Node,
     src: &[u8],
-    kind_fn: &dyn Fn(&str, Node, &[u8]) -> Option<&'static str>,
-    name_fn: &dyn Fn(Node, &[u8]) -> String,
+    kind_fn: &KindClassifier,
+    name_fn: &NameExtractor,
 ) -> Vec<RawItem> {
     let mut items = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if let Some(label) = kind_fn(child.kind(), child, src) {
             items.push(RawItem {
-                kind: SymbolKind::Item { label: label.into() },
+                kind: SymbolKind::Item {
+                    label: label.into(),
+                },
                 name: name_fn(child, src),
                 signature: item_signature(child, src),
                 doc: item_doc(src, child.byte_range().start),
@@ -420,7 +484,10 @@ fn item_doc(src: &[u8], item_start: usize) -> Option<String> {
     let mut collected: Vec<String> = Vec::new();
     let mut end = item_start;
     loop {
-        let start = src[..end].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let start = src[..end]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |p| p + 1);
         let line = String::from_utf8_lossy(&src[start..end]);
         let t = line.trim();
         match t.strip_prefix("///") {
@@ -428,10 +495,8 @@ fn item_doc(src: &[u8], item_start: usize) -> Option<String> {
                 collected.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
             }
             _ => {
-                let gap = t.is_empty()
-                    || t.starts_with("#[")
-                    || t.starts_with('[')
-                    || t.starts_with('@');
+                let gap =
+                    t.is_empty() || t.starts_with("#[") || t.starts_with('[') || t.starts_with('@');
                 if !collected.is_empty() || !gap {
                     break;
                 }
@@ -475,8 +540,11 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_python_items,
+        parse_rust_items, parse_ts_items,
+    };
     use crate::types::SymbolKind;
-    use super::{parse_rust_items, parse_c_items, parse_cpp_items, parse_python_items, parse_js_items, parse_ts_items, parse_csharp_items};
 
     const SRC: &str = r#"mod inner {
     pub fn helper() {
@@ -514,16 +582,37 @@ fn free() {
         assert_eq!(
             summary,
             vec![
-                (SymbolKind::Item { label: "module".into() }, "inner", 1),
-                (SymbolKind::Item { label: "struct".into() }, "Point", 0),
-                (SymbolKind::Item { label: "impl".into() }, "Point", 2),
+                (
+                    SymbolKind::Item {
+                        label: "module".into()
+                    },
+                    "inner",
+                    1
+                ),
+                (
+                    SymbolKind::Item {
+                        label: "struct".into()
+                    },
+                    "Point",
+                    0
+                ),
+                (
+                    SymbolKind::Item {
+                        label: "impl".into()
+                    },
+                    "Point",
+                    2
+                ),
                 (SymbolKind::Item { label: "fn".into() }, "free", 0),
             ]
         );
 
         // nested fn inside mod
         assert_eq!(items[0].children[0].name, "helper");
-        assert_eq!(items[0].children[0].kind, SymbolKind::Item { label: "fn".into() });
+        assert_eq!(
+            items[0].children[0].kind,
+            SymbolKind::Item { label: "fn".into() }
+        );
 
         // methods inside impl, in source order at this stage
         let methods: Vec<&str> = items[2].children.iter().map(|c| c.name.as_str()).collect();
@@ -539,9 +628,19 @@ fn free() {
     fn trait_impl_name_includes_trait() {
         let src = b"trait Show {}\nimpl Show for i32 {}\n";
         let items = parse_rust_items(src).unwrap();
-        assert_eq!(items[0].kind, SymbolKind::Item { label: "trait".into() });
+        assert_eq!(
+            items[0].kind,
+            SymbolKind::Item {
+                label: "trait".into()
+            }
+        );
         assert_eq!(items[0].name, "Show");
-        assert_eq!(items[1].kind, SymbolKind::Item { label: "impl".into() });
+        assert_eq!(
+            items[1].kind,
+            SymbolKind::Item {
+                label: "impl".into()
+            }
+        );
         assert_eq!(items[1].name, "Show for i32");
     }
 
@@ -567,7 +666,10 @@ fn free() {
             file_doc(b"//! First line.\n//!\n//! Third.\nfn x() {}\n"),
             Some("First line.\n\nThird.".to_string())
         );
-        assert_eq!(file_doc(b"\n\n//! After blanks.\nfn x() {}\n"), Some("After blanks.".to_string()));
+        assert_eq!(
+            file_doc(b"\n\n//! After blanks.\nfn x() {}\n"),
+            Some("After blanks.".to_string())
+        );
         assert_eq!(file_doc(b"fn x() {}\n"), None);
         assert_eq!(file_doc(b"// plain comment\n//! not leading\n"), None);
     }
@@ -859,13 +961,7 @@ void standalone() {
             .iter()
             .map(|i| (i.kind.label(), i.name.as_str()))
             .collect();
-        assert_eq!(
-            top,
-            vec![
-                ("typedef", "ulong"),
-                ("fn", "standalone"),
-            ]
-        );
+        assert_eq!(top, vec![("typedef", "ulong"), ("fn", "standalone"),]);
     }
 
     #[test]
@@ -902,4 +998,3 @@ void Foo::bar() {
         assert_eq!(items[2].name, "Foo::bar");
     }
 }
-

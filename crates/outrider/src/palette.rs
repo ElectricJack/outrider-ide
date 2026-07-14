@@ -38,7 +38,8 @@ impl Palette {
         self.selection = 0;
         self.candidates.clear();
         Self::collect_candidates(&tree.root, mode, &mut self.candidates);
-        self.candidates.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.1.cmp(&b.1)));
+        self.candidates
+            .sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.1.cmp(&b.1)));
         self.refilter();
     }
 
@@ -136,7 +137,11 @@ mod tests {
     fn test_tree() -> SymbolTree {
         fn node(kind: SymbolKind, qp: &str, name: &str, children: Vec<SymbolNode>) -> SymbolNode {
             SymbolNode {
-                id: SymbolId { kind, qualified_path: qp.into(), ordinal: 0 },
+                id: SymbolId {
+                    kind,
+                    qualified_path: qp.into(),
+                    ordinal: 0,
+                },
                 name: name.into(),
                 byte_range: None,
                 signature: None,
@@ -153,16 +158,47 @@ mod tests {
                 "",
                 "",
                 vec![
-                    node(SymbolKind::File, "parse.rs", "parse.rs", vec![
-                        node(SymbolKind::Item { label: "fn".into() }, "parse.rs::parse_item", "parse_item", vec![]),
-                        node(SymbolKind::Item { label: "fn".into() }, "parse.rs::tokenize", "tokenize", vec![]),
-                    ]),
-                    node(SymbolKind::File, "main.rs", "main.rs", vec![
-                        node(SymbolKind::Item { label: "fn".into() }, "main.rs::main", "main", vec![]),
-                    ]),
-                    node(SymbolKind::Folder, "utils", "utils", vec![
-                        node(SymbolKind::File, "utils/helpers.rs", "helpers.rs", vec![]),
-                    ]),
+                    node(
+                        SymbolKind::File,
+                        "parse.rs",
+                        "parse.rs",
+                        vec![
+                            node(
+                                SymbolKind::Item { label: "fn".into() },
+                                "parse.rs::parse_item",
+                                "parse_item",
+                                vec![],
+                            ),
+                            node(
+                                SymbolKind::Item { label: "fn".into() },
+                                "parse.rs::tokenize",
+                                "tokenize",
+                                vec![],
+                            ),
+                        ],
+                    ),
+                    node(
+                        SymbolKind::File,
+                        "main.rs",
+                        "main.rs",
+                        vec![node(
+                            SymbolKind::Item { label: "fn".into() },
+                            "main.rs::main",
+                            "main",
+                            vec![],
+                        )],
+                    ),
+                    node(
+                        SymbolKind::Folder,
+                        "utils",
+                        "utils",
+                        vec![node(
+                            SymbolKind::File,
+                            "utils/helpers.rs",
+                            "helpers.rs",
+                            vec![],
+                        )],
+                    ),
                 ],
             ),
             repo_root: std::path::PathBuf::from("/tmp"),
@@ -253,7 +289,11 @@ mod tests {
         // Build a tree with 20 files
         fn node(kind: SymbolKind, qp: &str, name: &str) -> SymbolNode {
             SymbolNode {
-                id: SymbolId { kind, qualified_path: qp.into(), ordinal: 0 },
+                id: SymbolId {
+                    kind,
+                    qualified_path: qp.into(),
+                    ordinal: 0,
+                },
                 name: name.into(),
                 byte_range: None,
                 signature: None,
@@ -269,7 +309,11 @@ mod tests {
             .collect();
         let tree = SymbolTree {
             root: SymbolNode {
-                id: SymbolId { kind: SymbolKind::Folder, qualified_path: "".into(), ordinal: 0 },
+                id: SymbolId {
+                    kind: SymbolKind::Folder,
+                    qualified_path: "".into(),
+                    ordinal: 0,
+                },
                 name: "".into(),
                 byte_range: None,
                 signature: None,

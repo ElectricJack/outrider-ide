@@ -5,3 +5,8 @@ members = [
     "crates/outrider-layout",
     "crates/outrider",
 ]
+
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/ElectricJack/outrider-ide"
+rust-version = "1.89"
