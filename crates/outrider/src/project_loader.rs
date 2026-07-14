@@ -19,6 +19,9 @@ pub struct LoadResult {
     pub layout: PackLayout,
     pub warnings: Vec<String>,
     pub source_fingerprints: BTreeMap<String, u64>,
+    /// Per-project disk allowance resolved on the loader thread so project
+    /// installation never canonicalizes the project path on the UI thread.
+    pub disk_cache_bytes: u64,
     /// Canonical project cache identity prepared off the UI thread. Failure is
     /// non-fatal so the tree and layout remain usable without disk caching.
     pub project_namespace: Result<ProjectTextureNamespace, String>,
@@ -215,6 +218,7 @@ fn load_project_cancellable(
     cancellation.checkpoint()?;
     let project_namespace =
         ProjectTextureNamespace::prepare(project_root).map_err(|error| error.to_string());
+    let disk_cache_bytes = settings.disk_cache_bytes(project_root);
     cancellation.checkpoint()?;
     let outcome = outrider_index::index_repo_with_progress_outcome_cancellable(
         project_root,
@@ -236,6 +240,7 @@ fn load_project_cancellable(
         layout,
         warnings: outcome.warnings,
         source_fingerprints: outcome.source_fingerprints,
+        disk_cache_bytes,
         project_namespace,
     };
     cancellation.checkpoint()?;
@@ -271,6 +276,7 @@ mod tests {
             layout,
             warnings,
             source_fingerprints,
+            disk_cache_bytes,
             project_namespace,
         } = result;
 
@@ -280,6 +286,7 @@ mod tests {
         assert!(!layout.rects.is_empty());
         assert!(warnings.is_empty());
         assert!(source_fingerprints.contains_key("main.rs"));
+        assert_eq!(disk_cache_bytes, crate::settings::DEFAULT_DISK_CACHE_BYTES);
         assert!(project_namespace.is_ok());
     }
 

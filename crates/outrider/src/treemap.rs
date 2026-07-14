@@ -1622,6 +1622,7 @@ impl TreemapView {
             layout,
             warnings,
             source_fingerprints,
+            disk_cache_bytes,
             project_namespace,
         } = project;
         debug_assert!(self.loader.accepts(generation));
@@ -1641,7 +1642,7 @@ impl TreemapView {
             project_namespace,
             source_fingerprints,
             self.settings.cache_mb as usize * 1024 * 1024,
-            self.settings.disk_cache_bytes(&project_root),
+            disk_cache_bytes,
         ));
         if !warnings.is_empty() {
             self.notifications
