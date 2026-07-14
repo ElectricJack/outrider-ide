@@ -59,6 +59,8 @@ pub struct TextureStore {
     dir: PathBuf,
     namespace_lock: Arc<Mutex<()>>,
     namespace_usage: Arc<AtomicU64>,
+    namespace_generation: Arc<AtomicU64>,
+    generation: u64,
     max_bytes: u64,
     used_bytes: u64,
     clock: u64,
@@ -66,19 +68,76 @@ pub struct TextureStore {
 }
 
 impl TextureStore {
-    pub fn open(project_root: &Path, max_bytes: u64) -> io::Result<Self> {
+    pub(crate) fn prepare_replacement(
+        project_root: &Path,
+        max_bytes: u64,
+    ) -> io::Result<PreparedTextureStore> {
         let cache_root = dirs::cache_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cache directory unavailable"))?
             .join("outrider")
             .join("textures");
-        let canonical = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.into());
-        let mut identity = canonical.to_string_lossy().replace('\\', "/");
-        #[cfg(windows)]
-        identity.make_ascii_lowercase();
-        Self::open_at(&cache_root, &identity, max_bytes)
+        Self::prepare_project_replacement_at(&cache_root, project_root, max_bytes)
     }
 
+    fn prepare_project_replacement_at(
+        cache_root: &Path,
+        project_root: &Path,
+        max_bytes: u64,
+    ) -> io::Result<PreparedTextureStore> {
+        let lexical_identity = normalized_project_identity(project_root);
+        let generation_key = generation_key(cache_root, &lexical_identity);
+        let namespace_generation = generation_resource(generation_key);
+        let generation = namespace_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        Ok(PreparedTextureStore {
+            cache_root: cache_root.to_path_buf(),
+            project_identity: lexical_identity,
+            project_root: Some(project_root.to_path_buf()),
+            max_bytes,
+            namespace_generation,
+            generation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_replacement_at(
+        cache_root: &Path,
+        project_identity: &str,
+        max_bytes: u64,
+    ) -> io::Result<PreparedTextureStore> {
+        let generation_key = generation_key(cache_root, project_identity);
+        let namespace_generation = generation_resource(generation_key);
+        let generation = namespace_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        Ok(PreparedTextureStore {
+            cache_root: cache_root.to_path_buf(),
+            project_identity: project_identity.to_owned(),
+            project_root: None,
+            max_bytes,
+            namespace_generation,
+            generation,
+        })
+    }
+
+    #[cfg(test)]
     pub fn open_at(cache_root: &Path, project_identity: &str, max_bytes: u64) -> io::Result<Self> {
+        let namespace_generation =
+            generation_resource(generation_key(cache_root, project_identity));
+        let generation = namespace_generation.load(Ordering::Acquire);
+        Self::open_at_generation(
+            cache_root,
+            project_identity,
+            max_bytes,
+            namespace_generation,
+            generation,
+        )
+    }
+
+    fn open_at_generation(
+        cache_root: &Path,
+        project_identity: &str,
+        max_bytes: u64,
+        namespace_generation: Arc<AtomicU64>,
+        generation: u64,
+    ) -> io::Result<Self> {
         let mut hash = Fnv1a::new();
         hash.field(project_identity.replace('\\', "/").as_bytes());
         let dir = cache_root.join(format!("{:016x}", hash.finish()));
@@ -93,11 +152,14 @@ impl TextureStore {
             dir,
             namespace_lock,
             namespace_usage,
+            namespace_generation,
+            generation,
             max_bytes,
             used_bytes: 0,
             clock: 0,
             entries: HashMap::new(),
         };
+        store.ensure_current_generation()?;
         store.rebuild_index_unlocked()?;
         store.evict_unlocked()?;
         Ok(store)
@@ -116,6 +178,7 @@ impl TextureStore {
         let _guard = operation_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        self.ensure_current_generation()?;
         self.rebuild_index_with_remove_unlocked(&mut remove)?;
         let path = self.path(*key);
         let mut file = match File::open(&path) {
@@ -191,6 +254,7 @@ impl TextureStore {
         let _guard = operation_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        self.ensure_current_generation()?;
         let payload_len = validate_payload(payload)?;
         let file_bytes = HEADER_LEN as u64 + payload_len;
         if file_bytes > self.max_bytes {
@@ -269,6 +333,7 @@ impl TextureStore {
         let _guard = operation_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        self.ensure_current_generation()?;
         let mut first_error = None;
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
@@ -418,6 +483,16 @@ impl TextureStore {
             .store(self.used_bytes, Ordering::Release);
     }
 
+    fn ensure_current_generation(&self) -> io::Result<()> {
+        if self.namespace_generation.load(Ordering::Acquire) != self.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "texture cache namespace was replaced",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn shared_usage(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.namespace_usage)
     }
@@ -484,9 +559,80 @@ impl TextureStore {
     }
 }
 
+pub(crate) struct PreparedTextureStore {
+    cache_root: PathBuf,
+    project_identity: String,
+    project_root: Option<PathBuf>,
+    max_bytes: u64,
+    namespace_generation: Arc<AtomicU64>,
+    generation: u64,
+}
+
+impl PreparedTextureStore {
+    pub(crate) fn open(self) -> io::Result<TextureStore> {
+        let project_identity = self
+            .project_root
+            .as_deref()
+            .map(canonical_project_identity)
+            .unwrap_or(self.project_identity);
+        TextureStore::open_at_generation(
+            &self.cache_root,
+            &project_identity,
+            self.max_bytes,
+            self.namespace_generation,
+            self.generation,
+        )
+    }
+}
+
 struct NamespaceResources {
     lock: Weak<Mutex<()>>,
     usage: Weak<AtomicU64>,
+}
+
+fn normalized_project_identity(project_root: &Path) -> String {
+    let absolute = std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let mut identity = absolute.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    identity.make_ascii_lowercase();
+    identity
+}
+
+fn canonical_project_identity(project_root: &Path) -> String {
+    let canonical = fs::canonicalize(project_root).unwrap_or_else(|_| {
+        std::path::absolute(project_root).unwrap_or_else(|_| project_root.into())
+    });
+    let mut identity = canonical.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    identity.make_ascii_lowercase();
+    identity
+}
+
+fn generation_key(cache_root: &Path, project_identity: &str) -> String {
+    let root = std::path::absolute(cache_root).unwrap_or_else(|_| cache_root.to_path_buf());
+    let mut key = format!(
+        "{}\0{}",
+        root.to_string_lossy().replace('\\', "/"),
+        project_identity.replace('\\', "/")
+    );
+    #[cfg(windows)]
+    key.make_ascii_lowercase();
+    key
+}
+
+fn generation_resource(key: String) -> Arc<AtomicU64> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<String, Weak<AtomicU64>>>> = OnceLock::new();
+    let generations = GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut generations = generations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    generations.retain(|_, generation| generation.strong_count() > 0);
+    if let Some(generation) = generations.get(&key).and_then(Weak::upgrade) {
+        return generation;
+    }
+    let generation = Arc::new(AtomicU64::new(1));
+    generations.insert(key, Arc::downgrade(&generation));
+    generation
 }
 
 fn namespace_resources(dir: &Path) -> (Arc<Mutex<()>>, Arc<AtomicU64>) {
@@ -962,6 +1108,44 @@ mod tests {
         let reopened = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
         assert!(namespace_bytes(&reopened) <= entry_bytes);
         assert_eq!(reopened.used_bytes(), namespace_bytes(&reopened));
+    }
+
+    #[test]
+    fn replaced_generation_cannot_write_after_reduced_limit_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let mut old = TextureStore::open_at(dir.path(), "project", entry_bytes * 2).unwrap();
+        old.save(&key("old.rs", 1), &payload(16)).unwrap();
+
+        let replacement =
+            TextureStore::prepare_replacement_at(dir.path(), "project", entry_bytes).unwrap();
+        let replacement = replacement.open().unwrap();
+        assert!(replacement.used_bytes() <= entry_bytes);
+
+        assert!(old.save(&key("stale.rs", 1), &payload(16)).is_err());
+        assert!(namespace_bytes(&replacement) <= entry_bytes);
+        assert_eq!(replacement.used_bytes(), namespace_bytes(&replacement));
+    }
+
+    #[test]
+    fn prepared_project_open_preserves_canonical_on_disk_namespace_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut canonical = std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        #[cfg(windows)]
+        canonical.make_ascii_lowercase();
+        let direct = TextureStore::open_at(&cache, &canonical, 1024).unwrap();
+
+        let prepared =
+            TextureStore::prepare_project_replacement_at(&cache, &project, 1024).unwrap();
+        let replacement = prepared.open().unwrap();
+
+        assert_eq!(direct.dir_for_test(), replacement.dir_for_test());
     }
 
     #[test]

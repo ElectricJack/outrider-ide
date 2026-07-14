@@ -399,6 +399,7 @@ fn rgb_u8(c: u32) -> (u8, u8, u8) {
 /// Bakes per frame for on-demand misses.
 pub const BAKES_PER_FRAME: usize = 4;
 const DISK_QUEUE_CAPACITY: usize = 64;
+const DISK_RESULT_CAPACITY: usize = 16;
 #[cfg(test)]
 const DEFAULT_CACHE_MB: u32 = 256;
 
@@ -471,12 +472,12 @@ struct TextureDiskWorker {
     state: Arc<Mutex<DiskState>>,
     shared_usage: Arc<Mutex<Option<Arc<AtomicU64>>>>,
     cancelled: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl TextureDiskWorker {
     fn spawn(project_root: PathBuf, max_bytes: u64) -> io::Result<Self> {
-        Self::try_spawn_with_opener(move || TextureStore::open(&project_root, max_bytes))
+        let prepared = TextureStore::prepare_replacement(&project_root, max_bytes)?;
+        Self::try_spawn_with_opener(move || prepared.open())
     }
 
     #[cfg(test)]
@@ -490,14 +491,14 @@ impl TextureDiskWorker {
         opener: impl FnOnce() -> io::Result<TextureStore> + Send + 'static,
     ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::sync_channel(DISK_QUEUE_CAPACITY);
-        let (result_tx, result_rx) = mpsc::channel();
+        let (result_tx, result_rx) = disk_result_channel();
         let state = Arc::new(Mutex::new(DiskState::Preparing));
         let worker_state = Arc::clone(&state);
         let shared_usage = Arc::new(Mutex::new(None));
         let worker_shared_usage = Arc::clone(&shared_usage);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        let thread = thread::Builder::new()
+        thread::Builder::new()
             .name("outrider-texture-cache".into())
             .spawn(move || {
                 run_disk_worker(
@@ -515,7 +516,6 @@ impl TextureDiskWorker {
             state,
             shared_usage,
             cancelled,
-            thread: Some(thread),
         })
     }
 }
@@ -523,29 +523,18 @@ impl TextureDiskWorker {
 impl Drop for TextureDiskWorker {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
-        if self.thread.is_none() {
-            return;
-        }
-        let mut shutdown = DiskCommand::Shutdown;
-        loop {
-            match self.commands.try_send(shutdown) {
-                Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => break,
-                Err(mpsc::TrySendError::Full(command)) => {
-                    shutdown = command;
-                    thread::yield_now();
-                }
-            }
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = self.commands.try_send(DiskCommand::Shutdown);
     }
+}
+
+fn disk_result_channel() -> (mpsc::SyncSender<DiskResult>, mpsc::Receiver<DiskResult>) {
+    mpsc::sync_channel(DISK_RESULT_CAPACITY)
 }
 
 fn run_disk_worker(
     opener: impl FnOnce() -> io::Result<TextureStore>,
     commands: mpsc::Receiver<DiskCommand>,
-    results: mpsc::Sender<DiskResult>,
+    results: mpsc::SyncSender<DiskResult>,
     state: Arc<Mutex<DiskState>>,
     shared_usage: Arc<Mutex<Option<Arc<AtomicU64>>>>,
     cancelled: Arc<AtomicBool>,
@@ -647,7 +636,7 @@ fn run_disk_worker(
 }
 
 fn send_disk_diagnostic(
-    results: &mpsc::Sender<DiskResult>,
+    results: &mpsc::SyncSender<DiskResult>,
     reported: &mut HashSet<(DiskOperation, String)>,
     operation: DiskOperation,
     message: String,
@@ -957,11 +946,18 @@ impl TextureCache {
 
     fn apply_disk_results(&mut self) {
         for _ in 0..BAKES_PER_FRAME {
-            let result = self
+            let received = self
                 .disk_worker
                 .as_ref()
-                .and_then(|worker| worker.results.try_recv().ok());
-            let Some(result) = result else { break };
+                .map(|worker| worker.results.try_recv());
+            let result = match received {
+                Some(Ok(result)) => result,
+                Some(Err(mpsc::TryRecvError::Empty)) | None => break,
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    self.handle_disk_disconnect();
+                    break;
+                }
+            };
             match result {
                 DiskResult::OpenComplete => self.disk_worker_starting = false,
                 DiskResult::Loaded { id, payload } => {
@@ -989,6 +985,25 @@ impl TextureCache {
                 }
             }
         }
+    }
+
+    fn handle_disk_disconnect(&mut self) {
+        let waiting = std::mem::take(&mut self.waiting_disk);
+        self.disk_inflight.clear();
+        for (id, priority) in waiting {
+            self.request(id, priority);
+        }
+        if self.clear_disk_pending || self.clear_disk_inflight > 0 {
+            self.disk_diagnostics.push(DiskDiagnostic {
+                operation: DiskOperation::Clear,
+                message: "texture cache worker disconnected".into(),
+            });
+        }
+        self.disk_worker_starting = false;
+        self.clear_disk_pending = false;
+        self.clear_disk_inflight = 0;
+        self.pending_disk_saves = 0;
+        self.disk_worker = None;
     }
 
     fn dispatch_disk_loads(&mut self) {
@@ -1030,6 +1045,10 @@ impl TextureCache {
         }
         let Some(worker) = &self.disk_worker else {
             self.clear_disk_pending = false;
+            self.disk_diagnostics.push(DiskDiagnostic {
+                operation: DiskOperation::Clear,
+                message: "texture cache unavailable".into(),
+            });
             return;
         };
         match worker.commands.try_send(DiskCommand::Clear) {
@@ -1184,42 +1203,48 @@ mod tests {
     }
 
     #[test]
-    fn dropping_worker_cancels_commands_queued_before_open_finishes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let open_root = root.clone();
+    fn disk_result_channel_applies_backpressure() {
+        let (results, _receiver) = disk_result_channel();
+        for ordinal in 0..DISK_RESULT_CAPACITY {
+            results
+                .try_send(DiskResult::Loaded {
+                    id: sid(&format!("result-{ordinal}")),
+                    payload: TexturePayload {
+                        width: 1,
+                        height: 1,
+                        bytes: vec![0; 4],
+                    },
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            results.try_send(DiskResult::Loaded {
+                id: sid("full"),
+                payload: TexturePayload {
+                    width: 1,
+                    height: 1,
+                    bytes: vec![0; 4],
+                },
+            }),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn dropping_worker_returns_while_open_is_blocked() {
         let (allow_open, wait_for_open) = mpsc::channel();
         let worker = TextureDiskWorker::spawn_with_opener(move || {
             wait_for_open.recv().unwrap();
-            TextureStore::open_at(&open_root, "project", 1024)
+            Err(std::io::Error::other("open released after drop"))
         });
-        worker
-            .commands
-            .send(DiskCommand::Save {
-                key: TextureKey::new("a.rs", 1, &sid("a.rs"), 1, 1),
-                payload: TexturePayload {
-                    width: 4,
-                    height: 1,
-                    bytes: vec![0; 16],
-                },
-            })
-            .unwrap();
 
         let (dropped_tx, dropped_rx) = mpsc::channel();
-        let dropping = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             drop(worker);
             dropped_tx.send(()).unwrap();
         });
-        assert!(
-            dropped_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-            "drop must wait for the worker to stop"
-        );
-        allow_open.send(()).unwrap();
         dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        dropping.join().unwrap();
-
-        let reopened = TextureStore::open_at(&root, "project", 1024).unwrap();
-        assert_eq!(reopened.used_bytes(), 0);
+        allow_open.send(()).unwrap();
     }
 
     #[test]
@@ -1327,7 +1352,6 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
-            thread: None,
         });
         cache.disk_worker_starting = true;
 
@@ -1335,6 +1359,49 @@ mod tests {
         result_tx.send(DiskResult::OpenComplete).unwrap();
         cache.process_requests(|_, _| panic!("no texture should bake"));
         assert!(!cache.has_queued());
+    }
+
+    #[test]
+    fn result_disconnect_requeues_inflight_loads_and_clears_lifecycle() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(DISK_QUEUE_CAPACITY);
+        let (result_tx, result_rx) = mpsc::sync_channel(DISK_RESULT_CAPACITY);
+        drop(result_tx);
+        let mut cache = TextureCache::new_memory_only(1024);
+        cache.disk_worker = Some(TextureDiskWorker {
+            commands: command_tx,
+            results: result_rx,
+            state: Arc::new(Mutex::new(DiskState::Preparing)),
+            shared_usage: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        cache.waiting_disk.insert(sid("a"), 100.0);
+        cache.waiting_disk.insert(sid("b"), 50.0);
+        cache.disk_inflight.insert(sid("a"));
+        cache.disk_worker_starting = true;
+        cache.clear_disk_inflight = 1;
+        cache.pending_disk_saves = 1;
+
+        cache.process_requests(|_, _| Some(texture(1)));
+
+        assert!(cache.disk_worker.is_none());
+        assert!(cache.contains(&sid("a")));
+        assert!(cache.contains(&sid("b")));
+        assert!(!cache.has_queued());
+    }
+
+    #[test]
+    fn every_clear_without_a_worker_emits_a_diagnostic() {
+        let mut cache = TextureCache::new_memory_only(1024);
+        for _ in 0..2 {
+            cache.request_clear_disk_cache();
+            cache.process_requests(|_, _| panic!("no texture should bake"));
+        }
+
+        let diagnostics = cache.drain_disk_diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.operation == DiskOperation::Clear));
     }
 
     #[test]
@@ -1348,7 +1415,6 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
-            thread: None,
         });
 
         cache.request_clear_disk_cache();
@@ -1373,7 +1439,6 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
-            thread: None,
         });
         let texture = some_tex(1, &mut Rasterizer::new()).unwrap();
 
@@ -1401,7 +1466,6 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
-            thread: None,
         });
 
         assert!(cache.get(&sid("a"), 10.0).is_none());
@@ -1437,7 +1501,6 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
-            thread: None,
         });
         cache.get(&sid("a"), 10.0);
 
