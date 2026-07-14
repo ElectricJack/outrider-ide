@@ -4,9 +4,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::thread;
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
@@ -472,12 +472,104 @@ struct TextureDiskWorker {
     state: Arc<Mutex<DiskState>>,
     shared_usage: Arc<Mutex<Option<Arc<AtomicU64>>>>,
     cancelled: Arc<AtomicBool>,
+    control: Option<Arc<WorkerControl>>,
+}
+
+struct PendingDiskStart {
+    prepared: crate::texture_store::PreparedTextureStore,
+}
+
+struct WorkerControl {
+    cancelled: Arc<AtomicBool>,
+    retiring: AtomicBool,
+    wake: Mutex<Option<mpsc::SyncSender<DiskCommand>>>,
+}
+
+impl WorkerControl {
+    fn retire(&self) {
+        self.retiring.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(wake) = self
+            .wake
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            let _ = wake.try_send(DiskCommand::Shutdown);
+        }
+    }
+}
+
+struct WorkerSlot {
+    current: Mutex<Option<Weak<WorkerControl>>>,
+    started: AtomicUsize,
+    retired: AtomicUsize,
+}
+
+impl WorkerSlot {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(None),
+            started: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_claim(&self) -> Option<Arc<WorkerControl>> {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(worker) = current.as_ref().and_then(Weak::upgrade) {
+            worker.retire();
+            return None;
+        }
+        let worker = Arc::new(WorkerControl {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            retiring: AtomicBool::new(false),
+            wake: Mutex::new(None),
+        });
+        *current = Some(Arc::downgrade(&worker));
+        Some(worker)
+    }
+
+    fn finish(&self, worker: &Arc<WorkerControl>) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if current
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, worker))
+        {
+            *current = None;
+        }
+        self.retired.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn global_worker_slot() -> Arc<WorkerSlot> {
+    static SLOT: OnceLock<Arc<WorkerSlot>> = OnceLock::new();
+    Arc::clone(SLOT.get_or_init(|| Arc::new(WorkerSlot::new())))
+}
+
+enum WorkerStart {
+    Started(TextureDiskWorker),
+    Deferred(PendingDiskStart),
+    Failed(io::Error),
 }
 
 impl TextureDiskWorker {
-    fn spawn(project_root: PathBuf, max_bytes: u64) -> io::Result<Self> {
-        let prepared = TextureStore::prepare_replacement(&project_root, max_bytes)?;
-        Self::try_spawn_with_opener(move || prepared.open())
+    fn start(prepared: PendingDiskStart, slot: Arc<WorkerSlot>) -> WorkerStart {
+        let Some(control) = slot.try_claim() else {
+            return WorkerStart::Deferred(prepared);
+        };
+        let opener = move || prepared.prepared.open();
+        match Self::try_spawn_with_opener_and_control(opener, Some((control, slot))) {
+            Ok(worker) => WorkerStart::Started(worker),
+            Err(error) => WorkerStart::Failed(error),
+        }
     }
 
     #[cfg(test)]
@@ -487,8 +579,26 @@ impl TextureDiskWorker {
         Self::try_spawn_with_opener(opener).expect("failed to spawn test texture cache worker")
     }
 
+    #[cfg(test)]
+    fn spawn_with_opener_and_slot(
+        opener: impl FnOnce() -> io::Result<TextureStore> + Send + 'static,
+        slot: Arc<WorkerSlot>,
+    ) -> Self {
+        let control = slot.try_claim().expect("test worker slot was occupied");
+        Self::try_spawn_with_opener_and_control(opener, Some((control, slot)))
+            .expect("failed to spawn gated test texture cache worker")
+    }
+
+    #[cfg(test)]
     fn try_spawn_with_opener(
         opener: impl FnOnce() -> io::Result<TextureStore> + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::try_spawn_with_opener_and_control(opener, None)
+    }
+
+    fn try_spawn_with_opener_and_control(
+        opener: impl FnOnce() -> io::Result<TextureStore> + Send + 'static,
+        lifecycle: Option<(Arc<WorkerControl>, Arc<WorkerSlot>)>,
     ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::sync_channel(DISK_QUEUE_CAPACITY);
         let (result_tx, result_rx) = disk_result_channel();
@@ -496,11 +606,24 @@ impl TextureDiskWorker {
         let worker_state = Arc::clone(&state);
         let shared_usage = Arc::new(Mutex::new(None));
         let worker_shared_usage = Arc::clone(&shared_usage);
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = lifecycle
+            .as_ref()
+            .map(|(control, _)| Arc::clone(&control.cancelled))
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let worker_cancelled = Arc::clone(&cancelled);
+        let control = lifecycle.as_ref().map(|(control, _)| Arc::clone(control));
+        if let Some(control) = &control {
+            *control
+                .wake
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(command_tx.clone());
+        }
         thread::Builder::new()
             .name("outrider-texture-cache".into())
             .spawn(move || {
+                if let Some((_, slot)) = &lifecycle {
+                    slot.started.fetch_add(1, Ordering::AcqRel);
+                }
                 run_disk_worker(
                     opener,
                     command_rx,
@@ -508,7 +631,10 @@ impl TextureDiskWorker {
                     worker_state,
                     worker_shared_usage,
                     worker_cancelled,
-                )
+                );
+                if let Some((control, slot)) = lifecycle {
+                    slot.finish(&control);
+                }
             })?;
         Ok(Self {
             commands: command_tx,
@@ -516,14 +642,19 @@ impl TextureDiskWorker {
             state,
             shared_usage,
             cancelled,
+            control,
         })
     }
 }
 
 impl Drop for TextureDiskWorker {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
-        let _ = self.commands.try_send(DiskCommand::Shutdown);
+        if let Some(control) = &self.control {
+            control.retire();
+        } else {
+            self.cancelled.store(true, Ordering::Release);
+            let _ = self.commands.try_send(DiskCommand::Shutdown);
+        }
     }
 }
 
@@ -670,6 +801,8 @@ pub struct TextureCache {
     deferred_once: HashSet<SymbolId>,
     retired: Vec<Arc<RenderImage>>,
     disk_worker: Option<TextureDiskWorker>,
+    pending_disk_start: Option<PendingDiskStart>,
+    worker_slot: Arc<WorkerSlot>,
     waiting_disk: HashMap<SymbolId, f64>,
     disk_inflight: HashSet<SymbolId>,
     disk_worker_starting: bool,
@@ -687,10 +820,31 @@ impl TextureCache {
         max_bytes: usize,
         disk_max_bytes: u64,
     ) -> Self {
-        let worker = TextureDiskWorker::spawn(project_root.to_path_buf(), disk_max_bytes);
-        let (disk_worker, disk_worker_starting, disk_diagnostics) = match worker {
-            Ok(worker) => (Some(worker), true, Vec::new()),
-            Err(error) => (
+        Self::new_with_slot(
+            project_root,
+            source_fingerprints,
+            max_bytes,
+            disk_max_bytes,
+            global_worker_slot(),
+        )
+    }
+
+    fn new_with_slot(
+        project_root: &Path,
+        source_fingerprints: BTreeMap<String, u64>,
+        max_bytes: usize,
+        disk_max_bytes: u64,
+        worker_slot: Arc<WorkerSlot>,
+    ) -> Self {
+        let start = TextureStore::prepare_replacement(project_root, disk_max_bytes)
+            .map(|prepared| PendingDiskStart { prepared })
+            .map(|pending| TextureDiskWorker::start(pending, Arc::clone(&worker_slot)));
+        let (disk_worker, pending_disk_start, disk_worker_starting, disk_diagnostics) = match start
+        {
+            Ok(WorkerStart::Started(worker)) => (Some(worker), None, true, Vec::new()),
+            Ok(WorkerStart::Deferred(pending)) => (None, Some(pending), false, Vec::new()),
+            Ok(WorkerStart::Failed(error)) | Err(error) => (
+                None,
                 None,
                 false,
                 vec![DiskDiagnostic {
@@ -709,6 +863,8 @@ impl TextureCache {
             deferred_once: HashSet::new(),
             retired: Vec::new(),
             disk_worker,
+            pending_disk_start,
+            worker_slot,
             waiting_disk: HashMap::new(),
             disk_inflight: HashSet::new(),
             disk_worker_starting,
@@ -738,7 +894,11 @@ impl TextureCache {
 
     pub fn disk_state(&self) -> DiskState {
         let Some(worker) = &self.disk_worker else {
-            return DiskState::Unavailable;
+            return if self.pending_disk_start.is_some() {
+                DiskState::Preparing
+            } else {
+                DiskState::Unavailable
+            };
         };
         let state = *worker
             .state
@@ -821,6 +981,7 @@ impl TextureCache {
         !self.queue.is_empty()
             || !self.waiting_disk.is_empty()
             || self.disk_worker_starting
+            || self.pending_disk_start.is_some()
             || self.clear_disk_pending
             || self.clear_disk_inflight > 0
             || self.pending_disk_saves > 0
@@ -859,6 +1020,7 @@ impl TextureCache {
         &mut self,
         mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
     ) -> bool {
+        self.retry_disk_worker_start();
         self.apply_disk_results();
         self.dispatch_clear_request();
         self.dispatch_disk_loads();
@@ -922,6 +1084,9 @@ impl TextureCache {
     }
 
     fn save_to_disk(&mut self, id: &SymbolId, tex: &NodeTexture) {
+        let Some(worker) = &self.disk_worker else {
+            return;
+        };
         let Some(key) = self.disk_key(id) else { return };
         let Some(image) = &tex.image else { return };
         let size = image.size(0);
@@ -933,13 +1098,30 @@ impl TextureCache {
             height: size.height.0 as u32,
             bytes: bytes.to_vec(),
         };
-        if let Some(worker) = &self.disk_worker {
-            if worker
-                .commands
-                .try_send(DiskCommand::Save { key, payload })
-                .is_ok()
-            {
-                self.pending_disk_saves = self.pending_disk_saves.saturating_add(1);
+        if worker
+            .commands
+            .try_send(DiskCommand::Save { key, payload })
+            .is_ok()
+        {
+            self.pending_disk_saves = self.pending_disk_saves.saturating_add(1);
+        }
+    }
+
+    fn retry_disk_worker_start(&mut self) {
+        let Some(pending) = self.pending_disk_start.take() else {
+            return;
+        };
+        match TextureDiskWorker::start(pending, Arc::clone(&self.worker_slot)) {
+            WorkerStart::Started(worker) => {
+                self.disk_worker = Some(worker);
+                self.disk_worker_starting = true;
+            }
+            WorkerStart::Deferred(pending) => self.pending_disk_start = Some(pending),
+            WorkerStart::Failed(error) => {
+                self.disk_diagnostics.push(DiskDiagnostic {
+                    operation: DiskOperation::Open,
+                    message: error.to_string(),
+                });
             }
         }
     }
@@ -1044,6 +1226,9 @@ impl TextureCache {
             return;
         }
         let Some(worker) = &self.disk_worker else {
+            if self.pending_disk_start.is_some() {
+                return;
+            }
             self.clear_disk_pending = false;
             self.disk_diagnostics.push(DiskDiagnostic {
                 operation: DiskOperation::Clear,
@@ -1079,6 +1264,8 @@ impl TextureCache {
             deferred_once: HashSet::new(),
             retired: Vec::new(),
             disk_worker: None,
+            pending_disk_start: None,
+            worker_slot: Arc::new(WorkerSlot::new()),
             waiting_disk: HashMap::new(),
             disk_inflight: HashSet::new(),
             disk_worker_starting: false,
@@ -1200,6 +1387,81 @@ mod tests {
         worker_started.recv_timeout(Duration::from_secs(1)).unwrap();
         allow_open.send(()).unwrap();
         drop(worker);
+    }
+
+    #[test]
+    fn repeated_replacements_bound_retirement_and_deferred_cache_auto_starts() {
+        let project = tempfile::tempdir().unwrap();
+        let slot = Arc::new(WorkerSlot::new());
+        let fingerprints = BTreeMap::from([("a".into(), 1)]);
+        let (allow_retirement, retirement_blocked) = mpsc::channel();
+
+        let first_worker = TextureDiskWorker::spawn_with_opener_and_slot(
+            move || {
+                retirement_blocked.recv().unwrap();
+                Err(std::io::Error::other("retired test worker"))
+            },
+            Arc::clone(&slot),
+        );
+        let mut first = TextureCache::new_memory_only(1024 * 1024);
+        first.source_fingerprints.insert("a".into(), 1);
+        first.disk_worker = Some(first_worker);
+        wait_for_counter_for_test(&slot.started, 1);
+
+        let mut middle = TextureCache::new_with_slot(
+            project.path(),
+            fingerprints.clone(),
+            1024 * 1024,
+            1024,
+            Arc::clone(&slot),
+        );
+        first.insert(sid("a"), some_tex(1, &mut Rasterizer::new()).unwrap());
+        assert_eq!(first.pending_disk_saves, 0);
+        drop(first);
+        let mut current = TextureCache::new_with_slot(
+            project.path(),
+            fingerprints,
+            1024 * 1024,
+            1024,
+            Arc::clone(&slot),
+        );
+        middle.insert(sid("a"), some_tex(1, &mut Rasterizer::new()).unwrap());
+        current.insert(sid("a"), some_tex(1, &mut Rasterizer::new()).unwrap());
+
+        assert_eq!(slot.started.load(Ordering::Acquire), 1);
+        assert_eq!(slot.retired.load(Ordering::Acquire), 0);
+        assert!(middle.disk_worker.is_none());
+        assert!(middle.pending_disk_start.is_some());
+        assert_eq!(middle.pending_disk_saves, 0);
+        assert!(current.disk_worker.is_none());
+        assert!(current.pending_disk_start.is_some());
+        assert_eq!(current.pending_disk_saves, 0);
+        assert_eq!(current.disk_state(), DiskState::Preparing);
+        drop(middle);
+
+        allow_retirement.send(()).unwrap();
+        wait_for_counter_for_test(&slot.retired, 1);
+        for _ in 0..100 {
+            current.process_requests(|_, _| None);
+            if current.disk_worker.is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(current.disk_worker.is_some());
+        wait_for_counter_for_test(&slot.started, 2);
+        assert_eq!(slot.started.load(Ordering::Acquire), 2);
+    }
+
+    fn wait_for_counter_for_test(counter: &AtomicUsize, expected: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while counter.load(Ordering::Acquire) < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "counter did not advance"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -1352,6 +1614,7 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            control: None,
         });
         cache.disk_worker_starting = true;
 
@@ -1373,6 +1636,7 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            control: None,
         });
         cache.waiting_disk.insert(sid("a"), 100.0);
         cache.waiting_disk.insert(sid("b"), 50.0);
@@ -1415,6 +1679,7 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            control: None,
         });
 
         cache.request_clear_disk_cache();
@@ -1439,6 +1704,7 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            control: None,
         });
         let texture = some_tex(1, &mut Rasterizer::new()).unwrap();
 
@@ -1466,6 +1732,7 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            control: None,
         });
 
         assert!(cache.get(&sid("a"), 10.0).is_none());
@@ -1501,6 +1768,7 @@ mod tests {
             state: Arc::new(Mutex::new(DiskState::Preparing)),
             shared_usage: Arc::new(Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            control: None,
         });
         cache.get(&sid("a"), 10.0);
 
