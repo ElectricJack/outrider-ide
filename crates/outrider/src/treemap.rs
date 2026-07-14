@@ -344,6 +344,19 @@ fn leaf_tex_rect(node: &SymbolNode, left: f64, top: f64, full_h: f64) -> (f64, f
     )
 }
 
+/// Texture painting only needs the quad to intersect the viewport. GPU image
+/// quads continue to render correctly when their projected size is subpixel.
+fn leaf_texture_is_visible(
+    left: f64,
+    width: f64,
+    top: f64,
+    height: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> bool {
+    left < viewport_w && left + width > 0.0 && top < viewport_h && top + height > 0.0
+}
+
 /// Rendered container-header height for a positive [`Camera`] zoom.
 fn container_header_px(zoom: f64) -> f64 {
     ((HEADER + 2.0 * LINE_STEP) * zoom.min(1.0)).max(HEADER)
@@ -908,7 +921,7 @@ impl TreemapView {
                     } else {
                         let (tx, ty, tw, th) =
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
-                        if tw >= 1.0 && th >= 1.0 && ty < vh && ty + th > 0.0 {
+                        if leaf_texture_is_visible(tx, tw, ty, th, vw, vh) {
                             if let Some(textures) = self.textures.as_mut() {
                                 if let Some(t) = textures.get(&item.node.id, tw * th) {
                                     if let Some(img) = &t.image {
@@ -2396,7 +2409,7 @@ mod tests {
     use super::{
         code_line, container_body, container_header_bg_h, container_header_layout,
         container_header_px, header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body,
-        runs_from_spans, truncate_to_width, wrap_doc, HEADER, LINE_STEP,
+        leaf_texture_is_visible, runs_from_spans, truncate_to_width, wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2695,6 +2708,13 @@ mod tests {
         assert!((y - (50.0 + HEADER)).abs() < 1e-9);
         assert!((w - world::PAGE_W * 0.5).abs() < 1e-9);
         assert!((h - 10.0 * LINE_STEP * 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cached_leaf_texture_remains_visible_at_subpixel_size() {
+        assert!(leaf_texture_is_visible(
+            120.0, 0.5, 120.0, 0.5, 800.0, 600.0
+        ));
     }
 
     use super::{inset_top, pinned_stack_h};
