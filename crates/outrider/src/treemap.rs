@@ -344,6 +344,53 @@ fn leaf_tex_rect(node: &SymbolNode, left: f64, top: f64, full_h: f64) -> (f64, f
     )
 }
 
+/// Rendered container-header height for a positive [`Camera`] zoom.
+fn container_header_px(zoom: f64) -> f64 {
+    ((HEADER + 2.0 * LINE_STEP) * zoom.min(1.0)).max(HEADER)
+}
+
+fn container_header_bg_h(body_len: usize, max_h: f64) -> f64 {
+    (HEADER + body_len as f64 * LINE_STEP).min(max_h)
+}
+
+fn header_bg_paint_h(logical_h: f32) -> f32 {
+    (logical_h - 1.0).max(0.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContainerHeaderLayout {
+    pin_y: f64,
+    max_h: f64,
+}
+
+/// Computes pinned-header geometry within the clipped container. `zoom` is a
+/// positive [`Camera`] zoom. Card-or-higher headers require one complete line
+/// after ancestor stacking and never extend past the container's trailing edge.
+fn container_header_layout(
+    rung: Rung,
+    clipped_y: f64,
+    clipped_h: f64,
+    stack_bottom: f64,
+    zoom: f64,
+) -> Option<ContainerHeaderLayout> {
+    let pin_y = clipped_y.max(stack_bottom);
+    match rung {
+        Rung::Dot => None,
+        Rung::Label if clipped_h >= 14.0 => Some(ContainerHeaderLayout {
+            pin_y,
+            max_h: clipped_h,
+        }),
+        Rung::Label => None,
+        Rung::Card | Rung::Detail | Rung::Full => {
+            let available = clipped_y + clipped_h - pin_y;
+            (available >= HEADER).then(|| ContainerHeaderLayout {
+                pin_y,
+                max_h: container_header_px(zoom).min(available),
+            })
+        }
+    }
+}
+
 /// Predicted height of the pinned ancestor-header stack above `focus` under
 /// camera `cam`, mirroring paint_items' stacking: each named ancestor's
 /// header pins at max(its screen top clamped to the viewport, the previous
@@ -357,7 +404,7 @@ fn pinned_stack_h(
     vw: f64,
     vh: f64,
 ) -> f64 {
-    let hdr = (HEADER + 2.0 * LINE_STEP) * cam.zoom.min(1.0);
+    let hdr = container_header_px(cam.zoom);
     let mut chain = Vec::new();
     let mut id = focus;
     while let Some(p) = index.parent(id) {
@@ -759,17 +806,28 @@ impl TreemapView {
             match item.draw {
                 Draw::Container(rung) => {
                     let stack_bottom = header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
-                    let pin_y = item.px.y.max(stack_bottom);
-                    let ch_px = (HEADER + 2.0 * LINE_STEP) * camera.zoom;
-                    if rung != Rung::Dot && item.px.h >= 14.0 {
-                        name = Self::pinned_name(&item, rung == Rung::Label, pin_y);
-                    }
-                    body =
-                        container_body(item.node, rung, &item.px, item.label_w, vh, pin_y, ch_px);
-                    if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
-                        header_bg_h = (HEADER + body.len() as f64 * LINE_STEP).min(ch_px) as f32;
-                        header_bg_y = pin_y as f32;
-                        header_stack.push((item.level, pin_y + header_bg_h as f64));
+                    if let Some(header) = container_header_layout(
+                        rung,
+                        item.px.y,
+                        item.px.h,
+                        stack_bottom,
+                        camera.zoom,
+                    ) {
+                        name = Self::pinned_name(&item, rung == Rung::Label, header.pin_y);
+                        body = container_body(
+                            item.node,
+                            rung,
+                            &item.px,
+                            item.label_w,
+                            vh,
+                            header.pin_y,
+                            header.max_h,
+                        );
+                        if name.is_some() && !matches!(rung, Rung::Dot | Rung::Label) {
+                            header_bg_h = container_header_bg_h(body.len(), header.max_h) as f32;
+                            header_bg_y = header.pin_y as f32;
+                            header_stack.push((item.level, header.pin_y + header_bg_h as f64));
+                        }
                     }
                     if matches!(rung, Rung::Dot | Rung::Label | Rung::Card)
                         && !item.node.children.is_empty()
@@ -2056,7 +2114,10 @@ impl Render for TreemapView {
                                     origin.x + px(item.x + 1.0),
                                     origin.y + px(item.header_bg_y + 1.0),
                                 ),
-                                size(px((item.w - 2.0).max(0.0)), px(item.header_bg_h)),
+                                size(
+                                    px((item.w - 2.0).max(0.0)),
+                                    px(header_bg_paint_h(item.header_bg_h)),
+                                ),
                             );
                             window.paint_quad(quad(
                                 hb,
@@ -2312,7 +2373,8 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        code_line, container_body, leaf_tex_rect, leaf_text_body, runs_from_spans,
+        code_line, container_body, container_header_bg_h, container_header_layout,
+        container_header_px, header_bg_paint_h, leaf_tex_rect, leaf_text_body, runs_from_spans,
         truncate_to_width, wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
@@ -2620,6 +2682,74 @@ mod tests {
     use outrider_index::SymbolTree;
     use outrider_layout::{PackLayout, Rect};
 
+    #[test]
+    fn container_header_never_collapses_below_one_line() {
+        let natural = HEADER + 2.0 * LINE_STEP;
+        assert!((container_header_px(1.0) - natural).abs() < 1e-9);
+        assert!((container_header_px(0.5) - natural * 0.5).abs() < 1e-9);
+        assert!((container_header_px(0.1) - HEADER).abs() < 1e-9);
+
+        // Camera zoom is positive. Check the adjacent representable values
+        // around the exact clamp transition rather than implying zero or
+        // negative zoom support.
+        let transition = HEADER / natural;
+        let below = f64::from_bits(transition.to_bits() - 1);
+        let above = f64::from_bits(transition.to_bits() + 1);
+        assert!((container_header_px(below) - HEADER).abs() < 1e-9);
+        assert!((container_header_px(transition) - HEADER).abs() < 1e-9);
+        assert!(container_header_px(above) > HEADER);
+    }
+
+    #[test]
+    fn container_header_layout_respects_trailing_edge_and_ancestor_stack() {
+        for rung in [Rung::Card, Rung::Detail, Rung::Full] {
+            assert!(container_header_layout(rung, 597.0, 3.0, 597.0, 1.0).is_none());
+            assert!(container_header_layout(rung, 600.0, 2.0, 600.0, 1.0).is_none());
+
+            let exact = container_header_layout(rung, 100.0, HEADER, 100.0, 1.0).unwrap();
+            assert!((exact.pin_y - 100.0).abs() < 1e-9);
+            assert!((exact.max_h - HEADER).abs() < 1e-9);
+
+            let available = HEADER + 5.0;
+            let capped = container_header_layout(rung, 100.0, available, 100.0, 1.0).unwrap();
+            assert!((capped.max_h - available).abs() < 1e-9);
+            assert!(capped.pin_y + capped.max_h <= 100.0 + available);
+
+            let stacked =
+                container_header_layout(rung, 100.0, 2.0 * HEADER, 100.0 + HEADER - 2.0, 1.0)
+                    .unwrap();
+            assert!((stacked.max_h - (HEADER + 2.0)).abs() < 1e-9);
+            assert!(
+                container_header_layout(rung, 100.0, 2.0 * HEADER, 100.0 + HEADER + 1.0, 1.0,)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn container_header_layout_preserves_label_and_dot_policy() {
+        assert!(container_header_layout(Rung::Dot, 0.0, 100.0, 0.0, 1.0).is_none());
+        assert!(container_header_layout(Rung::Label, 0.0, 13.99, 0.0, 1.0).is_none());
+        assert!(container_header_layout(Rung::Label, 0.0, 14.0, 0.0, 1.0).is_some());
+    }
+
+    #[test]
+    fn named_container_header_background_keeps_one_line_without_body_rows() {
+        let h = container_header_bg_h(0, container_header_px(0.1));
+        assert!((h - HEADER).abs() < 1e-9);
+    }
+
+    #[test]
+    fn header_background_paint_height_accounts_for_top_inset() {
+        let logical_h = HEADER as f32;
+        let paint_y = 1.0;
+        assert_eq!(paint_y + header_bg_paint_h(logical_h), logical_h);
+        assert_eq!(header_bg_paint_h(0.0), 0.0);
+        assert_eq!(header_bg_paint_h(0.5), 0.0);
+        assert_eq!(header_bg_paint_h(1.0), 0.0);
+        assert_eq!(header_bg_paint_h(1.5), 0.5);
+    }
+
     fn screen_y(cam: &Camera, wy: f64, vh: f64) -> f64 {
         (wy - cam.center_y) * cam.zoom + vh / 2.0
     }
@@ -2748,6 +2878,13 @@ mod tests {
         };
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
         assert!((h - hdr).abs() < 1e-9);
+        let cam = Camera {
+            center_x: 0.0,
+            center_y: 3000.0,
+            zoom: 0.1,
+        };
+        let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
+        assert!((h - 2.0 * HEADER).abs() < 1e-9);
     }
 
     #[test]
