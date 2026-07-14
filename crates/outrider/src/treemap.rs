@@ -353,6 +353,10 @@ fn container_header_bg_h(body_len: usize, max_h: f64) -> f64 {
     (HEADER + body_len as f64 * LINE_STEP).min(max_h)
 }
 
+fn header_bg_paint_h(logical_h: f32) -> f32 {
+    (logical_h - 1.0).max(0.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ContainerHeaderLayout {
     pin_y: f64,
@@ -2110,7 +2114,10 @@ impl Render for TreemapView {
                                     origin.x + px(item.x + 1.0),
                                     origin.y + px(item.header_bg_y + 1.0),
                                 ),
-                                size(px((item.w - 2.0).max(0.0)), px(item.header_bg_h)),
+                                size(
+                                    px((item.w - 2.0).max(0.0)),
+                                    px(header_bg_paint_h(item.header_bg_h)),
+                                ),
                             );
                             window.paint_quad(quad(
                                 hb,
@@ -2367,8 +2374,8 @@ mod tests {
 
     use super::{
         code_line, container_body, container_header_bg_h, container_header_layout,
-        container_header_px, leaf_tex_rect, leaf_text_body, runs_from_spans, truncate_to_width,
-        wrap_doc, HEADER, LINE_STEP,
+        container_header_px, header_bg_paint_h, leaf_tex_rect, leaf_text_body, runs_from_spans,
+        truncate_to_width, wrap_doc, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2730,6 +2737,17 @@ mod tests {
     fn named_container_header_background_keeps_one_line_without_body_rows() {
         let h = container_header_bg_h(0, container_header_px(0.1));
         assert!((h - HEADER).abs() < 1e-9);
+    }
+
+    #[test]
+    fn header_background_paint_height_accounts_for_top_inset() {
+        let logical_h = HEADER as f32;
+        let paint_y = 1.0;
+        assert_eq!(paint_y + header_bg_paint_h(logical_h), logical_h);
+        assert_eq!(header_bg_paint_h(0.0), 0.0);
+        assert_eq!(header_bg_paint_h(0.5), 0.0);
+        assert_eq!(header_bg_paint_h(1.0), 0.0);
+        assert_eq!(header_bg_paint_h(1.5), 0.5);
     }
 
     fn screen_y(cam: &Camera, wy: f64, vh: f64) -> f64 {
