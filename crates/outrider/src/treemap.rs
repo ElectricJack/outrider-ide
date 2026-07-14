@@ -274,7 +274,7 @@ pub struct TreemapView {
     focus_handle: FocusHandle,
     buffers: BufferManager,
     file_symbols: BTreeMap<String, Vec<(SymbolId, usize)>>,
-    textures: TextureCache,
+    textures: Option<TextureCache>,
     bake_pending: bool,
     /// The four beam-cast arrow targets of the focused node (Left, Right,
     /// Up, Down), cached because layout is immutable per session.
@@ -668,6 +668,10 @@ fn open_in_file_manager(path: &std::path::Path) {
     }
 }
 
+fn loading_texture_cache() -> Option<TextureCache> {
+    None
+}
+
 /// Construction, camera helpers, and the per-frame paint pipeline.
 impl TreemapView {
     /// Construct a responsive shell and begin indexing only after GPUI has
@@ -701,33 +705,33 @@ impl TreemapView {
             repo_root: project_root.clone(),
         };
         let layout = outrider_layout::pack(&tree, &world::pack_config());
-        let mut view = Self::new(tree, layout, BTreeMap::new(), loaded_settings, cx);
+        let (settings, settings_notification) = loaded_settings.into_parts();
+        let mut view = Self::from_parts(
+            tree,
+            layout,
+            settings,
+            settings_notification,
+            loading_texture_cache(),
+            cx,
+        );
         let show_welcome = view.show_welcome;
         view.start_loading(project_root);
         view.show_welcome = show_welcome;
         view
     }
 
-    /// Construct from a fully-indexed `SymbolTree` and its `PackLayout`;
-    /// camera is deferred until the first render supplies a viewport.
-    pub fn new(
+    fn from_parts(
         tree: SymbolTree,
         layout: PackLayout,
-        source_fingerprints: BTreeMap<String, u64>,
-        loaded_settings: settings::SettingsLoad,
+        settings: settings::Settings,
+        settings_notification: Option<String>,
+        textures: Option<TextureCache>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (settings, settings_notification) = loaded_settings.into_parts();
         let root_id = tree.root.id.clone();
         let file_symbols = collect_file_symbols(&tree);
         let buffers = BufferManager::new(tree.repo_root.clone());
         let show_welcome = settings.show_welcome;
-        let textures = TextureCache::new(
-            &tree.repo_root,
-            source_fingerprints,
-            settings.cache_mb as usize * 1024 * 1024,
-            settings.disk_cache_bytes(&tree.repo_root),
-        );
         Self {
             tree,
             layout,
@@ -772,7 +776,11 @@ impl TreemapView {
     }
 
     fn memory_status(&self) -> String {
-        let bytes = self.textures.used_bytes();
+        let bytes = self
+            .textures
+            .as_ref()
+            .map(TextureCache::used_bytes)
+            .unwrap_or(0);
         let mb = bytes as f64 / (1024.0 * 1024.0);
         let max_mb = self.settings.cache_mb;
         format!("{mb:.0} / {max_mb} MB")
@@ -915,7 +923,9 @@ impl TreemapView {
         }
         let (_, neighbor_ids) = self.neighbors.clone().unwrap();
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh, |id| {
-            self.textures.contains(id)
+            self.textures
+                .as_ref()
+                .is_some_and(|textures| textures.contains(id))
         });
         let mut out = Vec::with_capacity(items.len());
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
@@ -965,18 +975,18 @@ impl TreemapView {
                         && !item.node.children.is_empty()
                     {
                         let area = item.label_w * item.full_h;
-                        if let Some(t) = self.textures.get(&item.node.id, area) {
-                            if let Some(img) = &t.image {
-                                tex = Some(TexQuad {
-                                    x: item.left as f32,
-                                    y: item.top as f32,
-                                    w: item.label_w as f32,
-                                    h: item.full_h as f32,
-                                    image: img.clone(),
-                                });
-                            }
-                        } else {
-                            if self.textures.needs_dependency_pass(&item.node.id) {
+                        if let Some(textures) = self.textures.as_mut() {
+                            if let Some(t) = textures.get(&item.node.id, area) {
+                                if let Some(img) = &t.image {
+                                    tex = Some(TexQuad {
+                                        x: item.left as f32,
+                                        y: item.top as f32,
+                                        w: item.label_w as f32,
+                                        h: item.full_h as f32,
+                                        image: img.clone(),
+                                    });
+                                }
+                            } else if textures.needs_dependency_pass(&item.node.id) {
                                 let mut dependencies_ready = true;
                                 for child in &item.node.children {
                                     let child_area = self
@@ -985,12 +995,12 @@ impl TreemapView {
                                         .get(&child.id)
                                         .map(|rect| rect.w * rect.h * camera.zoom * camera.zoom)
                                         .unwrap_or(0.0);
-                                    if self.textures.get(&child.id, area + child_area).is_none() {
+                                    if textures.get(&child.id, area + child_area).is_none() {
                                         dependencies_ready = false;
                                     }
                                 }
                                 if !dependencies_ready {
-                                    self.textures.defer_request_once(&item.node.id);
+                                    textures.defer_request_once(&item.node.id);
                                 }
                             }
                         }
@@ -1021,16 +1031,18 @@ impl TreemapView {
                         let (tx, ty, tw, th) =
                             leaf_tex_rect(item.node, item.left, item.top, item.full_h);
                         if tw >= 1.0 && th >= 1.0 && ty < vh && ty + th > 0.0 {
-                            if let Some(t) = self.textures.get(&item.node.id, tw * th) {
-                                if let Some(img) = &t.image {
-                                    tex = Some(TexQuad {
-                                        x: tx as f32,
-                                        y: ty as f32,
-                                        w: tw as f32,
-                                        h: th as f32,
-                                        image: img.clone(),
-                                    });
-                                    body_opacity = 0.0;
+                            if let Some(textures) = self.textures.as_mut() {
+                                if let Some(t) = textures.get(&item.node.id, tw * th) {
+                                    if let Some(img) = &t.image {
+                                        tex = Some(TexQuad {
+                                            x: tx as f32,
+                                            y: ty as f32,
+                                            w: tw as f32,
+                                            h: th as f32,
+                                            image: img.clone(),
+                                        });
+                                        body_opacity = 0.0;
+                                    }
                                 }
                             }
                         }
@@ -1097,53 +1109,57 @@ impl TreemapView {
                 rows,
             })
         });
-        self.bake_pending = if self.textures.has_queued() {
-            let index = TreeIndex::new(&self.tree);
-            let direct_child_bytes: HashMap<_, _> = self
-                .textures
-                .next_request_ids()
-                .into_iter()
-                .filter_map(|id| {
-                    let node = index.node(&id)?;
-                    (!content::is_leaf_item(node))
-                        .then(|| (id, self.textures.direct_child_bytes(node)))
+        self.bake_pending = if let Some(textures) = self.textures.as_mut() {
+            if textures.has_queued() {
+                let index = TreeIndex::new(&self.tree);
+                let direct_child_bytes: HashMap<_, _> = textures
+                    .next_request_ids()
+                    .into_iter()
+                    .filter_map(|id| {
+                        let node = index.node(&id)?;
+                        (!content::is_leaf_item(node))
+                            .then(|| (id, textures.direct_child_bytes(node)))
+                    })
+                    .collect();
+                let buffers = &mut self.buffers;
+                let file_symbols = &self.file_symbols;
+                let layout = &self.layout;
+                textures.process_requests(|id, rasterizer| {
+                    let node = index.node(id)?;
+                    if !content::is_leaf_item(node) {
+                        let rect = layout.rects.get(id)?;
+                        let level = index.depth(id).unwrap_or(0) as u8;
+                        let child_tex = |cid: &outrider_index::SymbolId| {
+                            direct_child_bytes
+                                .get(id)
+                                .and_then(|children| children.get(cid))
+                                .cloned()
+                        };
+                        return Some(rasterize::bake_container(
+                            node, *rect, layout, level, &child_tex,
+                        ));
+                    }
+                    let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
+                    let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let m = buffers.get(&rel, syms)?;
+                    let start = m.symbol_start_line(id)?;
+                    let count =
+                        (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
+                    let mut lines: Vec<rasterize::Line> = Vec::with_capacity(count);
+                    for j in 0..count {
+                        let (text, spans) = m.buffer.line(start + j)?;
+                        let runs = runs_from_spans(text.len(), spans);
+                        lines.push((text, runs));
+                    }
+                    if lines.is_empty() {
+                        None
+                    } else {
+                        Some(rasterizer.bake(&lines))
+                    }
                 })
-                .collect();
-            let buffers = &mut self.buffers;
-            let file_symbols = &self.file_symbols;
-            let layout = &self.layout;
-            self.textures.process_requests(|id, rasterizer| {
-                let node = index.node(id)?;
-                if !content::is_leaf_item(node) {
-                    let rect = layout.rects.get(id)?;
-                    let level = index.depth(id).unwrap_or(0) as u8;
-                    let child_tex = |cid: &outrider_index::SymbolId| {
-                        direct_child_bytes
-                            .get(id)
-                            .and_then(|children| children.get(cid))
-                            .cloned()
-                    };
-                    return Some(rasterize::bake_container(
-                        node, *rect, layout, level, &child_tex,
-                    ));
-                }
-                let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
-                let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
-                let m = buffers.get(&rel, syms)?;
-                let start = m.symbol_start_line(id)?;
-                let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
-                let mut lines: Vec<rasterize::Line> = Vec::with_capacity(count);
-                for j in 0..count {
-                    let (text, spans) = m.buffer.line(start + j)?;
-                    let runs = runs_from_spans(text.len(), spans);
-                    lines.push((text, runs));
-                }
-                if lines.is_empty() {
-                    None
-                } else {
-                    Some(rasterizer.bake(&lines))
-                }
-            })
+            } else {
+                false
+            }
         } else {
             false
         };
@@ -1381,7 +1397,9 @@ impl TreemapView {
         let Some(cam) = self.camera else { return };
         let (vw, vh) = Self::map_viewport(window);
         let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
-            self.textures.contains(id)
+            self.textures
+                .as_ref()
+                .is_some_and(|textures| textures.contains(id))
         });
         let (mx, my) = (
             f64::from(e.position.x),
@@ -1417,7 +1435,9 @@ impl TreemapView {
         let Some(cam) = self.camera else { return };
         let (vw, vh) = Self::map_viewport(window);
         let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
-            self.textures.contains(id)
+            self.textures
+                .as_ref()
+                .is_some_and(|textures| textures.contains(id))
         });
         let (mx, my) = (
             f64::from(e.position.x),
@@ -1453,7 +1473,9 @@ impl TreemapView {
             let Some(cam) = self.camera else { return };
             let (vw, vh) = Self::map_viewport(window);
             let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
-                self.textures.contains(id)
+                self.textures
+                    .as_ref()
+                    .is_some_and(|textures| textures.contains(id))
             });
             let (mx, my) = (
                 f64::from(e.position.x),
@@ -1808,12 +1830,12 @@ impl TreemapView {
         self.palette = palette::Palette::new();
         self.tree = tree;
         self.layout = layout;
-        self.textures = TextureCache::new(
+        self.textures = Some(TextureCache::new(
             &project_root,
             source_fingerprints,
             self.settings.cache_mb as usize * 1024 * 1024,
             self.settings.disk_cache_bytes(&project_root),
-        );
+        ));
         if !warnings.is_empty() {
             self.settings_notification = Some(warnings.join("; "));
         }
@@ -2368,8 +2390,10 @@ impl Render for TreemapView {
 
         let (items, doc_panel) = self.paint_items(vw, vh);
 
-        for img in self.textures.take_retired() {
-            let _ = window.drop_image(img);
+        if let Some(textures) = self.textures.as_mut() {
+            for img in textures.take_retired() {
+                let _ = window.drop_image(img);
+            }
         }
         if self.tween.is_some() || self.bake_pending || is_loading {
             window.request_animation_frame();
@@ -2731,6 +2755,11 @@ impl Render for TreemapView {
 #[cfg(test)]
 mod tests {
     use super::{parse_gibibytes, SettingsDraft};
+
+    #[test]
+    fn loading_shell_texture_cache_is_lazy() {
+        assert!(super::loading_texture_cache().is_none());
+    }
 
     #[test]
     fn decimal_gibibytes_are_converted_without_overflow() {
