@@ -415,13 +415,6 @@ fn max_line_chars(
     buffers: &mut BufferManager,
     file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
 ) -> usize {
-    let mut max_chars = content::body_lines(node, Rung::Full)
-        .into_iter()
-        .map(|line| match line {
-            BodyLine::Plain(text) | BodyLine::Dim(text) => text.chars().count(),
-        })
-        .max()
-        .unwrap_or(0);
     if content::is_leaf_item(node) {
         let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
         let symbols = file_symbols.get(&rel).map(Vec::as_slice).unwrap_or(&[]);
@@ -429,15 +422,21 @@ fn max_line_chars(
             if let Some(start) = materialized.symbol_start_line(&node.id) {
                 let count = (node.measure as usize)
                     .min(materialized.buffer.len_lines().saturating_sub(start));
-                for offset in 0..count {
-                    if let Some((text, _)) = materialized.buffer.line(start + offset) {
-                        max_chars = max_chars.max(text.chars().count());
-                    }
-                }
+                return (0..count)
+                    .filter_map(|offset| materialized.buffer.line(start + offset))
+                    .map(|(text, _)| text.chars().count())
+                    .max()
+                    .unwrap_or(0);
             }
         }
     }
-    max_chars
+    content::body_lines(node, Rung::Full)
+        .into_iter()
+        .map(|line| match line {
+            BodyLine::Plain(text) | BodyLine::Dim(text) => text.chars().count(),
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Unclipped screen rect of a leaf's line area: full page width, rows
@@ -956,6 +955,9 @@ impl TreemapView {
             ));
         }
         let (_, neighbor_ids) = self.neighbors.clone().unwrap();
+        if let Some(textures) = self.textures.as_mut() {
+            textures.begin_visibility_frame();
+        }
         let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh, |id| {
             self.textures
                 .as_ref()
@@ -1225,39 +1227,47 @@ impl TreemapView {
                 let buffers = &mut self.buffers;
                 let file_symbols = &self.file_symbols;
                 let layout = &self.layout;
-                textures.process_requests(|id, rasterizer| {
-                    let node = index.node(id)?;
-                    if !content::is_leaf_item(node) {
-                        let rect = layout.rects.get(id)?;
-                        let level = index.depth(id).unwrap_or(0) as u8;
-                        let child_tex = |cid: &outrider_index::SymbolId| {
-                            direct_child_bytes
-                                .get(id)
-                                .and_then(|children| children.get(cid))
-                                .cloned()
-                        };
-                        return Some(rasterize::bake_container(
-                            node, *rect, layout, level, &child_tex,
-                        ));
-                    }
-                    let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
-                    let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let m = buffers.get(&rel, syms)?;
-                    let start = m.symbol_start_line(id)?;
-                    let count =
-                        (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
-                    let mut lines: Vec<rasterize::Line> = Vec::with_capacity(count);
-                    for j in 0..count {
-                        let (text, spans) = m.buffer.line(start + j)?;
-                        let runs = runs_from_spans(text.len(), spans);
-                        lines.push((text, runs));
-                    }
-                    if lines.is_empty() {
-                        None
-                    } else {
-                        Some(rasterizer.bake(&lines))
-                    }
-                })
+                textures.process_requests_grouped(
+                    |id| {
+                        index
+                            .node(id)
+                            .filter(|node| content::is_leaf_item(node))
+                            .map(|_| BufferManager::file_path_of(&id.qualified_path).to_string())
+                    },
+                    |id, rasterizer| {
+                        let node = index.node(id)?;
+                        if !content::is_leaf_item(node) {
+                            let rect = layout.rects.get(id)?;
+                            let level = index.depth(id).unwrap_or(0) as u8;
+                            let child_tex = |cid: &outrider_index::SymbolId| {
+                                direct_child_bytes
+                                    .get(id)
+                                    .and_then(|children| children.get(cid))
+                                    .cloned()
+                            };
+                            return Some(rasterize::bake_container(
+                                node, *rect, layout, level, &child_tex,
+                            ));
+                        }
+                        let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
+                        let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
+                        let m = buffers.get(&rel, syms)?;
+                        let start = m.symbol_start_line(id)?;
+                        let count =
+                            (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
+                        let mut lines: Vec<rasterize::Line> = Vec::with_capacity(count);
+                        for j in 0..count {
+                            let (text, spans) = m.buffer.line(start + j)?;
+                            let runs = runs_from_spans(text.len(), spans);
+                            lines.push((text, runs));
+                        }
+                        if lines.is_empty() {
+                            None
+                        } else {
+                            Some(rasterizer.bake(&lines))
+                        }
+                    },
+                )
             } else {
                 false
             }
@@ -2602,8 +2612,8 @@ mod tests {
         char_budget, code_line, container_body, container_children_have_images,
         container_header_bg_h, container_header_layout, container_header_px, focused_width,
         header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body, leaf_texture_is_visible,
-        runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc, wrap_to_budget, HEADER,
-        LINE_STEP,
+        max_line_chars, runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc,
+        wrap_to_budget, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2819,6 +2829,28 @@ mod tests {
         );
         // code row 0 at natural-y HEADER
         assert!((f64::from(body[0].y) - HEADER).abs() < 1e-3);
+    }
+
+    #[test]
+    fn focused_width_uses_rendered_source_lines_not_a_hidden_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "let short = 1;\n").unwrap();
+        let signature = format!("fn {}()", "very_long_".repeat(40));
+        let leaf = node(
+            SymbolKind::Item { label: "fn".into() },
+            "a.rs::short",
+            Some(0..15),
+            1,
+            Some(&signature),
+            None,
+        );
+        let mut manager = BufferManager::new(dir.path().to_path_buf());
+        let file_symbols = BTreeMap::from([("a.rs".to_string(), vec![(leaf.id.clone(), 0)])]);
+
+        let max_chars = max_line_chars(&leaf, &mut manager, &file_symbols);
+
+        assert_eq!(max_chars, "let short = 1;".chars().count());
+        assert!((focused_width(max_chars) - world::PAGE_W).abs() < 1e-9);
     }
 
     #[test]

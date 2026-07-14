@@ -1044,6 +1044,15 @@ impl TextureCache {
             .is_some_and(|entry| entry.tex.image.is_some())
     }
 
+    /// Start a new visibility pass. Queued work remains available, but its
+    /// old screen-area scores no longer outrank nodes in the current view.
+    pub fn begin_visibility_frame(&mut self) {
+        self.queue.values_mut().for_each(|priority| *priority = 0.0);
+        self.waiting_disk
+            .values_mut()
+            .for_each(|priority| *priority = 0.0);
+    }
+
     /// Cache lookup. Hit refreshes LRU; miss checks disk, then queues.
     pub fn get(&mut self, id: &SymbolId, screen_area: f64) -> Option<&NodeTexture> {
         self.clock += 1;
@@ -1084,6 +1093,9 @@ impl TextureCache {
     /// refresh per node keeps scrolling responsive without rebaking every frame.
     pub fn refresh_from_live_text(&mut self, id: &SymbolId, screen_area: f64) -> bool {
         if !self.refreshed_from_live_text.insert(id.clone()) {
+            if let Some(priority) = self.queue.get_mut(id) {
+                *priority = priority.max(screen_area);
+            }
             return false;
         }
         self.queue
@@ -1134,6 +1146,16 @@ impl TextureCache {
     /// Bake up to BAKES_PER_FRAME queued items, evict past budget.
     pub fn process_requests(
         &mut self,
+        bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
+    ) -> bool {
+        self.process_requests_grouped(|_| None, bake_fn)
+    }
+
+    /// Bake visible work in priority order, using the highest-priority item's
+    /// group to finish other visible requests backed by the same source file.
+    pub fn process_requests_grouped(
+        &mut self,
+        mut group_fn: impl FnMut(&SymbolId) -> Option<String>,
         mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
     ) -> bool {
         self.handle_disk_superseded();
@@ -1143,9 +1165,23 @@ impl TextureCache {
         self.dispatch_disk_loads();
         let mut queue: Vec<_> = std::mem::take(&mut self.queue).into_iter().collect();
         queue.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let remaining = queue.split_off(queue.len().min(BAKES_PER_FRAME));
-        self.queue.extend(remaining);
-        for (id, _) in queue {
+        let mut selected = Vec::with_capacity(BAKES_PER_FRAME);
+        while selected.len() < BAKES_PER_FRAME && !queue.is_empty() {
+            let first = queue.remove(0);
+            let group = group_fn(&first.0);
+            selected.push(first);
+            let Some(group) = group else { continue };
+            while selected.len() < BAKES_PER_FRAME {
+                let Some(index) = queue.iter().position(|(id, priority)| {
+                    *priority > 0.0 && group_fn(id).as_deref() == Some(group.as_str())
+                }) else {
+                    break;
+                };
+                selected.push(queue.remove(index));
+            }
+        }
+        self.queue.extend(queue);
+        for (id, _) in selected {
             let tex = bake_fn(&id, &mut self.raster).unwrap_or_else(NodeTexture::empty);
             self.insert(id, tex);
         }
@@ -1542,6 +1578,53 @@ mod tests {
         cache.request(sid("b"), 50.0);
 
         assert_eq!(cache.queued_ids(), vec![sid("a"), sid("b")]);
+    }
+
+    #[test]
+    fn visibility_frame_replaces_stale_priorities_with_current_areas() {
+        let mut cache = TextureCache::new_memory_only(1024);
+        cache.request(sid("was-large"), 1_000.0);
+        cache.request(sid("now-large"), 10.0);
+        cache.request(sid("offscreen"), 500.0);
+
+        cache.begin_visibility_frame();
+        cache.request(sid("was-large"), 5.0);
+        cache.request(sid("now-large"), 100.0);
+
+        assert_eq!(
+            cache.queued_ids(),
+            vec![sid("now-large"), sid("was-large"), sid("offscreen")]
+        );
+    }
+
+    #[test]
+    fn grouped_bakes_finish_visible_leaves_from_the_first_file() {
+        let mut cache = TextureCache::new_memory_only(DEFAULT_CACHE_MB as usize * 1024 * 1024);
+        cache.request(sid("a.rs::first"), 100.0);
+        cache.request(sid("b.rs::first"), 90.0);
+        cache.request(sid("a.rs::second"), 80.0);
+        cache.request(sid("a.rs::third"), 70.0);
+        cache.request(sid("b.rs::second"), 60.0);
+        let mut baked = Vec::new();
+
+        let remaining = cache.process_requests_grouped(
+            |id| id.qualified_path.split("::").next().map(str::to_owned),
+            |id, _| {
+                baked.push(id.clone());
+                Some(texture(1))
+            },
+        );
+
+        assert!(remaining);
+        assert_eq!(
+            baked,
+            vec![
+                sid("a.rs::first"),
+                sid("a.rs::second"),
+                sid("a.rs::third"),
+                sid("b.rs::first"),
+            ]
+        );
     }
 
     #[test]
