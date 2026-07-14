@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use outrider_index::{SymbolId, SymbolKind};
@@ -55,6 +57,8 @@ struct Metadata {
 
 pub struct TextureStore {
     dir: PathBuf,
+    namespace_lock: Arc<Mutex<()>>,
+    namespace_usage: Arc<AtomicU64>,
     max_bytes: u64,
     used_bytes: u64,
     clock: u64,
@@ -79,19 +83,40 @@ impl TextureStore {
         hash.field(project_identity.replace('\\', "/").as_bytes());
         let dir = cache_root.join(format!("{:016x}", hash.finish()));
         fs::create_dir_all(&dir)?;
+        let dir = fs::canonicalize(&dir)?;
+        let (namespace_lock, namespace_usage) = namespace_resources(&dir);
+        let operation_lock = Arc::clone(&namespace_lock);
+        let _guard = operation_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut store = Self {
             dir,
+            namespace_lock,
+            namespace_usage,
             max_bytes,
             used_bytes: 0,
             clock: 0,
             entries: HashMap::new(),
         };
-        store.rebuild_index()?;
-        store.evict()?;
+        store.rebuild_index_unlocked()?;
+        store.evict_unlocked()?;
         Ok(store)
     }
 
     pub fn load(&mut self, key: &TextureKey) -> io::Result<Option<TexturePayload>> {
+        self.load_with_remove(key, |path| fs::remove_file(path))
+    }
+
+    fn load_with_remove(
+        &mut self,
+        key: &TextureKey,
+        mut remove: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<Option<TexturePayload>> {
+        let operation_lock = Arc::clone(&self.namespace_lock);
+        let _guard = operation_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.rebuild_index_with_remove_unlocked(&mut remove)?;
         let path = self.path(*key);
         let mut file = match File::open(&path) {
             Ok(file) => file,
@@ -103,8 +128,19 @@ impl TextureStore {
         };
         let Some(header) = validate_file(&mut file, self.max_bytes)? else {
             drop(file);
-            let _ = fs::remove_file(path);
-            self.remove_metadata(*key);
+            match remove(&path) {
+                Ok(()) => self.remove_metadata(*key),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => self.remove_metadata(*key),
+                Err(error) => {
+                    self.rebuild_index_with_remove_unlocked(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "cleanup disabled",
+                        ))
+                    })?;
+                    return Err(error);
+                }
+            }
             return Ok(None);
         };
         let len = usize::try_from(header.payload_len)
@@ -129,7 +165,8 @@ impl TextureStore {
             self.used_bytes = self.used_bytes.saturating_sub(previous.file_bytes);
         }
         self.used_bytes = self.used_bytes.saturating_add(header.file_bytes);
-        self.evict()?;
+        self.publish_usage();
+        self.evict_unlocked()?;
         Ok(Some(TexturePayload {
             width: header.width,
             height: header.height,
@@ -150,12 +187,16 @@ impl TextureStore {
         replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
         mut remove: impl FnMut(&Path) -> io::Result<()>,
     ) -> io::Result<()> {
+        let operation_lock = Arc::clone(&self.namespace_lock);
+        let _guard = operation_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let payload_len = validate_payload(payload)?;
         let file_bytes = HEADER_LEN as u64 + payload_len;
         if file_bytes > self.max_bytes {
             return Ok(());
         }
-        self.rebuild_index()?;
+        self.rebuild_index_with_remove_unlocked(&mut remove)?;
         self.reserve_physical_space(file_bytes, &mut remove)?;
         let access = self.next_access();
         let path = self.path(*key);
@@ -175,7 +216,8 @@ impl TextureStore {
             replace(&temp, &path)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp);
+            let _ = remove(&temp);
+            self.rebuild_index_with_remove_unlocked(&mut remove)?;
         }
         result?;
 
@@ -189,7 +231,8 @@ impl TextureStore {
             self.used_bytes = self.used_bytes.saturating_sub(old.file_bytes);
         }
         self.used_bytes = self.used_bytes.saturating_add(file_bytes);
-        self.evict()
+        self.publish_usage();
+        self.evict_unlocked()
     }
 
     #[cfg(test)]
@@ -215,36 +258,79 @@ impl TextureStore {
 
     #[allow(dead_code)] // Public store API; UI wiring lands in a later task.
     pub fn clear(&mut self) -> io::Result<()> {
+        self.clear_with_remove(|path| fs::remove_file(path))
+    }
+
+    fn clear_with_remove(
+        &mut self,
+        mut remove: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let operation_lock = Arc::clone(&self.namespace_lock);
+        let _guard = operation_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut first_error = None;
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
             if matches!(
                 path.extension().and_then(|value| value.to_str()),
                 Some("tex" | "tmp")
             ) {
-                fs::remove_file(path)?;
+                if let Err(error) = remove(&path) {
+                    if error.kind() != io::ErrorKind::NotFound && first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        self.entries.clear();
-        self.used_bytes = 0;
-        Ok(())
+        self.rebuild_index_with_remove_unlocked(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cleanup disabled",
+            ))
+        })?;
+        first_error.map_or(Ok(()), Err)
     }
 
     #[allow(dead_code)] // Public store API; UI wiring lands in a later task.
     pub fn used_bytes(&self) -> u64 {
-        self.used_bytes
+        self.namespace_usage.load(Ordering::Acquire)
     }
 
-    fn rebuild_index(&mut self) -> io::Result<()> {
+    fn rebuild_index_unlocked(&mut self) -> io::Result<()> {
+        self.rebuild_index_with_remove_unlocked(|path| fs::remove_file(path))
+    }
+
+    fn rebuild_index_with_remove_unlocked(
+        &mut self,
+        mut remove: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         self.entries.clear();
         self.used_bytes = 0;
         self.clock = 0;
         for entry in fs::read_dir(&self.dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) == Some("tmp") {
-                let _ = fs::remove_file(path);
+            let entry = entry?;
+            let path = entry.path();
+            let extension = path.extension().and_then(|value| value.to_str());
+            if extension == Some("tmp") {
+                let file_bytes = entry.metadata()?.len();
+                if let Err(error) = remove(&path) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        self.used_bytes = self.used_bytes.saturating_add(file_bytes);
+                    }
+                }
                 continue;
             }
+            if extension != Some("tex") {
+                continue;
+            }
+            let file_bytes = entry.metadata()?.len();
             let Some(key) = key_from_path(&path) else {
+                if let Err(error) = remove(&path) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        self.used_bytes = self.used_bytes.saturating_add(file_bytes);
+                    }
+                }
                 continue;
             };
             let mut file = File::open(&path)?;
@@ -262,10 +348,15 @@ impl TextureStore {
                 }
                 None => {
                     drop(file);
-                    let _ = fs::remove_file(path);
+                    if let Err(error) = remove(&path) {
+                        if error.kind() != io::ErrorKind::NotFound {
+                            self.used_bytes = self.used_bytes.saturating_add(file_bytes);
+                        }
+                    }
                 }
             }
         }
+        self.publish_usage();
         Ok(())
     }
 
@@ -294,7 +385,7 @@ impl TextureStore {
         Ok(())
     }
 
-    fn evict(&mut self) -> io::Result<()> {
+    fn evict_unlocked(&mut self) -> io::Result<()> {
         while self.used_bytes > self.max_bytes {
             let Some(victim) = self
                 .entries
@@ -318,7 +409,17 @@ impl TextureStore {
     fn remove_metadata(&mut self, key: TextureKey) {
         if let Some(metadata) = self.entries.remove(&key) {
             self.used_bytes = self.used_bytes.saturating_sub(metadata.file_bytes);
+            self.publish_usage();
         }
+    }
+
+    fn publish_usage(&self) {
+        self.namespace_usage
+            .store(self.used_bytes, Ordering::Release);
+    }
+
+    pub(crate) fn shared_usage(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.namespace_usage)
     }
 
     fn next_access(&mut self) -> u64 {
@@ -347,6 +448,67 @@ impl TextureStore {
             .open(self.path(*key))?
             .write_all(bytes)
     }
+
+    #[cfg(test)]
+    pub(crate) fn dir_for_test(&self) -> &Path {
+        &self.dir
+    }
+
+    #[cfg(test)]
+    fn rebuild_index_with_remove_for_test(
+        &mut self,
+        remove: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let operation_lock = Arc::clone(&self.namespace_lock);
+        let _guard = operation_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.rebuild_index_with_remove_unlocked(remove)
+    }
+
+    #[cfg(test)]
+    fn load_with_remove_for_test(
+        &mut self,
+        key: &TextureKey,
+        remove: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<Option<TexturePayload>> {
+        self.load_with_remove(key, remove)
+    }
+
+    #[cfg(test)]
+    fn clear_with_remove_for_test(
+        &mut self,
+        remove: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.clear_with_remove(remove)
+    }
+}
+
+struct NamespaceResources {
+    lock: Weak<Mutex<()>>,
+    usage: Weak<AtomicU64>,
+}
+
+fn namespace_resources(dir: &Path) -> (Arc<Mutex<()>>, Arc<AtomicU64>) {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, NamespaceResources>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
+    locks.retain(|_, resources| resources.lock.strong_count() > 0);
+    if let Some(resources) = locks.get(dir) {
+        if let (Some(lock), Some(usage)) = (resources.lock.upgrade(), resources.usage.upgrade()) {
+            return (lock, usage);
+        }
+    }
+    let lock = Arc::new(Mutex::new(()));
+    let usage = Arc::new(AtomicU64::new(0));
+    locks.insert(
+        dir.to_path_buf(),
+        NamespaceResources {
+            lock: Arc::downgrade(&lock),
+            usage: Arc::downgrade(&usage),
+        },
+    );
+    (lock, usage)
 }
 
 #[cfg(unix)]
@@ -678,6 +840,131 @@ mod tests {
     }
 
     #[test]
+    fn undeletable_invalid_entry_counts_toward_the_hard_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let mut store = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        store
+            .write_raw_for_test(&key("broken.rs", 1), &[0xff; HEADER_LEN + 8])
+            .unwrap();
+
+        store
+            .rebuild_index_with_remove_for_test(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure",
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(store.used_bytes(), (HEADER_LEN + 8) as u64);
+        assert!(store
+            .save_with_io_for_test(
+                &key("new.rs", 1),
+                &payload(16),
+                |_, _| Ok(()),
+                |_| Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure"
+                )),
+            )
+            .is_err());
+        assert!(namespace_bytes(&store) <= entry_bytes);
+    }
+
+    #[test]
+    fn undeletable_temp_entry_counts_toward_the_hard_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let mut store = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        std::fs::write(store.dir.join("abandoned.tmp"), vec![0xff; HEADER_LEN + 8]).unwrap();
+
+        store
+            .rebuild_index_with_remove_for_test(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure",
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(store.used_bytes(), (HEADER_LEN + 8) as u64);
+        assert!(store
+            .save_with_io_for_test(
+                &key("new.rs", 1),
+                &payload(16),
+                |_, _| Ok(()),
+                |_| Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure"
+                )),
+            )
+            .is_err());
+        assert!(namespace_bytes(&store) <= entry_bytes);
+    }
+
+    #[test]
+    fn invalid_load_cleanup_failure_preserves_physical_occupancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let mut store = TextureStore::open_at(dir.path(), "project", entry_bytes * 2).unwrap();
+        let cache_key = key("broken.rs", 1);
+        store.save(&cache_key, &payload(16)).unwrap();
+        store.append_raw_for_test(&cache_key, &[0xff; 4]).unwrap();
+
+        let result = store.load_with_remove_for_test(&cache_key, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected cleanup failure",
+            ))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(store.used_bytes(), entry_bytes + 4);
+        assert!(namespace_bytes(&store) <= entry_bytes * 2);
+    }
+
+    #[test]
+    fn overlapping_same_project_stores_never_exceed_the_namespace_limit() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let one = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        let two = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let one_start = Arc::clone(&start);
+        let two_start = Arc::clone(&start);
+
+        let one = std::thread::spawn(move || {
+            let mut store = one;
+            one_start.wait();
+            for ordinal in 0..64 {
+                store
+                    .save(&key(&format!("one-{ordinal}.rs"), 1), &payload(16))
+                    .unwrap();
+            }
+            store.used_bytes()
+        });
+        let two = std::thread::spawn(move || {
+            let mut store = two;
+            two_start.wait();
+            for ordinal in 0..64 {
+                store
+                    .save(&key(&format!("two-{ordinal}.rs"), 1), &payload(16))
+                    .unwrap();
+            }
+            store.used_bytes()
+        });
+
+        assert!(one.join().unwrap() <= entry_bytes);
+        assert!(two.join().unwrap() <= entry_bytes);
+        let reopened = TextureStore::open_at(dir.path(), "project", entry_bytes).unwrap();
+        assert!(namespace_bytes(&reopened) <= entry_bytes);
+        assert_eq!(reopened.used_bytes(), namespace_bytes(&reopened));
+    }
+
+    #[test]
     fn failed_atomic_replacement_preserves_old_entry() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = TextureStore::open_at(dir.path(), "project", 1024).unwrap();
@@ -742,5 +1029,38 @@ mod tests {
         one.clear().unwrap();
         assert!(one.load(&key("a.rs", 1)).unwrap().is_none());
         assert!(two.load(&key("a.rs", 1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn partial_clear_reconciles_usage_to_files_that_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_bytes = (HEADER_LEN + 16) as u64;
+        let mut store = TextureStore::open_at(dir.path(), "project", entry_bytes * 2).unwrap();
+        let preserved = key("preserved.rs", 1);
+        store.save(&preserved, &payload(16)).unwrap();
+        store.save(&key("deleted.rs", 1), &payload(16)).unwrap();
+        let preserved_path = store.path(preserved);
+
+        let result = store.clear_with_remove_for_test(|path| {
+            if path == preserved_path {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected clear failure",
+                ))
+            } else {
+                std::fs::remove_file(path)
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(store.used_bytes(), entry_bytes);
+        assert_eq!(namespace_bytes(&store), entry_bytes);
+    }
+
+    fn namespace_bytes(store: &TextureStore) -> u64 {
+        std::fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
     }
 }

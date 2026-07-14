@@ -27,7 +27,7 @@ use crate::paint_model::{
 };
 use crate::palette;
 use crate::project_loader::{LoadProgress, LoadResult, LoaderPoll, ProjectLoader};
-use crate::rasterize::{self, TextureCache};
+use crate::rasterize::{self, DiskState, TextureCache};
 use crate::settings;
 use crate::theme;
 use crate::world::{self, Draw, LeafDraw, Rung};
@@ -448,12 +448,15 @@ fn loading_texture_cache() -> Option<TextureCache> {
     None
 }
 
-fn format_cache_status(memory_bytes: usize, memory_max_mb: u64, disk_bytes: Option<u64>) -> String {
+fn format_cache_status(memory_bytes: usize, memory_max_mb: u64, disk_state: DiskState) -> String {
     let memory_mb = memory_bytes as f64 / (1024.0 * 1024.0);
-    let disk = disk_bytes.map_or_else(
-        || "Disk preparing…".to_owned(),
-        |bytes| format!("Disk {:.0} MB", bytes as f64 / (1024.0 * 1024.0)),
-    );
+    let disk = match disk_state {
+        DiskState::Preparing => "Disk preparing…".to_owned(),
+        DiskState::Ready { used_bytes } => {
+            format!("Disk {:.0} MB", used_bytes as f64 / (1024.0 * 1024.0))
+        }
+        DiskState::Unavailable => "Disk unavailable".to_owned(),
+    };
     format!("Memory {memory_mb:.0} / {memory_max_mb} MB · {disk}")
 }
 
@@ -575,11 +578,12 @@ impl TreemapView {
             .as_ref()
             .map(TextureCache::used_bytes)
             .unwrap_or(0);
-        let disk_bytes = self
+        let disk_state = self
             .textures
             .as_ref()
-            .and_then(TextureCache::disk_used_bytes);
-        format_cache_status(memory_bytes, u64::from(self.settings.cache_mb), disk_bytes)
+            .map(TextureCache::disk_state)
+            .unwrap_or(DiskState::Preparing);
+        format_cache_status(memory_bytes, u64::from(self.settings.cache_mb), disk_state)
     }
 
     /// Window title shown in the client titlebar and taskbar.
@@ -2205,12 +2209,22 @@ mod tests {
     #[test]
     fn cache_status_reports_memory_and_current_project_disk_usage() {
         assert_eq!(
-            super::format_cache_status(3 * 1024 * 1024, 128, Some(5 * 1024 * 1024)),
+            super::format_cache_status(
+                3 * 1024 * 1024,
+                128,
+                crate::rasterize::DiskState::Ready {
+                    used_bytes: 5 * 1024 * 1024,
+                },
+            ),
             "Memory 3 / 128 MB · Disk 5 MB"
         );
         assert_eq!(
-            super::format_cache_status(0, 128, None),
+            super::format_cache_status(0, 128, crate::rasterize::DiskState::Preparing),
             "Memory 0 / 128 MB · Disk preparing…"
+        );
+        assert_eq!(
+            super::format_cache_status(0, 128, crate::rasterize::DiskState::Unavailable),
+            "Memory 0 / 128 MB · Disk unavailable"
         );
     }
 

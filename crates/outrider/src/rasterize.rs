@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
@@ -399,7 +399,6 @@ fn rgb_u8(c: u32) -> (u8, u8, u8) {
 /// Bakes per frame for on-demand misses.
 pub const BAKES_PER_FRAME: usize = 4;
 const DISK_QUEUE_CAPACITY: usize = 64;
-const UNKNOWN_DISK_USAGE: u64 = u64::MAX;
 #[cfg(test)]
 const DEFAULT_CACHE_MB: u32 = 256;
 
@@ -422,6 +421,13 @@ pub struct DiskDiagnostic {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskState {
+    Preparing,
+    Ready { used_bytes: u64 },
+    Unavailable,
+}
+
 impl fmt::Display for DiskDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -442,6 +448,7 @@ enum DiskCommand {
         payload: TexturePayload,
     },
     Clear,
+    Shutdown,
 }
 
 enum DiskResult {
@@ -461,29 +468,76 @@ enum DiskResult {
 struct TextureDiskWorker {
     commands: mpsc::SyncSender<DiskCommand>,
     results: mpsc::Receiver<DiskResult>,
-    used_bytes: Arc<AtomicU64>,
+    state: Arc<Mutex<DiskState>>,
+    shared_usage: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    cancelled: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl TextureDiskWorker {
-    fn spawn(project_root: PathBuf, max_bytes: u64) -> Self {
-        Self::spawn_with_opener(move || TextureStore::open(&project_root, max_bytes))
+    fn spawn(project_root: PathBuf, max_bytes: u64) -> io::Result<Self> {
+        Self::try_spawn_with_opener(move || TextureStore::open(&project_root, max_bytes))
     }
 
+    #[cfg(test)]
     fn spawn_with_opener(
         opener: impl FnOnce() -> io::Result<TextureStore> + Send + 'static,
     ) -> Self {
+        Self::try_spawn_with_opener(opener).expect("failed to spawn test texture cache worker")
+    }
+
+    fn try_spawn_with_opener(
+        opener: impl FnOnce() -> io::Result<TextureStore> + Send + 'static,
+    ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::sync_channel(DISK_QUEUE_CAPACITY);
-        let (result_tx, result_rx) = mpsc::sync_channel(DISK_QUEUE_CAPACITY);
-        let used_bytes = Arc::new(AtomicU64::new(UNKNOWN_DISK_USAGE));
-        let worker_used_bytes = Arc::clone(&used_bytes);
-        thread::Builder::new()
+        let (result_tx, result_rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(DiskState::Preparing));
+        let worker_state = Arc::clone(&state);
+        let shared_usage = Arc::new(Mutex::new(None));
+        let worker_shared_usage = Arc::clone(&shared_usage);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let thread = thread::Builder::new()
             .name("outrider-texture-cache".into())
-            .spawn(move || run_disk_worker(opener, command_rx, result_tx, worker_used_bytes))
-            .expect("failed to spawn texture cache worker");
-        Self {
+            .spawn(move || {
+                run_disk_worker(
+                    opener,
+                    command_rx,
+                    result_tx,
+                    worker_state,
+                    worker_shared_usage,
+                    worker_cancelled,
+                )
+            })?;
+        Ok(Self {
             commands: command_tx,
             results: result_rx,
-            used_bytes,
+            state,
+            shared_usage,
+            cancelled,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for TextureDiskWorker {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if self.thread.is_none() {
+            return;
+        }
+        let mut shutdown = DiskCommand::Shutdown;
+        loop {
+            match self.commands.try_send(shutdown) {
+                Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => break,
+                Err(mpsc::TrySendError::Full(command)) => {
+                    shutdown = command;
+                    thread::yield_now();
+                }
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -491,13 +545,20 @@ impl TextureDiskWorker {
 fn run_disk_worker(
     opener: impl FnOnce() -> io::Result<TextureStore>,
     commands: mpsc::Receiver<DiskCommand>,
-    results: mpsc::SyncSender<DiskResult>,
-    used_bytes: Arc<AtomicU64>,
+    results: mpsc::Sender<DiskResult>,
+    state: Arc<Mutex<DiskState>>,
+    shared_usage: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    cancelled: Arc<AtomicBool>,
 ) {
     let mut reported = HashSet::new();
     let mut store = match opener() {
         Ok(store) => {
-            used_bytes.store(store.used_bytes(), Ordering::Release);
+            *shared_usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(store.shared_usage());
+            *state.lock().unwrap_or_else(|error| error.into_inner()) = DiskState::Ready {
+                used_bytes: store.used_bytes(),
+            };
             Some(store)
         }
         Err(error) => {
@@ -507,11 +568,18 @@ fn run_disk_worker(
                 DiskOperation::Open,
                 error.to_string(),
             );
+            *state.lock().unwrap_or_else(|error| error.into_inner()) = DiskState::Unavailable;
             None
         }
     };
     let _ = results.send(DiskResult::OpenComplete);
     while let Ok(command) = commands.recv() {
+        if matches!(command, DiskCommand::Shutdown) {
+            break;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            continue;
+        }
         match command {
             DiskCommand::Load { id, key } => {
                 let loaded = store.as_mut().map(|store| store.load(&key));
@@ -533,7 +601,9 @@ fn run_disk_worker(
                     }
                 }
                 if let Some(store) = &store {
-                    used_bytes.store(store.used_bytes(), Ordering::Release);
+                    *state.lock().unwrap_or_else(|error| error.into_inner()) = DiskState::Ready {
+                        used_bytes: store.used_bytes(),
+                    };
                 }
             }
             DiskCommand::Save { key, payload } => {
@@ -546,30 +616,38 @@ fn run_disk_worker(
                             error.to_string(),
                         );
                     }
-                    used_bytes.store(store.used_bytes(), Ordering::Release);
+                    *state.lock().unwrap_or_else(|error| error.into_inner()) = DiskState::Ready {
+                        used_bytes: store.used_bytes(),
+                    };
                 }
                 let _ = results.send(DiskResult::SaveComplete);
             }
             DiskCommand::Clear => {
                 if let Some(store) = &mut store {
                     if let Err(error) = store.clear() {
-                        send_disk_diagnostic(
-                            &results,
-                            &mut reported,
-                            DiskOperation::Clear,
-                            error.to_string(),
-                        );
+                        let _ = results.send(DiskResult::Diagnostic(DiskDiagnostic {
+                            operation: DiskOperation::Clear,
+                            message: error.to_string(),
+                        }));
                     }
-                    used_bytes.store(store.used_bytes(), Ordering::Release);
+                    *state.lock().unwrap_or_else(|error| error.into_inner()) = DiskState::Ready {
+                        used_bytes: store.used_bytes(),
+                    };
+                } else {
+                    let _ = results.send(DiskResult::Diagnostic(DiskDiagnostic {
+                        operation: DiskOperation::Clear,
+                        message: "texture cache unavailable".into(),
+                    }));
                 }
                 let _ = results.send(DiskResult::ClearComplete);
             }
+            DiskCommand::Shutdown => unreachable!(),
         }
     }
 }
 
 fn send_disk_diagnostic(
-    results: &mpsc::SyncSender<DiskResult>,
+    results: &mpsc::Sender<DiskResult>,
     reported: &mut HashSet<(DiskOperation, String)>,
     operation: DiskOperation,
     message: String,
@@ -620,6 +698,18 @@ impl TextureCache {
         max_bytes: usize,
         disk_max_bytes: u64,
     ) -> Self {
+        let worker = TextureDiskWorker::spawn(project_root.to_path_buf(), disk_max_bytes);
+        let (disk_worker, disk_worker_starting, disk_diagnostics) = match worker {
+            Ok(worker) => (Some(worker), true, Vec::new()),
+            Err(error) => (
+                None,
+                false,
+                vec![DiskDiagnostic {
+                    operation: DiskOperation::Open,
+                    message: error.to_string(),
+                }],
+            ),
+        };
         Self {
             raster: Rasterizer::new(),
             entries: HashMap::new(),
@@ -629,17 +719,14 @@ impl TextureCache {
             queue: HashMap::new(),
             deferred_once: HashSet::new(),
             retired: Vec::new(),
-            disk_worker: Some(TextureDiskWorker::spawn(
-                project_root.to_path_buf(),
-                disk_max_bytes,
-            )),
+            disk_worker,
             waiting_disk: HashMap::new(),
             disk_inflight: HashSet::new(),
-            disk_worker_starting: true,
+            disk_worker_starting,
             clear_disk_pending: false,
             clear_disk_inflight: 0,
             pending_disk_saves: 0,
-            disk_diagnostics: Vec::new(),
+            disk_diagnostics,
             source_fingerprints,
         }
     }
@@ -660,13 +747,27 @@ impl TextureCache {
         self.bytes
     }
 
-    pub fn disk_used_bytes(&self) -> Option<u64> {
-        let bytes = self
-            .disk_worker
-            .as_ref()?
-            .used_bytes
-            .load(Ordering::Acquire);
-        (bytes != UNKNOWN_DISK_USAGE).then_some(bytes)
+    pub fn disk_state(&self) -> DiskState {
+        let Some(worker) = &self.disk_worker else {
+            return DiskState::Unavailable;
+        };
+        let state = *worker
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if matches!(state, DiskState::Ready { .. }) {
+            if let Some(usage) = worker
+                .shared_usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                return DiskState::Ready {
+                    used_bytes: usage.load(Ordering::Acquire),
+                };
+            }
+        }
+        state
     }
 
     pub fn request_clear_disk_cache(&mut self) {
@@ -1078,8 +1179,141 @@ mod tests {
         });
 
         worker_started.recv_timeout(Duration::from_secs(1)).unwrap();
-        drop(worker);
         allow_open.send(()).unwrap();
+        drop(worker);
+    }
+
+    #[test]
+    fn dropping_worker_cancels_commands_queued_before_open_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let open_root = root.clone();
+        let (allow_open, wait_for_open) = mpsc::channel();
+        let worker = TextureDiskWorker::spawn_with_opener(move || {
+            wait_for_open.recv().unwrap();
+            TextureStore::open_at(&open_root, "project", 1024)
+        });
+        worker
+            .commands
+            .send(DiskCommand::Save {
+                key: TextureKey::new("a.rs", 1, &sid("a.rs"), 1, 1),
+                payload: TexturePayload {
+                    width: 4,
+                    height: 1,
+                    bytes: vec![0; 16],
+                },
+            })
+            .unwrap();
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            drop(worker);
+            dropped_tx.send(()).unwrap();
+        });
+        assert!(
+            dropped_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "drop must wait for the worker to stop"
+        );
+        allow_open.send(()).unwrap();
+        dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        dropping.join().unwrap();
+
+        let reopened = TextureStore::open_at(&root, "project", 1024).unwrap();
+        assert_eq!(reopened.used_bytes(), 0);
+    }
+
+    #[test]
+    fn failed_store_open_transitions_disk_state_to_unavailable() {
+        let worker = TextureDiskWorker::spawn_with_opener(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected open failure",
+            ))
+        });
+
+        loop {
+            if matches!(
+                worker.results.recv_timeout(Duration::from_secs(1)).unwrap(),
+                DiskResult::OpenComplete
+            ) {
+                break;
+            }
+        }
+        assert_eq!(
+            *worker
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            DiskState::Unavailable
+        );
+    }
+
+    #[test]
+    fn every_explicit_clear_failure_emits_a_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TextureStore::open_at(dir.path(), "project", 1024).unwrap();
+        let namespace = store.dir_for_test().to_path_buf();
+        std::fs::remove_dir(&namespace).unwrap();
+        std::fs::write(&namespace, b"not a directory").unwrap();
+        let worker = TextureDiskWorker::spawn_with_opener(move || Ok(store));
+
+        while !matches!(
+            worker.results.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DiskResult::OpenComplete
+        ) {}
+        worker.commands.send(DiskCommand::Clear).unwrap();
+        worker.commands.send(DiskCommand::Clear).unwrap();
+
+        let mut clear_diagnostics = 0;
+        while clear_diagnostics < 2 {
+            if let DiskResult::Diagnostic(diagnostic) =
+                worker.results.recv_timeout(Duration::from_secs(1)).unwrap()
+            {
+                if diagnostic.operation == DiskOperation::Clear {
+                    clear_diagnostics += 1;
+                }
+            }
+        }
+        assert_eq!(clear_diagnostics, 2);
+    }
+
+    #[test]
+    fn replacement_worker_observes_usage_written_by_older_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = 1024;
+        let older_store = TextureStore::open_at(dir.path(), "project", limit).unwrap();
+        let replacement_store = TextureStore::open_at(dir.path(), "project", limit).unwrap();
+        let older = TextureDiskWorker::spawn_with_opener(move || Ok(older_store));
+        let replacement = TextureDiskWorker::spawn_with_opener(move || Ok(replacement_store));
+        for worker in [&older, &replacement] {
+            while !matches!(
+                worker.results.recv_timeout(Duration::from_secs(1)).unwrap(),
+                DiskResult::OpenComplete
+            ) {}
+        }
+        let payload = TexturePayload {
+            width: 4,
+            height: 1,
+            bytes: vec![0; 16],
+        };
+        let key = TextureKey::new("a.rs", 1, &sid("a.rs"), 1, 1);
+        older
+            .commands
+            .send(DiskCommand::Save { key, payload })
+            .unwrap();
+        while !matches!(
+            older.results.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DiskResult::SaveComplete
+        ) {}
+
+        let mut cache = TextureCache::new_memory_only(1024);
+        cache.disk_worker = Some(replacement);
+        assert_eq!(
+            cache.disk_state(),
+            DiskState::Ready {
+                used_bytes: (crate::texture_store::HEADER_LEN + 16) as u64,
+            }
+        );
     }
 
     #[test]
@@ -1090,7 +1324,10 @@ mod tests {
         cache.disk_worker = Some(TextureDiskWorker {
             commands: command_tx,
             results: result_rx,
-            used_bytes: Arc::new(AtomicU64::new(UNKNOWN_DISK_USAGE)),
+            state: Arc::new(Mutex::new(DiskState::Preparing)),
+            shared_usage: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            thread: None,
         });
         cache.disk_worker_starting = true;
 
@@ -1108,7 +1345,10 @@ mod tests {
         cache.disk_worker = Some(TextureDiskWorker {
             commands: command_tx,
             results: result_rx,
-            used_bytes: Arc::new(AtomicU64::new(UNKNOWN_DISK_USAGE)),
+            state: Arc::new(Mutex::new(DiskState::Preparing)),
+            shared_usage: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            thread: None,
         });
 
         cache.request_clear_disk_cache();
@@ -1130,7 +1370,10 @@ mod tests {
         cache.disk_worker = Some(TextureDiskWorker {
             commands: command_tx,
             results: result_rx,
-            used_bytes: Arc::new(AtomicU64::new(UNKNOWN_DISK_USAGE)),
+            state: Arc::new(Mutex::new(DiskState::Preparing)),
+            shared_usage: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            thread: None,
         });
         let texture = some_tex(1, &mut Rasterizer::new()).unwrap();
 
@@ -1155,7 +1398,10 @@ mod tests {
         cache.disk_worker = Some(TextureDiskWorker {
             commands: command_tx,
             results: result_rx,
-            used_bytes: Arc::new(AtomicU64::new(UNKNOWN_DISK_USAGE)),
+            state: Arc::new(Mutex::new(DiskState::Preparing)),
+            shared_usage: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            thread: None,
         });
 
         assert!(cache.get(&sid("a"), 10.0).is_none());
@@ -1188,7 +1434,10 @@ mod tests {
         cache.disk_worker = Some(TextureDiskWorker {
             commands: command_tx,
             results: result_rx,
-            used_bytes: Arc::new(AtomicU64::new(UNKNOWN_DISK_USAGE)),
+            state: Arc::new(Mutex::new(DiskState::Preparing)),
+            shared_usage: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            thread: None,
         });
         cache.get(&sid("a"), 10.0);
 

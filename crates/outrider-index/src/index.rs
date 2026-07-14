@@ -22,6 +22,8 @@ use crate::types::{
     SymbolTree,
 };
 
+type CancellationCheck<'a> = dyn Fn() -> bool + Sync + 'a;
+
 /// Upper bound for retaining a complete source/text file in memory.
 pub(crate) const MAX_RETAINED_FILE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -144,7 +146,7 @@ fn index_repo_outcome_impl(
     filter_folders: &[String],
     progress: Option<&IndexProgress>,
     cache_root: Option<&Path>,
-    is_cancelled: Option<&dyn Fn() -> bool>,
+    is_cancelled: Option<&CancellationCheck<'_>>,
 ) -> anyhow::Result<IndexOutcome> {
     cancellation_checkpoint(is_cancelled)?;
     if let Some(progress) = progress {
@@ -158,7 +160,12 @@ fn index_repo_outcome_impl(
     if let Some(progress) = progress {
         progress.phase.store(1, Ordering::Relaxed);
     }
-    let files = index_discovered_files(&FsFileSource::new(repo_root), &paths, progress)?;
+    let files = index_discovered_files_cancellable(
+        &FsFileSource::new(repo_root),
+        &paths,
+        progress,
+        is_cancelled,
+    )?;
     cancellation_checkpoint(is_cancelled)?;
     let source_fingerprints = files
         .iter()
@@ -193,7 +200,7 @@ fn index_repo_outcome_impl(
     })
 }
 
-fn cancellation_checkpoint(is_cancelled: Option<&dyn Fn() -> bool>) -> anyhow::Result<()> {
+fn cancellation_checkpoint(is_cancelled: Option<&CancellationCheck<'_>>) -> anyhow::Result<()> {
     if is_cancelled.is_some_and(|is_cancelled| is_cancelled()) {
         anyhow::bail!("indexing cancelled");
     }
@@ -240,7 +247,7 @@ pub fn index_repo_with_progress_outcome_cancellable(
     filter_extensions: &[String],
     filter_folders: &[String],
     progress: &IndexProgress,
-    is_cancelled: &dyn Fn() -> bool,
+    is_cancelled: &CancellationCheck<'_>,
 ) -> anyhow::Result<IndexOutcome> {
     index_repo_outcome_impl(
         repo_root,
@@ -254,14 +261,27 @@ pub fn index_repo_with_progress_outcome_cancellable(
 
 /// Materialize metrics, parse products, fingerprints, and chunks. Each
 /// retained file is opened once; unsupported or oversized files are streamed.
+#[cfg(test)]
 pub(crate) fn index_discovered_files(
     source: &dyn FileSource,
     paths: &[PathBuf],
     progress: Option<&IndexProgress>,
 ) -> anyhow::Result<Vec<IndexedFile>> {
+    index_discovered_files_cancellable(source, paths, progress, None)
+}
+
+fn index_discovered_files_cancellable(
+    source: &dyn FileSource,
+    paths: &[PathBuf],
+    progress: Option<&IndexProgress>,
+    is_cancelled: Option<&CancellationCheck<'_>>,
+) -> anyhow::Result<Vec<IndexedFile>> {
     let mut indexed: Vec<IndexedFile> = paths
         .par_iter()
-        .map(|path| materialize_file(source, path, progress))
+        .map(|path| {
+            cancellation_checkpoint(is_cancelled)?;
+            materialize_file(source, path, progress, is_cancelled)
+        })
         .collect::<anyhow::Result<_>>()?;
     indexed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(indexed)
@@ -271,7 +291,9 @@ fn materialize_file(
     source: &dyn FileSource,
     path: &Path,
     progress: Option<&IndexProgress>,
+    is_cancelled: Option<&CancellationCheck<'_>>,
 ) -> anyhow::Result<IndexedFile> {
+    cancellation_checkpoint(is_cancelled)?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let parser = parser_for(ext);
     let retain = parser.is_some() || is_retained_text(ext);
@@ -280,13 +302,15 @@ fn materialize_file(
         .with_context(|| format!("reading metadata for {}", path.display()))?;
 
     if retain && known_len.is_none_or(|len| len <= MAX_RETAINED_FILE_BYTES as u64) {
-        let read = read_retained(
+        let read = read_retained_cancellable(
             source
                 .open(path)
                 .with_context(|| format!("reading {}", path.display()))?,
             MAX_RETAINED_FILE_BYTES,
+            is_cancelled,
         )
         .with_context(|| format!("reading {}", path.display()))?;
+        cancellation_checkpoint(is_cancelled)?;
         if let Some(bytes) = read.bytes {
             let lines = read.lines;
             let mut parsed = ParsedFile::default();
@@ -336,7 +360,7 @@ fn materialize_file(
     let mut reader = source
         .open(path)
         .with_context(|| format!("reading {}", path.display()))?;
-    let (lines, bytes) = stream_metrics(&mut reader)?;
+    let (lines, bytes) = stream_metrics_cancellable(&mut reader, is_cancelled)?;
     Ok(IndexedFile {
         rel_path: path.to_path_buf(),
         lines,
@@ -370,13 +394,23 @@ fn is_retained_text(ext: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn stream_metrics(reader: &mut dyn BufRead) -> anyhow::Result<(u64, u64)> {
+    stream_metrics_cancellable(reader, None)
+}
+
+fn stream_metrics_cancellable(
+    reader: &mut dyn BufRead,
+    is_cancelled: Option<&CancellationCheck<'_>>,
+) -> anyhow::Result<(u64, u64)> {
     let mut newlines = 0;
     let mut byte_count = 0;
     let mut ends_with_newline = false;
     loop {
+        cancellation_checkpoint(is_cancelled)?;
         let (len, chunk_newlines, last_is_newline) = {
             let chunk = reader.fill_buf()?;
+            cancellation_checkpoint(is_cancelled)?;
             if chunk.is_empty() {
                 break;
             }
@@ -399,9 +433,10 @@ fn stream_metrics(reader: &mut dyn BufRead) -> anyhow::Result<(u64, u64)> {
     Ok((lines, byte_count))
 }
 
-fn read_retained(
+fn read_retained_cancellable(
     mut reader: Box<dyn BufRead + Send>,
     max_bytes: usize,
+    is_cancelled: Option<&CancellationCheck<'_>>,
 ) -> anyhow::Result<FileRead> {
     let mut retained = Vec::with_capacity(max_bytes.min(64 * 1024));
     let mut newlines = 0;
@@ -409,8 +444,10 @@ fn read_retained(
     let mut ends_with_newline = false;
     let mut overflowed = false;
     loop {
+        cancellation_checkpoint(is_cancelled)?;
         let (len, chunk_newlines, last_is_newline) = {
             let chunk = reader.fill_buf()?;
+            cancellation_checkpoint(is_cancelled)?;
             if chunk.is_empty() {
                 break;
             }
@@ -505,8 +542,8 @@ fn to_symbol_node(item: RawItem, parent_qual: &str) -> SymbolNode {
 mod tests {
     use super::*;
     use std::io::{self, Read};
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Mutex};
 
     struct ChunkProbeReader {
         bytes: Vec<u8>,
@@ -546,6 +583,60 @@ mod tests {
         bytes: Vec<u8>,
         max_inspected: Arc<AtomicUsize>,
         opens: Arc<AtomicUsize>,
+    }
+
+    struct BlockingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        started: std::sync::mpsc::Sender<()>,
+        release: Option<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Read for BlockingReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let len = available.len().min(output.len());
+            output[..len].copy_from_slice(&available[..len]);
+            self.consume(len);
+            Ok(len)
+        }
+    }
+
+    impl BufRead for BlockingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if let Some(release) = self.release.take() {
+                self.started.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            let end = (self.position + 16).min(self.bytes.len());
+            Ok(&self.bytes[self.position..end])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.position = (self.position + amount).min(self.bytes.len());
+        }
+    }
+
+    struct BlockingSource {
+        opens: Arc<AtomicUsize>,
+        started: std::sync::mpsc::Sender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl FileSource for BlockingSource {
+        fn open(&self, _path: &Path) -> anyhow::Result<Box<dyn BufRead + Send>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(BlockingReader {
+                bytes: vec![b'x'; 1024],
+                position: 0,
+                started: self.started.clone(),
+                release: self.release.lock().unwrap().take(),
+            }))
+        }
+
+        fn len(&self, _path: &Path) -> anyhow::Result<Option<u64>> {
+            Ok(Some(1024))
+        }
     }
 
     impl FileSource for ProbeSource {
@@ -657,5 +748,50 @@ mod tests {
         assert!(error.to_string().contains("cancelled"));
         assert_eq!(progress.files_total.load(Ordering::SeqCst), 1);
         assert_eq!(progress.files_parsed.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn mid_materialization_cancellation_stops_queued_files() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (started_sender, started) = std::sync::mpsc::channel();
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let source = BlockingSource {
+            opens: Arc::clone(&opens),
+            started: started_sender,
+            release: Mutex::new(Some(release)),
+        };
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (result_sender, result) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            let paths = ["a.txt", "b.txt", "c.txt"].map(PathBuf::from);
+            let indexed = pool.install(|| {
+                index_discovered_files_cancellable(
+                    &source,
+                    &paths,
+                    None,
+                    Some(&|| worker_cancelled.load(Ordering::Acquire)),
+                )
+            });
+            result_sender.send(indexed).unwrap();
+        });
+
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("first materialization did not begin");
+        cancelled.store(true, Ordering::Release);
+        release_sender.send(()).unwrap();
+        let error = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("cancelled materialization did not return")
+            .expect_err("cancelled materialization unexpectedly succeeded");
+
+        assert!(format!("{error:#}").contains("cancelled"));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
     }
 }
