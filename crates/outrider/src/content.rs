@@ -3,7 +3,7 @@
 //! Pure functions — no rendering; shared by the layout and paint paths.
 
 use outrider_index::{SymbolKind, SymbolNode};
-
+#[cfg(test)]
 use crate::world::Rung;
 
 /// Monospace body font size (px); shared by content math and the paint path.
@@ -17,7 +17,7 @@ pub const BOTTOM_PAD: f64 = 6.0;
 
 /// Below this on-screen font size a leaf paints its texture instead of live
 /// text (the text/texture tier boundary).
-pub const MIN_TEXT_FONT_PX: f64 = 7.0;
+pub const MIN_TEXT_FONT_PX: f64 = 4.0;
 
 /// A leaf page: has source bytes, no children, and is not a folder.
 /// Items are code pages; childless files (markdown, TOML, plain text,
@@ -33,16 +33,17 @@ pub fn natural_px(node: &SymbolNode) -> f64 {
     HEADER + (1.0 + node.measure as f64) * LINE_STEP + BOTTOM_PAD
 }
 
-/// One rendered body line under a box's name row.
+// Body lines, inventory strings, and related helpers are no longer rendered
+// but kept under #[cfg(test)] for the existing test suite.
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyLine {
-    /// TEXT_PRIMARY
     Plain(String),
-    /// TEXT_SECONDARY
     Dim(String),
 }
 
-/// Card meta line — format unchanged from the pre-4b render (spec §4.4).
+#[cfg(test)]
 pub fn card_meta(node: &SymbolNode) -> String {
     format!(
         "{} · p{:.0} · {}L",
@@ -52,7 +53,7 @@ pub fn card_meta(node: &SymbolNode) -> String {
     )
 }
 
-/// e.g. "480L · 47 commits · p96"
+#[cfg(test)]
 pub fn churn_readout(node: &SymbolNode) -> String {
     format!(
         "{}L · {} commits · p{:.0}",
@@ -62,7 +63,7 @@ pub fn churn_readout(node: &SymbolNode) -> String {
     )
 }
 
-/// Pluralize `word` with a count prefix: "1 fn" or "3 fns".
+#[cfg(test)]
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("1 {word}")
@@ -71,9 +72,7 @@ fn plural(n: usize, word: &str) -> String {
     }
 }
 
-/// Item counts by kind: all descendants for files/items ("3 fns · 1 struct");
-/// direct child files/folders for folders ("2 files · 1 folder"). Empty
-/// string when there is nothing to count.
+#[cfg(test)]
 pub fn kind_counts(node: &SymbolNode) -> String {
     if node.id.kind == SymbolKind::Folder {
         let files = node
@@ -115,8 +114,7 @@ pub fn kind_counts(node: &SymbolNode) -> String {
         .join(" · ")
 }
 
-/// The full inventory line (spec §4.3): kind counts + churn readout,
-/// e.g. "4 fns · 2 structs · 480L · 47 commits · p96".
+#[cfg(test)]
 pub fn inventory(node: &SymbolNode) -> String {
     let kinds = kind_counts(node);
     if kinds.is_empty() {
@@ -126,59 +124,15 @@ pub fn inventory(node: &SymbolNode) -> String {
     }
 }
 
-/// Non-code body lines by node type and rung — the spec §4.3 content table.
-/// Full leaf items return only their signature; the paint path appends the
-/// highlighted code (or leaves this Detail-equivalent content when the
-/// buffer is unavailable).
-pub fn body_lines(node: &SymbolNode, rung: Rung) -> Vec<BodyLine> {
-    match rung {
-        Rung::Dot | Rung::Label => vec![],
-        Rung::Card => vec![BodyLine::Dim(card_meta(node))],
-        Rung::Detail | Rung::Full => match node.id.kind {
-            SymbolKind::Folder => {
-                if rung == Rung::Detail {
-                    let mut out = vec![BodyLine::Dim(churn_readout(node))];
-                    let kinds = kind_counts(node);
-                    if !kinds.is_empty() {
-                        out.push(BodyLine::Dim(kinds));
-                    }
-                    out
-                } else {
-                    vec![BodyLine::Dim(inventory(node))]
-                }
-            }
-            SymbolKind::File => {
-                if rung == Rung::Detail {
-                    let mut out = vec![BodyLine::Dim(churn_readout(node))];
-                    let kinds = kind_counts(node);
-                    if !kinds.is_empty() {
-                        out.push(BodyLine::Dim(kinds));
-                    }
-                    out
-                } else if node.children.is_empty() {
-                    vec![BodyLine::Dim(churn_readout(node))]
-                } else {
-                    vec![BodyLine::Dim(inventory(node))]
-                }
-            }
-            SymbolKind::Chunk => vec![BodyLine::Dim(churn_readout(node))],
-            SymbolKind::Item { .. } => {
-                let mut out = Vec::new();
-                if let Some(sig) = &node.signature {
-                    out.push(BodyLine::Plain(sig.clone()));
-                }
-                if rung == Rung::Full && !node.children.is_empty() {
-                    out.push(BodyLine::Dim(inventory(node)));
-                }
-                out
-            }
-        },
-    }
+#[cfg(test)]
+pub fn body_lines(_node: &SymbolNode, _rung: Rung) -> Vec<BodyLine> {
+    vec![]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::Rung;
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     #[allow(clippy::too_many_arguments)]
@@ -348,90 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn body_lines_follow_the_content_table() {
-        use BodyLine::{Dim, Plain};
+    fn body_lines_always_empty() {
         let f = file();
-        let leaf = &f.children[2]; // fn free
-        let container = &f.children[1]; // impl Point (2 children)
         let d = folder();
-
-        // leaf item: signature at Detail AND Full (code appended by paint)
-        assert_eq!(
-            body_lines(leaf, Rung::Detail),
-            vec![Plain("fn free()".into())]
-        );
-        assert_eq!(
-            body_lines(leaf, Rung::Full),
-            vec![Plain("fn free()".into())]
-        );
-        // container item: signature; Full adds the inventory
-        assert_eq!(
-            body_lines(container, Rung::Detail),
-            vec![Plain("impl Point".into())]
-        );
-        assert_eq!(
-            body_lines(container, Rung::Full),
-            vec![Plain("impl Point".into()), Dim(inventory(container))]
-        );
-        // file Detail: churn readout + kind counts (doc shown via hover panel)
-        assert_eq!(
-            body_lines(&f, Rung::Detail),
-            vec![
-                Dim("480L · 47 commits · p96".into()),
-                Dim("3 fns · 1 impl · 1 struct".into()),
-            ]
-        );
-        // file Full: inventory only (doc shown via hover panel)
-        assert_eq!(body_lines(&f, Rung::Full), vec![Dim(inventory(&f))]);
-        // folder Detail: readout + counts; Full: inventory only
-        assert_eq!(
-            body_lines(&d, Rung::Detail),
-            vec![
-                Dim("812L · 12 commits · p40".into()),
-                Dim("2 files · 1 folder".into())
-            ]
-        );
-        assert_eq!(body_lines(&d, Rung::Full), vec![Dim(inventory(&d))]);
-        // file without docs
-        let nodoc = node(SymbolKind::File, "n.rs", 9, 0.0, 0, None, None, vec![]);
-        assert_eq!(
-            body_lines(&nodoc, Rung::Detail),
-            vec![Dim("9L · 0 commits · p0".into())]
-        );
-        assert_eq!(
-            body_lines(&nodoc, Rung::Full),
-            vec![Dim("9L · 0 commits · p0".into())]
-        );
-        // Card keeps the legacy meta; Dot/Label have no body
-        assert_eq!(
-            body_lines(&f, Rung::Card),
-            vec![Dim("47 · p96 · 480L".into())]
-        );
-        assert_eq!(body_lines(&f, Rung::Dot), vec![]);
-        assert_eq!(body_lines(&f, Rung::Label), vec![]);
-    }
-
-    #[test]
-    fn childless_file_full_body_is_one_readout_row() {
-        use BodyLine::Dim;
-        let f = node(
-            SymbolKind::File,
-            "README.md",
-            12,
-            0.2,
-            5,
-            None,
-            Some("# Readme\nIntro."),
-            vec![],
-        );
-        assert_eq!(
-            body_lines(&f, Rung::Full),
-            vec![Dim("12L · 5 commits · p20".into())]
-        );
-        assert_eq!(
-            body_lines(&f, Rung::Detail),
-            vec![Dim("12L · 5 commits · p20".into())]
-        );
+        for rung in [Rung::Dot, Rung::Label, Rung::Card, Rung::Detail, Rung::Full] {
+            assert_eq!(body_lines(&f, rung), vec![]);
+            assert_eq!(body_lines(&d, rung), vec![]);
+        }
     }
 
     #[test]
@@ -590,15 +467,8 @@ mod tests {
             )],
         );
         assert_eq!(kind_counts(&one), "1 part");
-        // a Chunk leaf's Full body is exactly its churn readout row
         let chunk = &file.children[0];
-        assert_eq!(
-            body_lines(chunk, Rung::Full),
-            vec![Dim("60L · 5 commits · p20".into())]
-        );
-        assert_eq!(
-            body_lines(chunk, Rung::Detail),
-            vec![Dim("60L · 5 commits · p20".into())]
-        );
+        assert_eq!(body_lines(chunk, Rung::Full), vec![]);
+        assert_eq!(body_lines(chunk, Rung::Detail), vec![]);
     }
 }

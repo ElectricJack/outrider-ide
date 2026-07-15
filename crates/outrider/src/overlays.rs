@@ -157,6 +157,14 @@ pub(crate) fn context_menu_row(id: &'static str, label: &'static str) -> gpui::S
         .child(label)
 }
 
+pub(crate) fn context_menu_separator() -> gpui::Div {
+    div()
+        .h(px(1.0))
+        .mx(px(8.0))
+        .my(px(4.0))
+        .bg(rgb(0x2a2d32_u32))
+}
+
 pub(crate) fn context_menu_shell(x: f32, y: f32) -> gpui::Div {
     div()
         .absolute()
@@ -309,18 +317,24 @@ pub(crate) fn welcome_element(
 ) -> gpui::Div {
     const WIDTH: f32 = 600.0;
     let left = ((map_width as f32 - WIDTH) / 2.0).max(0.0);
-    let keybindings = [
-        ("Enter / Esc", "Step into / out of focused node"),
-        ("Arrow keys", "Move focus spatially"),
-        ("Alt+Left / Alt+Right", "Navigate history back / forward"),
-        ("Home", "Reset camera to fit all nodes"),
-        ("End", "Frame the focused node"),
-        ("Scroll", "Zoom in / out at cursor"),
-        ("Click", "Set focus"),
-        ("Drag", "Pan the view"),
-        ("Ctrl+P", "Open file palette"),
-        ("Ctrl+T", "Open symbol palette"),
-        ("Ctrl+Shift+E", "Open focused file in file manager"),
+    #[cfg(target_os = "macos")]
+    const M: &str = "Cmd";
+    #[cfg(not(target_os = "macos"))]
+    const M: &str = "Ctrl";
+    let keybindings: Vec<(String, &str)> = vec![
+        ("Enter / Esc".into(), "Step into / out of focused node"),
+        ("Arrow keys".into(), "Move focus spatially"),
+        ("Alt+Left / Alt+Right".into(), "Navigate history back / forward"),
+        ("Home".into(), "Reset camera to fit all nodes"),
+        ("End".into(), "Frame the focused node"),
+        ("Scroll".into(), "Zoom in / out at cursor"),
+        ("Click".into(), "Set focus"),
+        ("Drag".into(), "Pan the view"),
+        (format!("{M}+O"), "Open folder"),
+        (format!("{M}+P"), "Go to file"),
+        (format!("{M}+T"), "Go to symbol"),
+        (format!("{M}+,"), "Settings"),
+        (format!("{M}+Shift+E"), "Reveal in file manager"),
     ];
     let rows = keybindings.into_iter().map(|(key, action)| {
         div()

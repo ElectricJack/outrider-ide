@@ -470,6 +470,7 @@ enum DiskResult {
     Diagnostic(DiskDiagnostic),
 }
 
+#[allow(dead_code)]
 struct TextureDiskWorker {
     commands: mpsc::SyncSender<DiskCommand>,
     results: mpsc::Receiver<DiskResult>,
@@ -990,10 +991,12 @@ impl TextureCache {
         ))
     }
 
+    #[allow(dead_code)]
     pub fn used_bytes(&self) -> usize {
         self.bytes
     }
 
+    #[allow(dead_code)]
     pub fn disk_state(&self) -> DiskState {
         if !self.worker_slot.is_newest(self.worker_claimant) {
             return DiskState::Unavailable;
@@ -1144,6 +1147,7 @@ impl TextureCache {
     }
 
     /// Bake up to BAKES_PER_FRAME queued items, evict past budget.
+    #[allow(dead_code)]
     pub fn process_requests(
         &mut self,
         bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,

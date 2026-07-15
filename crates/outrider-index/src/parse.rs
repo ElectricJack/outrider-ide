@@ -26,6 +26,7 @@ pub struct RawItem {
 
 type KindClassifier = dyn for<'tree> Fn(&str, Node<'tree>, &[u8]) -> Option<&'static str>;
 type NameExtractor = dyn for<'tree> Fn(Node<'tree>, &[u8]) -> String;
+type DocExtractor = dyn for<'tree> Fn(Node<'tree>, &[u8]) -> Option<String>;
 
 /// Extract mod/struct/enum/trait/impl/fn items, nested per the syntax tree
 /// (spec §5.2). Items are returned in source order.
@@ -103,11 +104,12 @@ pub fn parse_python_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(
+    Ok(collect_items_with_doc(
         tree.root_node(),
         source,
         &kind_fn,
         &python_item_name,
+        Some(&python_docstring),
     ))
 }
 
@@ -122,6 +124,93 @@ fn python_item_name(node: Node, src: &[u8]) -> String {
         }
     }
     item_name_default(node, src)
+}
+
+fn python_docstring(node: Node, src: &[u8]) -> Option<String> {
+    let inner;
+    let def = if node.kind() == "decorated_definition" {
+        let mut cursor = node.walk();
+        inner = node.children(&mut cursor).find(|c| {
+            c.kind() == "function_definition" || c.kind() == "class_definition"
+        })?;
+        inner
+    } else {
+        node
+    };
+    let body = def.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let first = body.named_children(&mut cursor).next()?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let string_node = first.named_child(0)?;
+    if string_node.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(string_node, src);
+    clean_docstring(&raw)
+}
+
+fn clean_docstring(raw: &str) -> Option<String> {
+    let body = raw
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+        .or_else(|| {
+            raw.strip_prefix("'''")
+                .and_then(|s| s.strip_suffix("'''"))
+        })?;
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let first = lines[0].trim();
+    let rest = &lines[1..];
+    let min_indent = rest
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    out.push(first);
+    for line in rest {
+        if line.trim().is_empty() {
+            out.push("");
+        } else {
+            out.push(&line[min_indent..]);
+        }
+    }
+    while out.last() == Some(&"") {
+        out.pop();
+    }
+    while out.first() == Some(&"") {
+        out.remove(0);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join("\n"))
+    }
+}
+
+pub fn python_file_doc(source: &[u8]) -> Option<String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let first = root.named_children(&mut cursor).next()?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let string_node = first.named_child(0)?;
+    if string_node.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(string_node, source);
+    clean_docstring(&raw)
 }
 
 /// Extract struct/enum/typedef/fn items from C source.
@@ -418,23 +507,35 @@ fn collect_items(
     kind_fn: &KindClassifier,
     name_fn: &NameExtractor,
 ) -> Vec<RawItem> {
+    collect_items_with_doc(node, src, kind_fn, name_fn, None)
+}
+
+fn collect_items_with_doc(
+    node: Node,
+    src: &[u8],
+    kind_fn: &KindClassifier,
+    name_fn: &NameExtractor,
+    doc_fn: Option<&DocExtractor>,
+) -> Vec<RawItem> {
     let mut items = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if let Some(label) = kind_fn(child.kind(), child, src) {
+            let doc = item_doc(src, child.byte_range().start)
+                .or_else(|| doc_fn.and_then(|f| f(child, src)));
             items.push(RawItem {
                 kind: SymbolKind::Item {
                     label: label.into(),
                 },
                 name: name_fn(child, src),
                 signature: item_signature(child, src),
-                doc: item_doc(src, child.byte_range().start),
+                doc,
                 byte_range: child.byte_range(),
                 line_count: (child.end_position().row - child.start_position().row + 1) as u64,
-                children: collect_items(child, src, kind_fn, name_fn),
+                children: collect_items_with_doc(child, src, kind_fn, name_fn, doc_fn),
             });
         } else {
-            items.extend(collect_items(child, src, kind_fn, name_fn));
+            items.extend(collect_items_with_doc(child, src, kind_fn, name_fn, doc_fn));
         }
     }
     items
@@ -727,6 +828,88 @@ def decorated():
         );
         assert_eq!(items[0].children[0].name, "speak");
         assert_eq!(items[0].children[1].name, "eat");
+    }
+
+    #[test]
+    fn python_docstrings_on_functions_and_classes() {
+        let src = br#"
+def greet(name):
+    """Say hello to someone."""
+    print(f"Hello {name}")
+
+class Dog:
+    """A good dog.
+
+    Dogs are the best.
+    """
+    def bark(self):
+        """Make noise."""
+        pass
+
+    def sit(self):
+        pass
+"#;
+        let items = parse_python_items(src).unwrap();
+        assert_eq!(items[0].doc.as_deref(), Some("Say hello to someone."));
+        assert_eq!(
+            items[1].doc.as_deref(),
+            Some("A good dog.\n\nDogs are the best.")
+        );
+        assert_eq!(items[1].children[0].doc.as_deref(), Some("Make noise."));
+        assert_eq!(items[1].children[1].doc, None);
+    }
+
+    #[test]
+    fn python_docstring_single_quotes() {
+        let src = br#"
+def f():
+    '''Single-quoted docstring.'''
+    pass
+"#;
+        let items = parse_python_items(src).unwrap();
+        assert_eq!(
+            items[0].doc.as_deref(),
+            Some("Single-quoted docstring.")
+        );
+    }
+
+    #[test]
+    fn python_docstring_on_decorated_definition() {
+        let src = br#"
+@staticmethod
+def helper():
+    """Decorated helper."""
+    pass
+"#;
+        let items = parse_python_items(src).unwrap();
+        assert_eq!(items[0].doc.as_deref(), Some("Decorated helper."));
+    }
+
+    #[test]
+    fn python_triple_slash_takes_precedence_over_docstring() {
+        let src = br#"
+/// Triple-slash comment.
+def f():
+    """Docstring."""
+    pass
+"#;
+        let items = parse_python_items(src).unwrap();
+        assert_eq!(items[0].doc.as_deref(), Some("Triple-slash comment."));
+    }
+
+    #[test]
+    fn python_file_doc_extracts_module_docstring() {
+        use super::python_file_doc;
+        assert_eq!(
+            python_file_doc(b"\"\"\"Module doc.\"\"\"\n\ndef f():\n    pass\n"),
+            Some("Module doc.".to_string())
+        );
+        assert_eq!(
+            python_file_doc(b"'''Multi-line\nmodule doc.'''\n\ndef f():\n    pass\n"),
+            Some("Multi-line\nmodule doc.".to_string())
+        );
+        assert_eq!(python_file_doc(b"def f():\n    pass\n"), None);
+        assert_eq!(python_file_doc(b"import os\n\"\"\"Not first.\"\"\""), None);
     }
 
     #[test]

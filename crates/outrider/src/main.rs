@@ -4,7 +4,6 @@
 
 mod buffers;
 mod camera;
-mod chrome;
 mod content;
 mod focus;
 mod interaction;
@@ -22,15 +21,14 @@ mod world;
 
 use std::path::PathBuf;
 
-use gpui::{
-    px, size, App, AppContext as _, Bounds, WindowBounds, WindowDecorations, WindowOptions,
-};
+use gpui::{px, size, App, AppContext as _, Bounds, Menu, MenuItem, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
-use crate::treemap::TreemapView;
+use crate::treemap::{
+    ClearDiskCache, OpenFilePalette, OpenFolder, OpenSymbolPalette, Quit, RevealInFileManager,
+    ToggleSettings, TreemapView,
+};
 
-/// Resolve the repo passed as `argv[1]` (or chosen interactively) and open the
-/// main treemap window before starting background indexing.
 fn main() {
     let repo = match std::env::args().nth(1).map(PathBuf::from) {
         Some(path) => path,
@@ -49,8 +47,6 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: None,
-                window_decorations: Some(WindowDecorations::Client),
                 app_id: Some("outrider".into()),
                 window_min_size: Some(size(px(480.), px(320.))),
                 ..Default::default()
@@ -58,6 +54,49 @@ fn main() {
             |_, cx| cx.new(|cx| TreemapView::loading_shell(repo, settings, cx)),
         )
         .expect("failed to open window");
+
+        cx.bind_keys([
+            gpui::KeyBinding::new("secondary-o", OpenFolder, None),
+            gpui::KeyBinding::new("secondary-p", OpenFilePalette, None),
+            gpui::KeyBinding::new("secondary-t", OpenSymbolPalette, None),
+            gpui::KeyBinding::new("secondary-,", ToggleSettings, None),
+            gpui::KeyBinding::new("secondary-shift-e", RevealInFileManager, None),
+            gpui::KeyBinding::new("secondary-q", Quit, None),
+        ]);
+
+        cx.on_action(|_: &Quit, cx| cx.quit());
+
+        cx.set_menus(vec![
+            Menu {
+                name: "Outrider".into(),
+                disabled: false,
+                items: vec![
+                    MenuItem::action("Settings...", ToggleSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit outrider", Quit),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                disabled: false,
+                items: vec![
+                    MenuItem::action("Open Folder...", OpenFolder),
+                    MenuItem::separator(),
+                    MenuItem::action("Clear Project Disk Cache", ClearDiskCache),
+                ],
+            },
+            Menu {
+                name: "Navigate".into(),
+                disabled: false,
+                items: vec![
+                    MenuItem::action("Go to File...", OpenFilePalette),
+                    MenuItem::action("Go to Symbol...", OpenSymbolPalette),
+                    MenuItem::separator(),
+                    MenuItem::action("Reveal in File Manager", RevealInFileManager),
+                ],
+            },
+        ]);
+
         cx.activate(true);
     });
 }

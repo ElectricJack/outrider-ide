@@ -12,6 +12,7 @@ pub(crate) struct BodyText {
     pub(crate) y: f32,
     pub(crate) text: String,
     pub(crate) runs: Vec<(usize, u32)>,
+    pub(crate) highlighted: bool,
 }
 
 pub(crate) struct NameRow {

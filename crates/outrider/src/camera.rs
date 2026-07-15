@@ -110,7 +110,7 @@ pub fn frame_page(rect: Rect, vw: f64, vh: f64, min_zoom: f64, max_zoom: f64) ->
 }
 
 /// Smooth cubic easing: accelerates then decelerates symmetrically over [0, 1].
-fn ease_in_out_cubic(t: f64) -> f64 {
+pub fn ease_in_out_cubic(t: f64) -> f64 {
     if t < 0.5 {
         4.0 * t * t * t
     } else {

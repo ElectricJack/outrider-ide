@@ -325,6 +325,8 @@ fn materialize_file(
                 finalize_children(&mut parsed.items);
                 if ext == "rs" {
                     parsed.doc = crate::parse::file_doc(&bytes);
+                } else if ext == "py" {
+                    parsed.doc = crate::parse::python_file_doc(&bytes);
                 }
                 if let Some(p) = progress {
                     p.files_parsed.fetch_add(1, Ordering::Relaxed);

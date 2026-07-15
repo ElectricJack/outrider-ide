@@ -18,11 +18,15 @@ pub const TEXT_SECONDARY: u32 = 0x9a9a9a;
 pub const FOCUS_BORDER: u32 = 0x4da6ff;
 #[cfg(target_os = "windows")]
 pub const FONT_FAMILY: &str = "Consolas";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub const FONT_FAMILY: &str = "Menlo";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub const FONT_FAMILY: &str = "DejaVu Sans Mono";
 #[cfg(target_os = "windows")]
 pub const FONT_FAMILY_SANS: &str = "Arial";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub const FONT_FAMILY_SANS: &str = "Helvetica Neue";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub const FONT_FAMILY_SANS: &str = "Liberation Sans";
 /// Light blue for doc-description overlays (matches the focus accent family).
 pub const DOC_COLOR: u32 = 0x7cb8e4;

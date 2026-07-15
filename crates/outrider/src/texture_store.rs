@@ -590,6 +590,7 @@ fn canonical_project_identity(project_root: &Path) -> String {
     let canonical = fs::canonicalize(project_root).unwrap_or_else(|_| {
         std::path::absolute(project_root).unwrap_or_else(|_| project_root.into())
     });
+    #[allow(unused_mut)]
     let mut identity = canonical.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     identity.make_ascii_lowercase();
@@ -606,6 +607,7 @@ fn namespace_derivation(cache_root: &Path, project_identity: &str) -> NamespaceD
     hash.field(project_identity.replace('\\', "/").as_bytes());
     let root = std::path::absolute(cache_root).unwrap_or_else(|_| cache_root.to_path_buf());
     let dir = root.join(format!("{:016x}", hash.finish()));
+    #[allow(unused_mut)]
     let mut key = dir.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     key.make_ascii_lowercase();

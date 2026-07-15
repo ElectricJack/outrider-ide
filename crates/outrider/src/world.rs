@@ -36,7 +36,7 @@ pub fn pack_config() -> outrider_layout::PackConfig {
         page_w: PAGE_W,
         line_step: content::LINE_STEP,
         header: content::HEADER,
-        container_header: content::HEADER + 2.0 * content::LINE_STEP,
+        container_header: content::HEADER,
         bottom_pad: content::BOTTOM_PAD,
         gap: PACK_GAP,
         aspect: PACK_ASPECT,
@@ -512,11 +512,12 @@ mod tests {
         // Label: [LABEL_PX, CARD_PX) height, wide enough
         assert_eq!(leaf_draw(20.0, 400.0, 100.0), Some(Label));
         assert_eq!(leaf_draw(79.9, 400.0, 100.0), Some(Label));
-        // Text: font ≥ 7 (ph/natural ≥ 7/12) AND pw ≥ CODE_MIN_W
+        // Text: font ≥ 4 (ph/natural ≥ 4/12) AND pw ≥ CODE_MIN_W
         assert_eq!(leaf_draw(80.0, 400.0, 100.0), Some(Text)); // font 9.6
-                                                               // Minimap: tall page, font sub-7
-        assert_eq!(leaf_draw(80.0, 400.0, 200.0), Some(Minimap)); // font 4.8
-                                                                  // width gate forces Minimap even when font clears 7
+        assert_eq!(leaf_draw(80.0, 400.0, 200.0), Some(Text)); // font 4.8
+                                                                // Minimap: tall page, font sub-4
+        assert_eq!(leaf_draw(80.0, 400.0, 300.0), Some(Minimap)); // font 3.2
+                                                                   // width gate forces Minimap even when font clears 4
         assert_eq!(leaf_draw(80.0, 299.9, 100.0), Some(Minimap));
     }
 
@@ -526,9 +527,9 @@ mod tests {
         let natural = 3000.0; // ~190-line page
                               // low zoom: box 200px tall → font 0.8 → Minimap
         assert_eq!(leaf_draw(200.0, 400.0, natural), Some(Minimap));
-        // zoom until font ≥ 7 → ph ≥ 7/12·natural = 1750
-        assert_eq!(leaf_draw(1750.0, 400.0, natural), Some(Text));
-        assert_eq!(leaf_draw(1749.0, 400.0, natural), Some(Minimap));
+        // zoom until font ≥ 4 → ph ≥ 4/12·natural = 1000
+        assert_eq!(leaf_draw(1000.0, 400.0, natural), Some(Text));
+        assert_eq!(leaf_draw(999.0, 400.0, natural), Some(Minimap));
     }
 
     #[test]

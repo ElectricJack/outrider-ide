@@ -85,6 +85,7 @@ pub fn discover_files(
     filter_folders: &[String],
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
+    let root_folder_name = repo_root.file_name();
     let walker = WalkBuilder::new(repo_root).require_git(false).build();
     for entry in walker {
         let entry = entry?;
@@ -108,11 +109,32 @@ pub fn discover_files(
             .strip_prefix(repo_root)
             .context("walker yielded path outside repo root")?
             .to_path_buf();
-        // Skip files inside filtered folders
-        if rel_path.components().any(|c| {
-            filter_folders
-                .iter()
-                .any(|f| c.as_os_str().to_string_lossy() == f.as_str())
+        // Skip files inside filtered folders. Filters without a path separator
+        // match any single component (e.g. "target" excludes any target/ at any
+        // depth). Filters containing '/' are treated as a relative path prefix.
+        // If the filter starts with the project root's folder name, also try
+        // matching without it (the treemap labels the root, so users naturally
+        // type e.g. "src/scripts/game_repos" when the relative path is
+        // "scripts/game_repos").
+        if filter_folders.iter().any(|f| {
+            if f.contains('/') {
+                let filter_path = Path::new(f.as_str());
+                if rel_path.starts_with(filter_path) {
+                    return true;
+                }
+                if let Some(root_name) = root_folder_name {
+                    if let Ok(stripped) = filter_path.strip_prefix(root_name) {
+                        if !stripped.as_os_str().is_empty() {
+                            return rel_path.starts_with(stripped);
+                        }
+                    }
+                }
+                false
+            } else {
+                rel_path
+                    .components()
+                    .any(|c| c.as_os_str().to_string_lossy() == f.as_str())
+            }
         }) {
             continue;
         }

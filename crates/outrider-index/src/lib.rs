@@ -4,12 +4,14 @@
 //! The resulting `SymbolTree` is the input to outrider-layout's shelf-packer.
 
 pub mod buffer;
+pub mod call_graph;
 pub mod chunk;
 pub mod churn;
 pub mod dump;
 pub mod index;
 pub mod parse;
 pub mod scan;
+pub mod type_resolve;
 pub mod types;
 
 pub use index::{

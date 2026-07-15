@@ -7,27 +7,43 @@ use std::path::PathBuf;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, BorderStyle,
-    Bounds, ContentMask, Context, Corners, ElementId, FocusHandle, Pixels, TextAlign, TextRun,
+    Bounds, ContentMask, Context, Corners, FocusHandle, Pixels, TextAlign, TextRun,
     Window,
 };
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 use outrider_layout::{PackLayout, Rect};
 
+use gpui::actions;
+
+actions!(
+    outrider,
+    [
+        OpenFolder,
+        ClearDiskCache,
+        ToggleSettings,
+        OpenFilePalette,
+        OpenSymbolPalette,
+        RevealInFileManager,
+        Quit,
+    ]
+);
+
+use outrider_index::call_graph::{CallEdge, CallGraphData};
+
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
-use crate::chrome;
-use crate::content::{self, BodyLine, FONT_PX, HEADER, LINE_STEP};
+use crate::content::{self, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
 use crate::interaction::InteractionAction;
 use crate::navigation::NavigationHistory;
 use crate::overlays::{ContextMenu, Notification, Notifications};
 use crate::paint_model::{
-    char_budget, code_line, runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc,
-    wrap_to_budget, BodyText, DocPanel, NameRow, PaintItem, TexQuad,
+    code_line, runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc, BodyText, DocPanel,
+    NameRow, PaintItem, TexQuad,
 };
 use crate::palette;
 use crate::project_loader::{LoadProgress, LoadResult, LoaderPoll, ProjectLoader};
-use crate::rasterize::{self, DiskState, TextureCache};
+use crate::rasterize::{self, TextureCache};
 use crate::settings;
 use crate::theme;
 use crate::world::{self, Draw, LeafDraw, Rung};
@@ -211,70 +227,197 @@ pub struct TreemapView {
     notifications: Notifications,
     /// Right-click context menu, if currently open.
     context_menu: Option<ContextMenu>,
+    /// Confirmation dialog before moving a file/folder to trash.
+    delete_confirm: Option<std::path::PathBuf>,
+    /// Inline rename input state.
+    rename_state: Option<RenameState>,
+    /// Call graph exploration mode.
+    call_graph: Option<CallGraphMode>,
+    call_graph_cache: HashMap<SymbolId, CallGraphData>,
+    cg_resolver: CallGraphResolver,
     /// Background indexing controller (Open Folder, startup, or re-index).
     loader: ProjectLoader,
     load_progress: Option<LoadProgress>,
 }
 
-/// Content-table rows for a container, pinned to `pin_y` (which may be
-/// stacked below ancestor headers when multiple containers are pinned).
-/// `max_h` caps body text to the zoomed container-header area so it
-/// never bleeds into the children zone.
-#[allow(clippy::too_many_arguments)]
-fn container_body(
-    node: &SymbolNode,
-    rung: Rung,
-    px: &world::PxRect,
-    label_w: f64,
-    vh: f64,
-    pin_y: f64,
-    max_h: f64,
-    focused: bool,
-) -> Vec<BodyText> {
-    if rung == Rung::Dot || rung == Rung::Label {
-        return Vec::new();
-    }
-    let font = FONT_PX as f32;
-    let mut out = Vec::new();
-    let mut row = 0usize;
-    for line in content::body_lines(node, rung) {
-        let y = header_paint_y(pin_y + HEADER + row as f64 * LINE_STEP);
-        if y + LINE_STEP > pin_y + max_h || y + LINE_STEP > px.y + px.h || y > vh {
-            break;
-        }
-        let (text, color) = match line {
-            BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
-            BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
-        };
-        if focused {
-            for shown in wrap_to_budget(&text, char_budget(label_w as f32, font)) {
-                let y = header_paint_y(pin_y + HEADER + row as f64 * LINE_STEP);
-                if y + LINE_STEP > pin_y + max_h || y + LINE_STEP > px.y + px.h || y > vh {
-                    break;
-                }
-                let len = shown.len();
-                out.push(BodyText {
-                    x: (px.x + BODY_PAD) as f32,
-                    y: y as f32,
-                    text: shown,
-                    runs: vec![(len, color)],
-                });
-                row += 1;
-            }
+struct RenameState {
+    path: std::path::PathBuf,
+    input: String,
+}
+
+struct CallGraphMode {
+    center: SymbolId,
+    caller_groups: Vec<CgEdgeGroup>,
+    callee_groups: Vec<CgEdgeGroup>,
+    selection: CallGraphSelection,
+    loading: bool,
+    scroll: CgScrollState,
+}
+
+struct CgEdgeGroup {
+    edges: Vec<CallEdge>,
+    active: usize,
+}
+
+fn group_edges(edges: Vec<CallEdge>) -> Vec<CgEdgeGroup> {
+    let mut groups: Vec<CgEdgeGroup> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for edge in edges {
+        if let Some(&idx) = seen.get(&edge.raw_name) {
+            groups[idx].edges.push(edge);
         } else {
-            if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
-                let len = shown.len();
-                out.push(BodyText {
-                    x: (px.x + BODY_PAD) as f32,
-                    y: y as f32,
-                    text: shown,
-                    runs: vec![(len, color)],
-                });
-            }
-            row += 1;
+            seen.insert(edge.raw_name.clone(), groups.len());
+            groups.push(CgEdgeGroup {
+                edges: vec![edge],
+                active: 0,
+            });
         }
     }
-    out
+    groups
+}
+
+const CG_SCROLL_SECS: f64 = 0.20;
+const CG_CARD_H: f32 = 120.0;
+const CG_CARD_GAP: f32 = 6.0;
+
+struct CgScrollState {
+    caller_from: f32,
+    callee_from: f32,
+    caller_target: f32,
+    callee_target: f32,
+    started: std::time::Instant,
+}
+
+impl CgScrollState {
+    fn new_at(caller: f32, callee: f32) -> Self {
+        Self {
+            caller_from: caller,
+            callee_from: callee,
+            caller_target: caller,
+            callee_target: callee,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn is_animating(&self) -> bool {
+        self.started.elapsed().as_secs_f64() < CG_SCROLL_SECS
+    }
+
+    fn current_offsets(&self) -> (f32, f32) {
+        let t = (self.started.elapsed().as_secs_f64() / CG_SCROLL_SECS).min(1.0);
+        let e = camera::ease_in_out_cubic(t) as f32;
+        (
+            self.caller_from + (self.caller_target - self.caller_from) * e,
+            self.callee_from + (self.callee_target - self.callee_from) * e,
+        )
+    }
+}
+
+fn cg_scroll_target(selected_idx: usize) -> f32 {
+    selected_idx as f32 * (CG_CARD_H + CG_CARD_GAP)
+}
+
+#[derive(Clone, PartialEq)]
+enum CallGraphSelection {
+    Caller(usize),
+    Callee(usize),
+}
+
+struct CgColumnItem {
+    name: String,
+    parent: Option<String>,
+    file: String,
+    lines: Vec<(String, Vec<outrider_index::buffer::HighlightSpan>)>,
+    selected: bool,
+    group_info: Option<(usize, usize)>,
+}
+
+fn cg_parent_name(qualified_path: &str) -> Option<String> {
+    let after_file = qualified_path.split("::").skip(1).collect::<Vec<_>>();
+    if after_file.len() >= 2 {
+        Some(after_file[..after_file.len() - 1].join("::"))
+    } else {
+        None
+    }
+}
+
+struct InflightResolve {
+    generation: u64,
+    target: SymbolId,
+    rx: std::sync::mpsc::Receiver<CallGraphData>,
+}
+
+struct CallGraphResolver {
+    generation: u64,
+    inflight: Option<InflightResolve>,
+}
+
+impl CallGraphResolver {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            inflight: None,
+        }
+    }
+
+    fn request(&mut self, center: SymbolId, tree: SymbolTree) {
+        self.generation = self.generation.wrapping_add(1);
+        let gen = self.generation;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let id = center.clone();
+        std::thread::spawn(move || {
+            let data = outrider_index::call_graph::resolve_calls(&id, &tree);
+            let _ = tx.send(data);
+        });
+        self.inflight = Some(InflightResolve {
+            generation: gen,
+            target: center,
+            rx,
+        });
+    }
+
+    fn poll(&mut self) -> Option<(SymbolId, CallGraphData)> {
+        let inflight = self.inflight.as_ref()?;
+        match inflight.rx.try_recv() {
+            Ok(data) if inflight.generation == self.generation => {
+                let target = inflight.target.clone();
+                self.inflight = None;
+                Some((target, data))
+            }
+            Ok(_) => {
+                self.inflight = None;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.inflight = None;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.inflight = None;
+    }
+
+    fn is_active(&self) -> bool {
+        self.inflight.is_some()
+    }
+}
+
+/// Container headers have no body rows (descriptions were removed).
+fn container_body(
+    _node: &SymbolNode,
+    _rung: Rung,
+    _px: &world::PxRect,
+    _label_w: f64,
+    _vh: f64,
+    _pin_y: f64,
+    _max_h: f64,
+    _focused: bool,
+) -> Vec<BodyText> {
+    Vec::new()
 }
 
 /// A leaf page's rows at uniform scale (spec §2): the signature/readout row
@@ -292,6 +435,7 @@ fn leaf_text_body(
     buffers: &mut BufferManager,
     file_symbols: &BTreeMap<String, Vec<(SymbolId, usize)>>,
     focused: bool,
+    highlight_lines: Option<std::ops::Range<usize>>,
 ) -> (Vec<BodyText>, usize) {
     let scale = full_h / content::natural_px(node);
     let font = (FONT_PX * scale) as f32;
@@ -306,11 +450,15 @@ fn leaf_text_body(
         if let Some(start) = m.symbol_start_line(&node.id) {
             let count = (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
             for j in 0..count {
+                let file_line = start + j;
+                let hl = highlight_lines
+                    .as_ref()
+                    .is_some_and(|r| file_line >= r.start && file_line < r.end);
                 let y = top + content_y0 + display_row as f64 * step;
                 if y > vh && !focused {
                     break;
                 }
-                if let Some((text, spans)) = m.buffer.line(start + j) {
+                if let Some((text, spans)) = m.buffer.line(file_line) {
                     if focused {
                         for (shown, runs) in wrap_code_line(&text, spans, label_w as f32, font) {
                             let y = top + content_y0 + display_row as f64 * step;
@@ -320,6 +468,7 @@ fn leaf_text_body(
                                     y: y as f32,
                                     text: shown,
                                     runs,
+                                    highlighted: hl,
                                 });
                             }
                             display_row += 1;
@@ -334,6 +483,7 @@ fn leaf_text_body(
                                     y: y as f32,
                                     text: shown,
                                     runs,
+                                    highlighted: hl,
                                 });
                             }
                         }
@@ -346,47 +496,7 @@ fn leaf_text_body(
             return (out, display_row.saturating_sub(count));
         }
     }
-    let lines = content::body_lines(node, Rung::Full);
-    let source_count = lines.len();
-    for line in lines {
-        let y = top + content_y0 + display_row as f64 * step;
-        if y > vh && !focused {
-            break;
-        }
-        let (text, color) = match line {
-            BodyLine::Plain(t) => (t, theme::TEXT_PRIMARY),
-            BodyLine::Dim(t) => (t, theme::TEXT_SECONDARY),
-        };
-        if focused {
-            for shown in wrap_to_budget(&text, char_budget(label_w as f32, font)) {
-                let y = top + content_y0 + display_row as f64 * step;
-                if y <= vh && y + step >= 0.0 {
-                    let len = shown.len();
-                    out.push(BodyText {
-                        x,
-                        y: y as f32,
-                        text: shown,
-                        runs: vec![(len, color)],
-                    });
-                }
-                display_row += 1;
-            }
-        } else {
-            if y + step >= 0.0 {
-                if let Some(shown) = truncate_to_width(&text, label_w as f32, font) {
-                    let len = shown.len();
-                    out.push(BodyText {
-                        x,
-                        y: y as f32,
-                        text: shown,
-                        runs: vec![(len, color)],
-                    });
-                }
-            }
-            display_row += 1;
-        }
-    }
-    (out, display_row.saturating_sub(source_count))
+    (out, 0)
 }
 
 fn focused_width(max_chars: usize) -> f64 {
@@ -430,13 +540,7 @@ fn max_line_chars(
             }
         }
     }
-    content::body_lines(node, Rung::Full)
-        .into_iter()
-        .map(|line| match line {
-            BodyLine::Plain(text) | BodyLine::Dim(text) => text.chars().count(),
-        })
-        .max()
-        .unwrap_or(0)
+    0
 }
 
 /// Unclipped screen rect of a leaf's line area: full page width, rows
@@ -475,13 +579,13 @@ fn container_children_have_images(
     node.children.iter().all(|child| has_image(&child.id))
 }
 
-/// Rendered container-header height for a positive [`Camera`] zoom.
-fn container_header_px(zoom: f64) -> f64 {
-    ((HEADER + 2.0 * LINE_STEP) * zoom.min(1.0)).max(HEADER)
+/// Rendered container-header height: always one name row.
+fn container_header_px(_zoom: f64) -> f64 {
+    HEADER
 }
 
-fn container_header_bg_h(body_len: usize, max_h: f64) -> f64 {
-    (HEADER + body_len as f64 * LINE_STEP).min(max_h)
+fn container_header_bg_h(_body_len: usize, max_h: f64) -> f64 {
+    HEADER.min(max_h)
 }
 
 fn header_bg_paint_h(logical_h: f32) -> f32 {
@@ -604,7 +708,13 @@ fn resolve_fs_path(id: &SymbolId, repo_root: &std::path::Path) -> std::path::Pat
 fn open_in_file_manager(path: &std::path::Path) {
     use std::process::Command;
 
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "macos") {
+        if path.is_dir() {
+            let _ = Command::new("open").arg(path).spawn();
+        } else {
+            let _ = Command::new("open").arg("-R").arg(path).spawn();
+        }
+    } else if cfg!(target_os = "windows") {
         if path.is_dir() {
             let _ = Command::new("explorer.exe").arg(path).spawn();
         } else {
@@ -635,18 +745,6 @@ fn open_in_file_manager(path: &std::path::Path) {
 
 fn loading_texture_cache() -> Option<TextureCache> {
     None
-}
-
-fn format_cache_status(memory_bytes: usize, memory_max_mb: u64, disk_state: DiskState) -> String {
-    let memory_mb = memory_bytes as f64 / (1024.0 * 1024.0);
-    let disk = match disk_state {
-        DiskState::Preparing => "Disk preparing…".to_owned(),
-        DiskState::Ready { used_bytes } => {
-            format!("Disk {:.0} MB", used_bytes as f64 / (1024.0 * 1024.0))
-        }
-        DiskState::Unavailable => "Disk unavailable".to_owned(),
-    };
-    format!("Memory {memory_mb:.0} / {memory_max_mb} MB · {disk}")
 }
 
 /// Construction, camera helpers, and the per-frame paint pipeline.
@@ -742,6 +840,11 @@ impl TreemapView {
             settings_draft: None,
             notifications,
             context_menu: None,
+            delete_confirm: None,
+            rename_state: None,
+            call_graph: None,
+            call_graph_cache: HashMap::new(),
+            cg_resolver: CallGraphResolver::new(),
             loader: ProjectLoader::new(),
             load_progress: None,
         }
@@ -761,21 +864,6 @@ impl TreemapView {
             })
     }
 
-    fn memory_status(&self) -> String {
-        let memory_bytes = self
-            .textures
-            .as_ref()
-            .map(TextureCache::used_bytes)
-            .unwrap_or(0);
-        let disk_state = self
-            .textures
-            .as_ref()
-            .map(TextureCache::disk_state)
-            .unwrap_or(DiskState::Preparing);
-        format_cache_status(memory_bytes, u64::from(self.settings.cache_mb), disk_state)
-    }
-
-    /// Window title shown in the client titlebar and taskbar.
     fn window_title(&self) -> String {
         let name = self
             .tree
@@ -786,15 +874,9 @@ impl TreemapView {
         format!("outrider — {name}")
     }
 
-    /// The map's drawable size = the window minus the titlebar. Camera math
-    /// and mouse hit-testing both use these; the map canvas is offset down
-    /// by `chrome::TITLEBAR_H` in window coordinates.
     fn map_viewport(window: &Window) -> (f64, f64) {
         let vp = window.viewport_size();
-        (
-            f64::from(vp.width),
-            f64::from(vp.height) - chrome::TITLEBAR_H,
-        )
+        (f64::from(vp.width), f64::from(vp.height))
     }
 
     /// Frame the focused rect below the pinned ancestor-header stack: frame
@@ -843,6 +925,7 @@ impl TreemapView {
                     &mut self.buffers,
                     &self.file_symbols,
                     true,
+                    None,
                 );
                 let next = expanded_leaf_bounds(packed, expanded_w, extra_rows);
                 if next.h == bounds.h {
@@ -931,7 +1014,7 @@ impl TreemapView {
     /// Advance the tween, materialize buffers/textures, and build the
     /// `PaintItem` list + optional focused-leaf doc panel for the current
     /// frame; also kicks off queued bakes.
-    fn paint_items(&mut self, vw: f64, vh: f64) -> (Vec<PaintItem>, Option<DocPanel>) {
+    fn paint_items(&mut self, vw: f64, vh: f64) -> (Vec<PaintItem>, Option<DocPanel>, bool) {
         if let Some((tw, started)) = self.tween {
             let t = started.elapsed().as_secs_f64();
             self.camera = Some(tw.sample(t));
@@ -955,6 +1038,32 @@ impl TreemapView {
             ));
         }
         let (_, neighbor_ids) = self.neighbors.clone().unwrap();
+
+        let cg_highlight_lines: Option<std::ops::Range<usize>> = self
+            .call_graph
+            .as_ref()
+            .and_then(|mode| {
+                let site = match &mode.selection {
+                    CallGraphSelection::Callee(i) => {
+                        let g = mode.callee_groups.get(*i)?;
+                        g.edges[g.active].call_site.as_ref()?
+                    }
+                    _ => return None,
+                };
+                let rel =
+                    crate::buffers::BufferManager::file_path_of(&mode.center.qualified_path)
+                        .to_string();
+                let syms = self
+                    .file_symbols
+                    .get(&rel)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let m = self.buffers.get(&rel, syms)?;
+                let start_line = m.buffer.byte_to_line(site.start);
+                let end_line = m.buffer.byte_to_line(site.end.saturating_sub(1)) + 1;
+                Some(start_line..end_line)
+            });
+
         if let Some(textures) = self.textures.as_mut() {
             textures.begin_visibility_frame();
         }
@@ -1074,6 +1183,11 @@ impl TreemapView {
                             expanded_w = effective_label_w as f32;
                         }
                         tex_opacity = 0.0;
+                        let hl = if is_focused {
+                            cg_highlight_lines.clone()
+                        } else {
+                            None
+                        };
                         let (text_body, extra_rows) = leaf_text_body(
                             item.node,
                             item.left,
@@ -1084,6 +1198,7 @@ impl TreemapView {
                             &mut self.buffers,
                             &self.file_symbols,
                             is_focused,
+                            hl,
                         );
                         body = text_body;
                         if is_focused && extra_rows > 0 {
@@ -1201,6 +1316,7 @@ impl TreemapView {
                     y,
                     text,
                     runs,
+                    highlighted: false,
                 });
                 y += LINE_STEP as f32;
             }
@@ -1274,7 +1390,8 @@ impl TreemapView {
         } else {
             false
         };
-        (out, doc_panel)
+        let cg_scrim = self.call_graph.is_some();
+        (out, doc_panel, cg_scrim)
     }
 
     /// Find a node in the tree by its ID (recursive depth-first search).
@@ -1430,106 +1547,13 @@ impl TreemapView {
             .children(preview_div)
     }
 
-    fn render_file_menu(&self, cx: &mut Context<Self>) -> gpui::Div {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .h_full()
-            .ml(px(12.0))
-            .gap(px(2.0))
-            .child(
-                div()
-                    .id(ElementId::Name("menu-open-folder".into()))
-                    .flex()
-                    .items_center()
-                    .h_full()
-                    .px(px(8.0))
-                    .cursor_pointer()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .text_size(px(12.))
-                    .hover(|s| {
-                        s.text_color(rgb(theme::TEXT_PRIMARY))
-                            .bg(rgb(chrome::MENU_HOVER))
-                    })
-                    .child("Open Folder")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        if let Some(folder) = rfd::FileDialog::new()
-                            .set_title("Open Project Folder")
-                            .pick_folder()
-                        {
-                            let (settings, warning) =
-                                crate::settings::Settings::load().into_parts();
-                            this.settings = settings;
-                            if let Some(message) = warning {
-                                this.notifications.push(Notification::warning(message));
-                            }
-                            this.start_loading(folder);
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id(ElementId::Name("menu-clear-project-disk-cache".into()))
-                    .flex()
-                    .items_center()
-                    .h_full()
-                    .px(px(8.0))
-                    .cursor_pointer()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .text_size(px(12.))
-                    .hover(|s| {
-                        s.text_color(rgb(theme::TEXT_PRIMARY))
-                            .bg(rgb(chrome::MENU_HOVER))
-                    })
-                    .child("Clear Project Disk Cache")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        if let Some(textures) = this.textures.as_mut() {
-                            textures.request_clear_disk_cache();
-                            this.bake_pending = true;
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id(ElementId::Name("menu-settings".into()))
-                    .flex()
-                    .items_center()
-                    .h_full()
-                    .px(px(8.0))
-                    .cursor_pointer()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .text_size(px(12.))
-                    .hover(|s| {
-                        s.text_color(rgb(theme::TEXT_PRIMARY))
-                            .bg(rgb(chrome::MENU_HOVER))
-                    })
-                    .child("Settings")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        if this.settings_draft.is_some() {
-                            this.settings_draft = None;
-                        } else {
-                            this.settings_draft = Some(SettingsDraft::from_settings(
-                                &this.settings,
-                                &this.tree.repo_root,
-                            ));
-                            this.palette.close();
-                            this.show_welcome = false;
-                            this.context_menu = None;
-                        }
-                        cx.notify();
-                    })),
-            )
-    }
-
     fn on_right_press(
         &mut self,
         e: &gpui::MouseDownEvent,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        if self.call_graph.is_some() { return; }
         let Some(cam) = self.camera else { return };
         let (vw, vh) = Self::map_viewport(window);
         let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
@@ -1539,7 +1563,7 @@ impl TreemapView {
         });
         let (mx, my) = (
             f64::from(e.position.x),
-            f64::from(e.position.y) - chrome::TITLEBAR_H,
+            f64::from(e.position.y),
         );
         if let Some(hit) = world::hit_test(&items, mx, my) {
             self.context_menu = Some(ContextMenu {
@@ -1553,6 +1577,7 @@ impl TreemapView {
     }
 
     fn on_left_release(&mut self, e: &gpui::MouseUpEvent, window: &Window, cx: &mut Context<Self>) {
+        if self.call_graph.is_some() { return; }
         self.drag_last = None;
         if self.context_menu.is_some() {
             self.context_menu = None;
@@ -1577,7 +1602,7 @@ impl TreemapView {
         });
         let (mx, my) = (
             f64::from(e.position.x),
-            f64::from(e.position.y) - chrome::TITLEBAR_H,
+            f64::from(e.position.y),
         );
         let hit = world::hit_test(&items, mx, my).map(|i| i.node.id.clone());
         drop(items);
@@ -1586,11 +1611,13 @@ impl TreemapView {
             if self.focus.set(id, &index) {
                 self.nav_history.push(self.focus.current.clone());
             }
+            self.maybe_precompute_call_graph();
             cx.notify();
         }
     }
 
     fn on_mouse_move(&mut self, e: &gpui::MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        if self.call_graph.is_some() { return; }
         if e.pressed_button == Some(gpui::MouseButton::Left) {
             let Some(last) = self.drag_last else { return };
             self.cancel_tween();
@@ -1611,7 +1638,7 @@ impl TreemapView {
             });
             let (mx, my) = (
                 f64::from(e.position.x),
-                f64::from(e.position.y) - chrome::TITLEBAR_H,
+                f64::from(e.position.y),
             );
             let hit = world::hit_test(&items, mx, my)
                 .filter(|i| i.node.doc.is_some())
@@ -1624,6 +1651,7 @@ impl TreemapView {
     }
 
     fn on_scroll(&mut self, e: &gpui::ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        if self.call_graph.is_some() { return; }
         self.cancel_tween();
         let dy = match e.delta {
             gpui::ScrollDelta::Pixels(p) => f64::from(p.y),
@@ -1636,7 +1664,7 @@ impl TreemapView {
             let factor = (dy * 0.002).exp();
             cam.zoom_about(
                 f64::from(e.position.x),
-                f64::from(e.position.y) - chrome::TITLEBAR_H,
+                f64::from(e.position.y),
                 vw,
                 vh,
                 factor,
@@ -1653,46 +1681,64 @@ impl TreemapView {
             cx.notify();
             return;
         }
+        if self.delete_confirm.is_some() {
+            if e.keystroke.key.as_str() == "escape" {
+                self.delete_confirm = None;
+                cx.notify();
+            }
+            return;
+        }
+        if self.rename_state.is_some() {
+            match e.keystroke.key.as_str() {
+                "escape" => self.rename_state = None,
+                "enter" => {
+                    if let Some(state) = self.rename_state.take() {
+                        let new_path = state
+                            .path
+                            .parent()
+                            .unwrap_or(&state.path)
+                            .join(&state.input);
+                        if let Err(err) = std::fs::rename(&state.path, &new_path) {
+                            self.notifications
+                                .push(Notification::warning(format!("Rename failed: {err}")));
+                        }
+                        self.reindex();
+                    }
+                }
+                "backspace" => {
+                    if let Some(s) = &mut self.rename_state {
+                        s.input.pop();
+                    }
+                }
+                _ => {
+                    if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
+                        let mut chars = s.chars();
+                        let c = chars.next()?;
+                        if chars.next().is_none() {
+                            Some(c)
+                        } else {
+                            None
+                        }
+                    }) {
+                        if let Some(s) = &mut self.rename_state {
+                            s.input.push(ch);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if self.call_graph.is_some() {
+            self.on_call_graph_key(e, window, cx);
+            return;
+        }
         if self.show_welcome {
             if e.keystroke.key.as_str() == "escape" {
                 self.show_welcome = false;
                 cx.notify();
             }
             return;
-        }
-        if e.keystroke.modifiers.control && !e.keystroke.modifiers.shift {
-            match e.keystroke.key.as_str() {
-                "p" => {
-                    self.palette.open(palette::PaletteMode::File, &self.tree);
-                    self.settings_draft = None;
-                    self.context_menu = None;
-                    cx.notify();
-                    return;
-                }
-                "t" => {
-                    self.palette.open(palette::PaletteMode::Symbol, &self.tree);
-                    self.settings_draft = None;
-                    self.context_menu = None;
-                    cx.notify();
-                    return;
-                }
-                "," => {
-                    if self.settings_draft.is_some() {
-                        self.settings_draft = None;
-                    } else {
-                        self.settings_draft = Some(SettingsDraft::from_settings(
-                            &self.settings,
-                            &self.tree.repo_root,
-                        ));
-                        self.palette.close();
-                        self.show_welcome = false;
-                        self.context_menu = None;
-                    }
-                    cx.notify();
-                    return;
-                }
-                _ => {}
-            }
         }
         if let Some(draft) = &mut self.settings_draft {
             match e.keystroke.key.as_str() {
@@ -1736,14 +1782,6 @@ impl TreemapView {
             cx.notify();
             return;
         }
-        if e.keystroke.modifiers.control
-            && e.keystroke.modifiers.shift
-            && e.keystroke.key.as_str() == "e"
-        {
-            let path = resolve_fs_path(&self.focus.current, &self.tree.repo_root);
-            open_in_file_manager(&path);
-            return;
-        }
         if self.palette.is_open() {
             self.on_palette_key(e, window, cx);
             return;
@@ -1764,6 +1802,7 @@ impl TreemapView {
                     if self.focus.set(id, &index) {
                         self.nav_history.push(self.focus.current.clone());
                     }
+                    self.maybe_precompute_call_graph();
                     let (vw, vh) = Self::map_viewport(window);
                     let max_zoom = camera::MAX_ZOOM;
                     let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
@@ -1816,6 +1855,7 @@ impl TreemapView {
                     return;
                 }
                 self.nav_history.push(self.focus.current.clone());
+                self.maybe_precompute_call_graph();
                 self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "escape" => {
@@ -1823,6 +1863,7 @@ impl TreemapView {
                     return;
                 }
                 self.nav_history.push(self.focus.current.clone());
+                self.maybe_precompute_call_graph();
                 self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "end" => self
@@ -1840,6 +1881,11 @@ impl TreemapView {
                 self.home_zoom = c.zoom;
                 Some(c)
             }
+            "tab" => {
+                self.enter_call_graph(window);
+                cx.notify();
+                return;
+            }
             "left" if e.keystroke.modifiers.alt => {
                 let Some(id) = self.nav_history.back().cloned() else {
                     return;
@@ -1847,6 +1893,7 @@ impl TreemapView {
                 self.focus.current = id;
                 self.focus.record_visit(&index);
                 self.neighbors = None;
+                self.maybe_precompute_call_graph();
                 self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "right" if e.keystroke.modifiers.alt => {
@@ -1856,6 +1903,7 @@ impl TreemapView {
                 self.focus.current = id;
                 self.focus.record_visit(&index);
                 self.neighbors = None;
+                self.maybe_precompute_call_graph();
                 self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             "up" | "down" | "left" | "right" => {
@@ -1873,6 +1921,7 @@ impl TreemapView {
                 if !self.focus.set(next, &index) {
                     return;
                 }
+                self.maybe_precompute_call_graph();
                 self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
             _ => return,
@@ -1889,6 +1938,274 @@ impl TreemapView {
         self.start_loading(repo);
     }
 
+    fn enter_call_graph(&mut self, _window: &Window) {
+        let center = self.focus.current.clone();
+        let node = Self::find_node(&self.tree.root, &center);
+        let is_fn = node.is_some_and(|n| {
+            n.children.is_empty()
+                && matches!(&n.id.kind, SymbolKind::Item { label } if label == "fn")
+        });
+        if !is_fn {
+            return;
+        }
+        let initial_offset = cg_scroll_target(0);
+        if let Some(data) = self.call_graph_cache.get(&center).cloned() {
+            let callee_groups = group_edges(data.callees);
+            let caller_groups = group_edges(data.callers);
+            let selection = if !callee_groups.is_empty() {
+                CallGraphSelection::Callee(0)
+            } else {
+                CallGraphSelection::Caller(0)
+            };
+            self.call_graph = Some(CallGraphMode {
+                center,
+                caller_groups,
+                callee_groups,
+                selection,
+                loading: false,
+                scroll: CgScrollState::new_at(initial_offset, initial_offset),
+            });
+        } else {
+            if !self.cg_resolver.is_active() {
+                self.cg_resolver.request(center.clone(), self.tree.clone());
+            }
+            self.call_graph = Some(CallGraphMode {
+                center,
+                caller_groups: Vec::new(),
+                callee_groups: Vec::new(),
+                selection: CallGraphSelection::Callee(0),
+                loading: true,
+                scroll: CgScrollState::new_at(initial_offset, initial_offset),
+            });
+        }
+    }
+
+    fn maybe_precompute_call_graph(&mut self) {
+        let id = &self.focus.current;
+        if self.call_graph_cache.contains_key(id) {
+            return;
+        }
+        let node = Self::find_node(&self.tree.root, id);
+        let is_fn = node.is_some_and(|n| {
+            n.children.is_empty()
+                && matches!(&n.id.kind, SymbolKind::Item { label } if label == "fn")
+        });
+        if !is_fn {
+            return;
+        }
+        self.cg_resolver.request(id.clone(), self.tree.clone());
+    }
+
+    fn poll_call_graph(&mut self, _window: &Window) -> bool {
+        if let Some((id, data)) = self.cg_resolver.poll() {
+            self.call_graph_cache.insert(id.clone(), data.clone());
+            if let Some(mode) = &mut self.call_graph {
+                if mode.loading && mode.center == id {
+                    mode.callee_groups = group_edges(data.callees);
+                    mode.caller_groups = group_edges(data.callers);
+                    mode.loading = false;
+                    mode.selection = if !mode.callee_groups.is_empty() {
+                        CallGraphSelection::Callee(0)
+                    } else {
+                        CallGraphSelection::Caller(0)
+                    };
+                    let initial_offset = cg_scroll_target(0);
+                    mode.scroll = CgScrollState::new_at(initial_offset, initial_offset);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn exit_call_graph(&mut self, window: &Window) {
+        if let Some(mode) = self.call_graph.take() {
+            let index = TreeIndex::new(&self.tree);
+            if self.focus.set(mode.center, &index) {
+                self.nav_history.push(self.focus.current.clone());
+            }
+            self.maybe_precompute_call_graph();
+            let (vw, vh) = Self::map_viewport(window);
+            let max_zoom = camera::MAX_ZOOM;
+            let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+            if let Some(to) = self.frame_focus(vw, vh, min_zoom, max_zoom) {
+                self.start_tween(to);
+            }
+        }
+    }
+
+    fn on_call_graph_key(
+        &mut self,
+        e: &gpui::KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = match &mut self.call_graph {
+            Some(m) => m,
+            None => return,
+        };
+        match e.keystroke.key.as_str() {
+            "tab" | "escape" => {
+                self.exit_call_graph(window);
+                cx.notify();
+            }
+            "left" => {
+                match &mode.selection {
+                    CallGraphSelection::Callee(_) => {
+                        if mode.caller_groups.is_empty() {
+                            return;
+                        }
+                        mode.selection = CallGraphSelection::Caller(0);
+                        let (cur_caller, cur_callee) = mode.scroll.current_offsets();
+                        mode.scroll = CgScrollState {
+                            caller_from: cur_caller,
+                            callee_from: cur_callee,
+                            caller_target: cg_scroll_target(0),
+                            callee_target: cur_callee,
+                            started: std::time::Instant::now(),
+                        };
+                    }
+                    CallGraphSelection::Caller(i) => {
+                        let g = match mode.caller_groups.get_mut(*i) {
+                            Some(g) if g.edges.len() > 1 => g,
+                            _ => return,
+                        };
+                        g.active = (g.active + g.edges.len() - 1) % g.edges.len();
+                    }
+                }
+                cx.notify();
+            }
+            "right" => {
+                match &mode.selection {
+                    CallGraphSelection::Caller(_) => {
+                        if mode.callee_groups.is_empty() {
+                            return;
+                        }
+                        mode.selection = CallGraphSelection::Callee(0);
+                        let (cur_caller, cur_callee) = mode.scroll.current_offsets();
+                        mode.scroll = CgScrollState {
+                            caller_from: cur_caller,
+                            callee_from: cur_callee,
+                            caller_target: cur_caller,
+                            callee_target: cg_scroll_target(0),
+                            started: std::time::Instant::now(),
+                        };
+                    }
+                    CallGraphSelection::Callee(i) => {
+                        let g = match mode.callee_groups.get_mut(*i) {
+                            Some(g) if g.edges.len() > 1 => g,
+                            _ => return,
+                        };
+                        g.active = (g.active + 1) % g.edges.len();
+                    }
+                }
+                cx.notify();
+            }
+            "up" => {
+                mode.selection = match &mode.selection {
+                    CallGraphSelection::Caller(i) if *i > 0 => {
+                        CallGraphSelection::Caller(i - 1)
+                    }
+                    CallGraphSelection::Callee(i) if *i > 0 => {
+                        CallGraphSelection::Callee(i - 1)
+                    }
+                    _ => return,
+                };
+                let (cur_caller, cur_callee) = mode.scroll.current_offsets();
+                let (new_caller_t, new_callee_t) = match &mode.selection {
+                    CallGraphSelection::Caller(i) => (cg_scroll_target(*i), cur_callee),
+                    CallGraphSelection::Callee(i) => (cur_caller, cg_scroll_target(*i)),
+                };
+                mode.scroll = CgScrollState {
+                    caller_from: cur_caller,
+                    callee_from: cur_callee,
+                    caller_target: new_caller_t,
+                    callee_target: new_callee_t,
+                    started: std::time::Instant::now(),
+                };
+                cx.notify();
+            }
+            "down" => {
+                mode.selection = match &mode.selection {
+                    CallGraphSelection::Caller(i) if *i + 1 < mode.caller_groups.len() => {
+                        CallGraphSelection::Caller(i + 1)
+                    }
+                    CallGraphSelection::Callee(i) if *i + 1 < mode.callee_groups.len() => {
+                        CallGraphSelection::Callee(i + 1)
+                    }
+                    _ => return,
+                };
+                let (cur_caller, cur_callee) = mode.scroll.current_offsets();
+                let (new_caller_t, new_callee_t) = match &mode.selection {
+                    CallGraphSelection::Caller(i) => (cg_scroll_target(*i), cur_callee),
+                    CallGraphSelection::Callee(i) => (cur_caller, cg_scroll_target(*i)),
+                };
+                mode.scroll = CgScrollState {
+                    caller_from: cur_caller,
+                    callee_from: cur_callee,
+                    caller_target: new_caller_t,
+                    callee_target: new_callee_t,
+                    started: std::time::Instant::now(),
+                };
+                cx.notify();
+            }
+            "enter" => {
+                let target = match &mode.selection {
+                    CallGraphSelection::Caller(i) => {
+                        mode.caller_groups.get(*i).map(|g| g.edges[g.active].target.clone())
+                    }
+                    CallGraphSelection::Callee(i) => {
+                        mode.callee_groups.get(*i).map(|g| g.edges[g.active].target.clone())
+                    }
+                };
+                if let Some(new_center) = target {
+                    let index = TreeIndex::new(&self.tree);
+                    if self.focus.set(new_center.clone(), &index) {
+                        self.nav_history.push(self.focus.current.clone());
+                    }
+                    let (vw, vh) = Self::map_viewport(window);
+                    let max_zoom = camera::MAX_ZOOM;
+                    let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+                    if let Some(to) = self.frame_focus(vw, vh, min_zoom, max_zoom) {
+                        self.start_tween(to);
+                    }
+                    let initial_offset = cg_scroll_target(0);
+                    if let Some(data) = self.call_graph_cache.get(&new_center).cloned() {
+                        let callee_groups = group_edges(data.callees);
+                        let caller_groups = group_edges(data.callers);
+                        let selection = if !callee_groups.is_empty() {
+                            CallGraphSelection::Callee(0)
+                        } else {
+                            CallGraphSelection::Caller(0)
+                        };
+                        self.call_graph = Some(CallGraphMode {
+                            center: new_center,
+                            caller_groups,
+                            callee_groups,
+                            selection,
+                            loading: false,
+                            scroll: CgScrollState::new_at(initial_offset, initial_offset),
+                        });
+                    } else {
+                        self.cg_resolver
+                            .request(new_center.clone(), self.tree.clone());
+                        self.call_graph = Some(CallGraphMode {
+                            center: new_center,
+                            caller_groups: Vec::new(),
+                            callee_groups: Vec::new(),
+                            selection: CallGraphSelection::Callee(0),
+                            loading: true,
+                            scroll: CgScrollState::new_at(initial_offset, initial_offset),
+                        });
+                    }
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Spawn a background thread to index `folder` and compute its layout.
     fn start_loading(&mut self, folder: std::path::PathBuf) {
         self.loader.start(folder, self.settings.clone());
@@ -1896,6 +2213,11 @@ impl TreemapView {
         self.show_welcome = false;
         self.settings_draft = None;
         self.context_menu = None;
+        self.delete_confirm = None;
+        self.rename_state = None;
+        self.call_graph = None;
+        self.call_graph_cache.clear();
+        self.cg_resolver.cancel();
         self.load_progress = None;
     }
 
@@ -1966,7 +2288,7 @@ impl TreemapView {
     fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let menu = self.context_menu.as_ref()?;
         let x = f32::from(menu.position.x);
-        let y = f32::from(menu.position.y) - chrome::TITLEBAR_H as f32;
+        let y = f32::from(menu.position.y);
         let target = menu.target.clone();
 
         // Resolve display name and path for this target.
@@ -2024,9 +2346,461 @@ impl TreemapView {
                             cx.notify();
                         }),
                     ),
+                )
+                .child(crate::overlays::context_menu_separator())
+                .child(
+                    crate::overlays::context_menu_row("ctx-rename", "Rename").on_click({
+                        let rename_path = fs_path.clone();
+                        let rename_name = node_name.clone();
+                        cx.listener(move |this, _e, _w, cx| {
+                            this.rename_state = Some(RenameState {
+                                path: rename_path.clone(),
+                                input: rename_name.clone(),
+                            });
+                            this.context_menu = None;
+                            cx.notify();
+                        })
+                    }),
+                )
+                .child(
+                    crate::overlays::context_menu_row("ctx-delete", "Move to Trash").on_click({
+                        let delete_path = fs_path.clone();
+                        cx.listener(move |this, _e, _w, cx| {
+                            this.delete_confirm = Some(delete_path.clone());
+                            this.context_menu = None;
+                            cx.notify();
+                        })
+                    }),
                 );
 
         Some(menu_div)
+    }
+
+    fn cg_source_lines(
+        &mut self,
+        id: &SymbolId,
+        max_lines: usize,
+    ) -> Vec<(String, Vec<outrider_index::buffer::HighlightSpan>)> {
+        let rel = crate::buffers::BufferManager::file_path_of(&id.qualified_path).to_string();
+        let syms = self
+            .file_symbols
+            .get(&rel)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let Some(m) = self.buffers.get(&rel, syms) else {
+            return Vec::new();
+        };
+        let Some(start) = m.symbol_start_line(id) else {
+            return Vec::new();
+        };
+        let node = Self::find_node(&self.tree.root, id);
+        let count = node
+            .map(|n| (n.measure as usize).min(m.buffer.len_lines().saturating_sub(start)))
+            .unwrap_or(0)
+            .min(max_lines);
+        (0..count)
+            .filter_map(|j| {
+                m.buffer
+                    .line(start + j)
+                    .map(|(text, spans)| (text, spans.to_vec()))
+            })
+            .collect()
+    }
+
+    fn render_call_graph(
+        &mut self,
+        vh: f64,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let mode = self.call_graph.as_ref()?;
+        let col_w = 320.0_f32;
+        let col_h = (vh as f32 - 96.0).max(200.0);
+        let loading = mode.loading;
+        let (caller_scroll, callee_scroll) = mode.scroll.current_offsets();
+
+        let caller_sel = match &mode.selection {
+            CallGraphSelection::Caller(i) => Some(*i),
+            _ => None,
+        };
+        let callee_sel = match &mode.selection {
+            CallGraphSelection::Callee(i) => Some(*i),
+            _ => None,
+        };
+
+        struct CgGroupSnap {
+            target: SymbolId,
+            raw_name: String,
+            active: usize,
+            total: usize,
+        }
+        let caller_snaps: Vec<CgGroupSnap> = mode
+            .caller_groups
+            .iter()
+            .map(|g| CgGroupSnap {
+                target: g.edges[g.active].target.clone(),
+                raw_name: g.edges[g.active].raw_name.clone(),
+                active: g.active,
+                total: g.edges.len(),
+            })
+            .collect();
+        let callee_snaps: Vec<CgGroupSnap> = mode
+            .callee_groups
+            .iter()
+            .map(|g| CgGroupSnap {
+                target: g.edges[g.active].target.clone(),
+                raw_name: g.edges[g.active].raw_name.clone(),
+                active: g.active,
+                total: g.edges.len(),
+            })
+            .collect();
+
+        let max_code_lines = 15;
+        let caller_items: Vec<CgColumnItem> = caller_snaps
+            .iter()
+            .enumerate()
+            .map(|(i, snap)| {
+                let node = Self::find_node(&self.tree.root, &snap.target);
+                let name = node.map(|n| n.name.clone()).unwrap_or_else(|| snap.raw_name.clone());
+                let parent = cg_parent_name(&snap.target.qualified_path);
+                let file = crate::buffers::BufferManager::file_path_of(&snap.target.qualified_path)
+                    .to_string();
+                let lines = if caller_sel.map_or(false, |s| i.abs_diff(s) <= 3) {
+                    self.cg_source_lines(&snap.target, max_code_lines)
+                } else {
+                    Vec::new()
+                };
+                let group_info = if snap.total > 1 {
+                    Some((snap.active + 1, snap.total))
+                } else {
+                    None
+                };
+                CgColumnItem {
+                    name,
+                    parent,
+                    file,
+                    lines,
+                    selected: caller_sel == Some(i),
+                    group_info,
+                }
+            })
+            .collect();
+        let callee_items: Vec<CgColumnItem> = callee_snaps
+            .iter()
+            .enumerate()
+            .map(|(i, snap)| {
+                let node = Self::find_node(&self.tree.root, &snap.target);
+                let name = node.map(|n| n.name.clone()).unwrap_or_else(|| snap.raw_name.clone());
+                let parent = cg_parent_name(&snap.target.qualified_path);
+                let file = crate::buffers::BufferManager::file_path_of(&snap.target.qualified_path)
+                    .to_string();
+                let lines = if callee_sel.map_or(false, |s| i.abs_diff(s) <= 3) {
+                    self.cg_source_lines(&snap.target, max_code_lines)
+                } else {
+                    Vec::new()
+                };
+                let group_info = if snap.total > 1 {
+                    Some((snap.active + 1, snap.total))
+                } else {
+                    None
+                };
+                CgColumnItem {
+                    name,
+                    parent,
+                    file,
+                    lines,
+                    selected: callee_sel == Some(i),
+                    group_info,
+                }
+            })
+            .collect();
+
+        let callers_col =
+            Self::render_cg_column(&caller_items, "Callers", true, col_w, col_h, loading, caller_scroll);
+        let callees_col =
+            Self::render_cg_column(&callee_items, "Callees", false, col_w, col_h, loading, callee_scroll);
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(callers_col)
+                .child(callees_col),
+        )
+    }
+
+    fn render_cg_column(
+        items: &[CgColumnItem],
+        title: &str,
+        is_callers: bool,
+        width: f32,
+        col_h: f32,
+        loading: bool,
+        scroll_pos: f32,
+    ) -> gpui::Stateful<gpui::Div> {
+        let col_id = if is_callers { "cg-callers" } else { "cg-callees" };
+        let header_h: f32 = 28.0;
+        let header = div()
+            .absolute()
+            .top(px(10.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .h(px(header_h))
+            .text_size(px(11.0))
+            .font_family(theme::FONT_FAMILY_SANS)
+            .text_color(rgb(theme::TEXT_SECONDARY))
+            .child(format!("{title} ({})", items.len()));
+
+        let mut col = div()
+            .id(col_id)
+            .absolute()
+            .top(px(48.0))
+            .w(px(width))
+            .h(px(col_h))
+            .overflow_hidden()
+            .child(header);
+
+        if is_callers {
+            col = col.left(px(12.0));
+        } else {
+            col = col.right(px(12.0));
+        }
+
+        if loading {
+            col = col.child(
+                div()
+                    .absolute()
+                    .top(px(header_h + 20.0))
+                    .left(px(8.0))
+                    .text_size(px(12.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child("Resolving..."),
+            );
+            return col;
+        }
+
+        if items.is_empty() {
+            col = col.child(
+                div()
+                    .absolute()
+                    .top(px(header_h + 20.0))
+                    .left(px(8.0))
+                    .text_size(px(12.0))
+                    .font_family(theme::FONT_FAMILY_SANS)
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(format!("No {}", title.to_lowercase())),
+            );
+            return col;
+        }
+
+        let step = CG_CARD_H + CG_CARD_GAP;
+        let content_top = header_h + 10.0;
+        let avail_h = col_h - content_top;
+        let center_y = content_top + (avail_h / 2.0 - CG_CARD_H / 2.0).max(0.0);
+
+        for (i, item) in items.iter().enumerate() {
+            let card_y = center_y + i as f32 * step - scroll_pos;
+
+            if card_y + CG_CARD_H < 0.0 || card_y > col_h {
+                continue;
+            }
+
+            let border_color = if item.selected {
+                rgb(theme::FOCUS_BORDER)
+            } else {
+                rgb(theme::border_for(theme::CODE_BG))
+            };
+
+            let mut name_row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_family(theme::FONT_FAMILY_SANS)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(item.name.clone()),
+                );
+            if let Some((current, total)) = item.group_info {
+                name_row = name_row.child(
+                    div()
+                        .text_size(px(9.0))
+                        .font_family(theme::FONT_FAMILY_SANS)
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(format!("{current}/{total}")),
+                );
+            }
+
+            let mut card = div()
+                .absolute()
+                .top(px(card_y))
+                .left(px(8.0))
+                .right(px(8.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .bg(rgb(theme::CODE_BG))
+                .border_1()
+                .border_color(border_color)
+                .rounded(px(4.0))
+                .child(name_row);
+
+            if let Some(parent) = &item.parent {
+                card = card.child(
+                    div()
+                        .text_size(px(9.0))
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(parent.clone()),
+                );
+            }
+
+            card = card.child(
+                div()
+                    .text_size(px(8.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .pb(px(4.0))
+                    .child(item.file.clone()),
+            );
+
+            if !item.lines.is_empty() {
+                let mut code_div = div()
+                    .border_color(rgb(theme::border_for(theme::CODE_BG)))
+                    .border_t_1()
+                    .pt(px(4.0));
+                for (text, spans) in &item.lines {
+                    if let Some((shown, runs)) = code_line(text, spans, width - 32.0, 10.0) {
+                        let mut line_div = div()
+                            .flex()
+                            .flex_row()
+                            .text_size(px(10.0))
+                            .font_family(theme::FONT_FAMILY);
+                        let mut byte_pos = 0;
+                        for (len, color) in &runs {
+                            let fragment = &shown[byte_pos..(byte_pos + len).min(shown.len())];
+                            if !fragment.is_empty() {
+                                line_div = line_div.child(
+                                    div().text_color(rgb(*color)).child(fragment.to_string()),
+                                );
+                            }
+                            byte_pos += len;
+                        }
+                        code_div = code_div.child(line_div);
+                    }
+                }
+                card = card.child(code_div);
+            }
+
+            col = col.child(card);
+        }
+
+        col
+    }
+
+    fn render_delete_confirm(
+        &self,
+        map_w: f64,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let path = self.delete_confirm.as_ref()?;
+        let display_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let delete_path = path.clone();
+
+        let cancel = crate::overlays::action_button("del-cancel", "Cancel", false)
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                this.delete_confirm = None;
+                cx.notify();
+            }));
+        let confirm = crate::overlays::action_button("del-confirm", "Move to Trash", true)
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                if let Err(err) = trash::delete(&delete_path) {
+                    this.notifications
+                        .push(Notification::warning(format!("Delete failed: {err}")));
+                }
+                this.delete_confirm = None;
+                this.reindex();
+                cx.notify();
+            }));
+
+        const WIDTH: f32 = 420.0;
+        let left = ((map_w as f32 - WIDTH) / 2.0).max(0.0);
+        Some(
+            crate::overlays::backdrop().child(
+                crate::overlays::centered_panel(80.0, left, WIDTH)
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .pb(px(14.0))
+                            .child(format!("Move \"{display_name}\" to trash?")),
+                    )
+                    .child(div().h(px(1.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
+                    .child(div().flex().flex_row().gap(px(10.0)).child(cancel).child(confirm)),
+            ),
+        )
+    }
+
+    fn render_rename(
+        &self,
+        map_w: f64,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let state = self.rename_state.as_ref()?;
+        let rename_path = state.path.clone();
+        let new_name = state.input.clone();
+
+        let cancel = crate::overlays::action_button("ren-cancel", "Cancel", false)
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                this.rename_state = None;
+                cx.notify();
+            }));
+        let confirm = crate::overlays::action_button("ren-confirm", "Rename", true)
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                let new_path = rename_path.parent().unwrap_or(&rename_path).join(&new_name);
+                if let Err(err) = std::fs::rename(&rename_path, &new_path) {
+                    this.notifications
+                        .push(Notification::warning(format!("Rename failed: {err}")));
+                }
+                this.rename_state = None;
+                this.reindex();
+                cx.notify();
+            }));
+
+        const WIDTH: f32 = 420.0;
+        let left = ((map_w as f32 - WIDTH) / 2.0).max(0.0);
+        Some(
+            crate::overlays::backdrop().child(
+                crate::overlays::centered_panel(80.0, left, WIDTH)
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .pb(px(14.0))
+                            .child("Rename"),
+                    )
+                    .child(
+                        crate::overlays::settings_input("ren-input", state.input.clone(), true),
+                    )
+                    .child(div().h(px(1.0)).mb(px(14.0)).bg(rgb(0x2a2d32_u32)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(10.0))
+                            .child(cancel)
+                            .child(confirm),
+                    ),
+            ),
+        )
     }
 
     /// Build the settings overlay div (absolutely positioned, centered).
@@ -2139,14 +2913,16 @@ impl Render for TreemapView {
             self.focus_handle.focus(window, cx);
         }
 
-        if self.poll_loading() {
+        let mut needs_notify = self.poll_loading();
+        needs_notify |= self.poll_call_graph(window);
+        if needs_notify {
             cx.notify();
         }
 
         let (vw, vh) = Self::map_viewport(window);
         let is_loading = self.loader.is_loading();
 
-        let (items, doc_panel) = self.paint_items(vw, vh);
+        let (items, doc_panel, cg_scrim) = self.paint_items(vw, vh);
 
         // Disk results are applied while building paint items. Drain their
         // diagnostics afterwards so a terminal worker failure is visible in
@@ -2163,7 +2939,9 @@ impl Render for TreemapView {
                 let _ = window.drop_image(img);
             }
         }
-        if self.tween.is_some() || self.bake_pending || is_loading {
+        let cg_animating = self.call_graph.as_ref().is_some_and(|cg| cg.scroll.is_animating());
+        if self.tween.is_some() || self.bake_pending || is_loading || self.cg_resolver.is_active() || cg_animating
+        {
             window.request_animation_frame();
         }
 
@@ -2182,6 +2960,15 @@ impl Render for TreemapView {
         // Build the context menu overlay (needs cx for click listeners).
         let context_menu_overlay = self.render_context_menu(cx);
 
+        // Build the call graph overlay.
+        let call_graph_overlay = self.render_call_graph(vh, cx);
+
+        // Build the delete-confirmation overlay.
+        let delete_overlay = self.render_delete_confirm(vw, cx);
+
+        // Build the rename overlay.
+        let rename_overlay = self.render_rename(vw, cx);
+
         // Build the loading overlay if indexing in background.
         let loading_overlay = self
             .load_progress
@@ -2197,18 +2984,69 @@ impl Render for TreemapView {
             ))
         });
 
-        let title = self.window_title();
-        let file_menu = self.render_file_menu(cx);
+        window.set_window_title(&self.window_title());
         let map = div()
-            .flex_grow(1.)
-            .w_full()
+            .size_full()
             .relative()
             .overflow_hidden()
             .bg(rgb(theme::BG))
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &OpenFolder, _w, cx| {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Open Project Folder")
+                    .pick_folder()
+                {
+                    let (settings, warning) =
+                        crate::settings::Settings::load().into_parts();
+                    this.settings = settings;
+                    if let Some(message) = warning {
+                        this.notifications.push(Notification::warning(message));
+                    }
+                    this.start_loading(folder);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ClearDiskCache, _w, cx| {
+                if let Some(textures) = this.textures.as_mut() {
+                    textures.request_clear_disk_cache();
+                    this.bake_pending = true;
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSettings, _w, cx| {
+                if this.settings_draft.is_some() {
+                    this.settings_draft = None;
+                } else {
+                    this.settings_draft = Some(SettingsDraft::from_settings(
+                        &this.settings,
+                        &this.tree.repo_root,
+                    ));
+                    this.palette.close();
+                    this.show_welcome = false;
+                    this.context_menu = None;
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenFilePalette, _w, cx| {
+                this.palette.open(palette::PaletteMode::File, &this.tree);
+                this.settings_draft = None;
+                this.context_menu = None;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenSymbolPalette, _w, cx| {
+                this.palette.open(palette::PaletteMode::Symbol, &this.tree);
+                this.settings_draft = None;
+                this.context_menu = None;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &RevealInFileManager, _w, _cx| {
+                let path = resolve_fs_path(&this.focus.current, &this.tree.repo_root);
+                open_in_file_manager(&path);
+            }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, e: &gpui::MouseDownEvent, _w, _cx| {
+                    if this.call_graph.is_some() { return; }
                     this.drag_last = Some(e.position);
                     this.press_origin = Some(e.position);
                 }),
@@ -2322,6 +3160,22 @@ impl Render for TreemapView {
                                 if bt.text.is_empty() {
                                     continue;
                                 }
+                                if bt.highlighted {
+                                    let char_w = item.body_font_px * 0.62;
+                                    let hw = char_w * bt.text.len() as f32 + 12.0;
+                                    let hh = item.body_font_px * 1.3;
+                                    window.paint_quad(quad(
+                                        Bounds::new(
+                                            point(origin.x + px(bt.x - 4.0), origin.y + px(bt.y)),
+                                            size(px(hw), px(hh)),
+                                        ),
+                                        px(2.0),
+                                        rgba(0x4488ff30),
+                                        px(0.),
+                                        transparent_black(),
+                                        BorderStyle::default(),
+                                    ));
+                                }
                                 let runs: Vec<TextRun> = bt
                                     .runs
                                     .iter()
@@ -2391,6 +3245,16 @@ impl Render for TreemapView {
                             ));
                             paint_text(item, window, _cx);
                         }
+                        if cg_scrim {
+                            window.paint_quad(quad(
+                                bounds,
+                                px(0.),
+                                rgba(0x000000cc),
+                                px(0.),
+                                transparent_black(),
+                                BorderStyle::default(),
+                            ));
+                        }
                         let paint_ring = |item: &PaintItem, window: &mut Window| {
                             let b = Bounds::new(
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
@@ -2412,9 +3276,13 @@ impl Render for TreemapView {
                         };
                         // Pass 2c: neighbor rings remain above regular content
                         // but below the selected leaf when their bounds overlap.
-                        for item in &items {
-                            if item.neighbor {
-                                paint_ring(item, window);
+                        // Skipped in call-graph mode — only the focused node is
+                        // above the scrim.
+                        if !cg_scrim {
+                            for item in &items {
+                                if item.neighbor {
+                                    paint_ring(item, window);
+                                }
                             }
                         }
                         // Pass 2d: selected leaf surface and text above every
@@ -2430,7 +3298,8 @@ impl Render for TreemapView {
                             }
                         }
                         // Pass 4: focused-leaf doc panel (floats to the right).
-                        if let Some(dp) = &doc_panel {
+                        // Skipped in call-graph mode.
+                        if let Some(dp) = doc_panel.as_ref().filter(|_| !cg_scrim) {
                             let pb = Bounds::new(
                                 point(origin.x + px(dp.x), origin.y + px(dp.y)),
                                 size(px(dp.w), px(dp.h)),
@@ -2481,51 +3350,19 @@ impl Render for TreemapView {
             .children(settings_overlay)
             .children(welcome_overlay)
             .children(context_menu_overlay)
+            .children(call_graph_overlay)
+            .children(delete_overlay)
+            .children(rename_overlay)
             .children(loading_overlay)
             .children(notification_overlay);
 
-        div()
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(theme::BG))
-            .child(chrome::titlebar(
-                title,
-                file_menu,
-                self.memory_status(),
-                window,
-            ))
-            .child(map)
-            .children(chrome::resize_rim(window))
+        map
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{parse_gibibytes, SettingsDraft};
-
-    #[test]
-    fn cache_status_reports_memory_and_current_project_disk_usage() {
-        assert_eq!(
-            super::format_cache_status(
-                3 * 1024 * 1024,
-                128,
-                crate::rasterize::DiskState::Ready {
-                    used_bytes: 5 * 1024 * 1024,
-                },
-            ),
-            "Memory 3 / 128 MB · Disk 5 MB"
-        );
-        assert_eq!(
-            super::format_cache_status(0, 128, crate::rasterize::DiskState::Preparing),
-            "Memory 0 / 128 MB · Disk preparing…"
-        );
-        assert_eq!(
-            super::format_cache_status(0, 128, crate::rasterize::DiskState::Unavailable),
-            "Memory 0 / 128 MB · Disk unavailable"
-        );
-    }
 
     #[test]
     fn loading_shell_texture_cache_is_lazy() {
@@ -2609,11 +3446,14 @@ mod tests {
     use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
-        char_budget, code_line, container_body, container_children_have_images,
+        container_body, container_children_have_images,
         container_header_bg_h, container_header_layout, container_header_px, focused_width,
         header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body, leaf_texture_is_visible,
-        max_line_chars, runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc,
-        wrap_to_budget, HEADER, LINE_STEP,
+        max_line_chars, HEADER, LINE_STEP, BODY_PAD,
+    };
+    use crate::paint_model::{
+        char_budget, code_line, runs_from_spans, truncate_to_width, wrap_code_line, wrap_doc,
+        wrap_to_budget,
     };
     use crate::buffers::BufferManager;
     use crate::world::{self, PxRect, Rung};
@@ -2775,9 +3615,7 @@ mod tests {
             h: 300.0,
         };
         let body = container_body(&f, Rung::Detail, &px, 400.0, 600.0, px.y, 300.0, false);
-        // churn readout only (doc shown via hover panel, no children → no kinds)
-        assert_eq!(body.len(), 1);
-        assert!((f64::from(body[0].y) - (HEADER - 1.0)).abs() < 1e-3);
+        assert_eq!(body.len(), 0);
     }
 
     #[test]
@@ -2818,6 +3656,7 @@ mod tests {
             &mut mgr,
             &file_symbols,
             false,
+            None,
         );
         // code only — no separate signature row (the code line IS the signature)
         assert_eq!(body.len(), 1);
@@ -2880,10 +3719,11 @@ mod tests {
             &mut mgr,
             &file_symbols,
             false,
+            None,
         );
         assert_eq!(body.len(), 1);
         assert!((f64::from(body[0].y) - 2.0 * HEADER).abs() < 1e-3);
-        // buffer unavailable → signature only, no code
+        // buffer unavailable → no body lines
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
         let (body, _extra) = leaf_text_body(
             &leaf,
@@ -2895,9 +3735,9 @@ mod tests {
             &mut broken,
             &BTreeMap::new(),
             false,
+            None,
         );
-        assert_eq!(body.len(), 1);
-        assert_eq!(body[0].text, "fn two()");
+        assert_eq!(body.len(), 0);
     }
 
     #[test]
@@ -2931,6 +3771,7 @@ mod tests {
             &mut manager,
             &file_symbols,
             true,
+            None,
         );
 
         assert_eq!(body.len(), 1, "only the first wrapped row is visible");
@@ -3071,21 +3912,11 @@ mod tests {
     use outrider_layout::{PackLayout, Rect};
 
     #[test]
-    fn container_header_never_collapses_below_one_line() {
-        let natural = HEADER + 2.0 * LINE_STEP;
-        assert!((container_header_px(1.0) - natural).abs() < 1e-9);
-        assert!((container_header_px(0.5) - natural * 0.5).abs() < 1e-9);
+    fn container_header_is_always_one_line() {
+        assert!((container_header_px(1.0) - HEADER).abs() < 1e-9);
+        assert!((container_header_px(0.5) - HEADER).abs() < 1e-9);
         assert!((container_header_px(0.1) - HEADER).abs() < 1e-9);
-
-        // Camera zoom is positive. Check the adjacent representable values
-        // around the exact clamp transition rather than implying zero or
-        // negative zoom support.
-        let transition = HEADER / natural;
-        let below = f64::from_bits(transition.to_bits() - 1);
-        let above = f64::from_bits(transition.to_bits() + 1);
-        assert!((container_header_px(below) - HEADER).abs() < 1e-9);
-        assert!((container_header_px(transition) - HEADER).abs() < 1e-9);
-        assert!(container_header_px(above) > HEADER);
+        assert!((container_header_px(2.0) - HEADER).abs() < 1e-9);
     }
 
     #[test]
@@ -3096,7 +3927,8 @@ mod tests {
             w: world::PAGE_W,
             h: 2_000.0,
         };
-        assert!((leaf_text_zoom_floor(normal_page) - 7.0 / 12.0).abs() < 1e-9);
+        // For PAGE_W (640), CODE_MIN_W/w = 300/640 ≈ 0.469 dominates over 4/12 ≈ 0.333
+        assert!((leaf_text_zoom_floor(normal_page) - 300.0 / world::PAGE_W).abs() < 1e-9);
 
         let narrow_page = Rect {
             w: 200.0,
@@ -3140,13 +3972,13 @@ mod tests {
 
             let available = HEADER + 5.0;
             let capped = container_header_layout(rung, 100.0, available, 100.0, 1.0).unwrap();
-            assert!((capped.max_h - available).abs() < 1e-9);
+            assert!((capped.max_h - HEADER).abs() < 1e-9);
             assert!(capped.pin_y + capped.max_h <= 100.0 + available);
 
             let stacked =
                 container_header_layout(rung, 100.0, 2.0 * HEADER, 100.0 + HEADER - 2.0, 1.0)
                     .unwrap();
-            assert!((stacked.max_h - (HEADER + 2.0)).abs() < 1e-9);
+            assert!((stacked.max_h - HEADER).abs() < 1e-9);
             assert!(
                 container_header_layout(rung, 100.0, 2.0 * HEADER, 100.0 + HEADER + 1.0, 1.0,)
                     .is_none()
@@ -3296,16 +4128,15 @@ mod tests {
             zoom: 1.0,
         };
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
-        let hdr = HEADER + 2.0 * LINE_STEP;
-        assert!((h - 2.0 * hdr).abs() < 1e-9);
-        // Header height scales with zoom below 1.
+        assert!((h - 2.0 * HEADER).abs() < 1e-9);
+        // Header height is constant regardless of zoom.
         let cam = Camera {
             center_x: 0.0,
             center_y: 0.0,
             zoom: 0.5,
         };
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, 600.0);
-        assert!((h - hdr).abs() < 1e-9);
+        assert!((h - 2.0 * HEADER).abs() < 1e-9);
         let cam = Camera {
             center_x: 0.0,
             center_y: 3000.0,
@@ -3329,8 +4160,7 @@ mod tests {
         let vh = 600.0;
         assert!((screen_y(&cam, -1000.0, vh) - 50.0).abs() < 1e-9);
         let h = pinned_stack_h(&focus, &layout, &index, &cam, 800.0, vh);
-        let hdr = HEADER + 2.0 * LINE_STEP;
-        assert!((h - (150.0 + hdr)).abs() < 1e-9);
+        assert!((h - (150.0 + HEADER)).abs() < 1e-9);
     }
 
     /// w_px giving exactly `budget` chars: budget = (w - 12) / (0.62 * 12).
