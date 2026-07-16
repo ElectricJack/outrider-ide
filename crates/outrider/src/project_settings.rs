@@ -106,7 +106,7 @@ pub fn categorize_extension(ext: &str) -> ExtensionCategory {
         | "mm" | "r" | "R" | "scala" | "clj" | "cljs" | "erl" | "ex" | "exs" | "hs" | "lua"
         | "pl" | "pm" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "zig" | "nim"
         | "v" | "d" | "f90" | "f95" | "jl" | "ml" | "mli" | "fs" | "fsx" | "dart" | "groovy"
-        | "vb" | "vbs" | "asm" | "s" | "S" => ExtensionCategory::Code,
+        | "vb" | "vbs" | "asm" | "s" | "S" | "rgen" | "rchit" => ExtensionCategory::Code,
 
         "toml" | "json" | "yaml" | "yml" | "xml" | "ini" | "cfg" | "conf" | "env"
         | "properties" | "plist" | "editorconfig" | "eslintrc" | "prettierrc" | "babelrc"
@@ -160,6 +160,8 @@ mod tests {
     #[test]
     fn categorizes_known_extensions() {
         assert_eq!(categorize_extension("rs"), ExtensionCategory::Code);
+        assert_eq!(categorize_extension("rgen"), ExtensionCategory::Code);
+        assert_eq!(categorize_extension("rchit"), ExtensionCategory::Code);
         assert_eq!(categorize_extension("json"), ExtensionCategory::Config);
         assert_eq!(categorize_extension("md"), ExtensionCategory::Docs);
         assert_eq!(categorize_extension("css"), ExtensionCategory::Styles);

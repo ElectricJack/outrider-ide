@@ -44,7 +44,8 @@ impl SourceLanguage {
             "md" | "markdown" => Self::Markdown,
             "toml" => Self::Toml,
             "mk" => Self::Make,
-            "glsl" | "vert" | "frag" | "geom" | "comp" | "tesc" | "tese" => Self::Glsl,
+            "glsl" | "vert" | "frag" | "geom" | "comp" | "tesc" | "tese" | "rgen"
+            | "rchit" => Self::Glsl,
             "hlsl" | "fx" | "fxh" => Self::Hlsl,
             _ => return None,
         })
@@ -81,7 +82,9 @@ mod tests {
 
     #[test]
     fn shader_extensions_are_deterministic_and_case_insensitive() {
-        for ext in ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese"] {
+        for ext in [
+            "glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "rgen", "rchit",
+        ] {
             assert_eq!(
                 SourceLanguage::for_path(Path::new(&format!("shader.{ext}"))),
                 Some(SourceLanguage::Glsl)

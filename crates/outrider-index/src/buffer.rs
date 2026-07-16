@@ -536,7 +536,9 @@ mod tests {
     #[test]
     fn shader_extensions_enable_syntax_highlighting() {
         let glsl = "#version 450\n// note\nvoid main() { float x = 1.0; }\n";
-        for ext in ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese"] {
+        for ext in [
+            "glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "rgen", "rchit",
+        ] {
             let buf = FileBuffer::new(glsl.to_string(), format!("shader.{ext}")).unwrap();
             assert!(
                 buf.line(1)
