@@ -3,6 +3,7 @@
 //! call the functions here rather than hard-coding palette values.
 
 use outrider_index::buffer::HighlightKind;
+use outrider_index::{SymbolKind, SymbolNode};
 
 /// Window and panel background color.
 pub const BG: u32 = 0x1a1a1c;
@@ -95,6 +96,7 @@ pub enum BoxTint {
     /// No tint; use the base depth/kind fill unchanged.
     Normal,
     /// Type-definition items (struct, enum, trait, interface, type alias).
+    #[allow(dead_code)]
     TypeDef,
     /// Folder whose contents are predominantly documentation files.
     DocsFolder,
@@ -189,6 +191,42 @@ pub enum BoxKind {
     Folder,
 }
 
+/// Map canonical leaf status and symbol kind to a rendering tier.
+pub fn node_box_kind(is_leaf: bool, symbol_kind: &SymbolKind) -> BoxKind {
+    if is_leaf {
+        BoxKind::Leaf
+    } else {
+        match symbol_kind {
+            SymbolKind::Folder => BoxKind::Folder,
+            SymbolKind::Item { .. } => BoxKind::Item,
+            SymbolKind::File | SymbolKind::Chunk => BoxKind::File,
+        }
+    }
+}
+
+fn file_extension_tint(path: &str) -> BoxTint {
+    let file = path.split("::").next().unwrap_or(path);
+    let ext = file.rsplit('.').next().unwrap_or("");
+    if ext == file {
+        BoxTint::Normal
+    } else {
+        BoxTint::FileType(extension_tint(ext))
+    }
+}
+
+/// Derive the semantic tint shared by live and cached rendering.
+pub fn node_box_tint(node: &SymbolNode) -> BoxTint {
+    match &node.id.kind {
+        SymbolKind::Folder => match node.name.as_str() {
+            "docs" | "doc" | "documentation" => BoxTint::DocsFolder,
+            "test" | "tests" | "spec" | "specs" | "__tests__" => BoxTint::TestFolder,
+            _ => BoxTint::Normal,
+        },
+        SymbolKind::Item { .. } => file_extension_tint(&node.id.qualified_path),
+        SymbolKind::File | SymbolKind::Chunk => file_extension_tint(&node.name),
+    }
+}
+
 /// File-container depth fill: the folder ramp shifted warm.
 pub fn file_fill(level: u8) -> u32 {
     lerp_rgb(depth_fill(level), FILE_TINT, FILE_BLEND)
@@ -258,6 +296,62 @@ pub fn syntax_color(kind: HighlightKind) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use outrider_index::{SymbolId, SymbolKind, SymbolNode};
+
+    fn node(kind: SymbolKind, name: &str, qualified_path: &str) -> SymbolNode {
+        SymbolNode {
+            id: SymbolId {
+                kind,
+                qualified_path: qualified_path.into(),
+                ordinal: 0,
+            },
+            name: name.into(),
+            byte_range: None,
+            signature: None,
+            doc: None,
+            measure: 0,
+            churn: 0.0,
+            churn_count: 0,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn python_nodes_share_extension_tint_and_use_three_brightness_tiers() {
+        let file = node(SymbolKind::File, "main.py", "main.py");
+        let mut item = node(
+            SymbolKind::Item {
+                label: "class".into(),
+            },
+            "Widget",
+            "main.py::Widget",
+        );
+        item.children.push(node(
+            SymbolKind::Item { label: "fn".into() },
+            "method",
+            "main.py::Widget::method",
+        ));
+        let mut leaf = node(
+            SymbolKind::Item { label: "fn".into() },
+            "method",
+            "main.py::Widget::method",
+        );
+        leaf.byte_range = Some(0..10);
+
+        let expected_tint = BoxTint::FileType(extension_tint("py"));
+        assert_eq!(node_box_tint(&file), expected_tint);
+        assert_eq!(node_box_tint(&item), expected_tint);
+        assert_eq!(node_box_tint(&leaf), expected_tint);
+        assert_eq!(node_box_kind(false, &file.id.kind), BoxKind::File);
+        assert_eq!(node_box_kind(false, &item.id.kind), BoxKind::Item);
+        assert_eq!(node_box_kind(true, &leaf.id.kind), BoxKind::Leaf);
+
+        let file_fill = box_fill(node_box_kind(false, &file.id.kind), 2, node_box_tint(&file));
+        let item_fill = box_fill(node_box_kind(false, &item.id.kind), 2, node_box_tint(&item));
+        let leaf_fill = box_fill(node_box_kind(true, &leaf.id.kind), 2, node_box_tint(&leaf));
+        assert!(brightness(file_fill) > brightness(item_fill));
+        assert!(brightness(item_fill) > brightness(leaf_fill));
+    }
 
     #[test]
     fn renderer_theme_fingerprint_is_stable_and_nonzero() {

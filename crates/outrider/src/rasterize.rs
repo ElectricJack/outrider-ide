@@ -15,10 +15,11 @@ use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Sw
 use gpui::RenderImage;
 use image::{Frame, ImageBuffer, Rgba};
 
-use outrider_index::{SymbolId, SymbolKind, SymbolNode};
+use outrider_index::{SymbolId, SymbolNode};
 use outrider_layout::{PackLayout, Rect};
 
 use crate::buffers::BufferManager;
+use crate::content;
 use crate::content::LINE_STEP;
 use crate::texture_store::{ProjectTextureNamespace, TextureKey, TexturePayload, TextureStore};
 use crate::theme;
@@ -33,7 +34,7 @@ pub const MAX_TEX_H: usize = 1024;
 const CONTAINER_TEX_MAX: f64 = 1024.0;
 /// Increment whenever rasterization semantics change incompatibly.
 // Version 2 invalidates textures baked with the former 480-world-unit page width.
-pub const RENDER_SCHEMA_VERSION: u64 = 2;
+pub const RENDER_SCHEMA_VERSION: u64 = 3;
 
 /// One source line: text plus colored runs (byte length, 0xRRGGBB).
 pub type Line = (String, Vec<(usize, u32)>);
@@ -251,17 +252,8 @@ fn container_fill(
         let pw = (r.w * sx).max(1.0).ceil() as i32;
         let ph = (r.h * sy).max(1.0).ceil() as i32;
 
-        let is_leaf = child.byte_range.is_some()
-            && child.children.is_empty()
-            && child.id.kind != SymbolKind::Folder;
-        let kind = if is_leaf {
-            theme::BoxKind::Leaf
-        } else if child.id.kind == SymbolKind::Folder {
-            theme::BoxKind::Folder
-        } else {
-            theme::BoxKind::File
-        };
-        let tint = classify_tint_node(child);
+        let kind = theme::node_box_kind(content::is_leaf_item(child), &child.id.kind);
+        let tint = theme::node_box_tint(child);
         let fill = theme::box_fill(kind, level, tint);
         let border = theme::border_for(fill);
         let (fr, fg, fb) = rgb_u8(fill);
@@ -316,23 +308,6 @@ fn container_fill(
                 }
             }
         }
-    }
-}
-
-fn classify_tint_node(node: &SymbolNode) -> theme::BoxTint {
-    match &node.id.kind {
-        SymbolKind::Folder => match node.name.as_str() {
-            "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
-            "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
-            _ => theme::BoxTint::Normal,
-        },
-        SymbolKind::Item { label } => match label.as_str() {
-            "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef" => {
-                theme::BoxTint::TypeDef
-            }
-            _ => theme::BoxTint::Normal,
-        },
-        _ => theme::BoxTint::Normal,
     }
 }
 
@@ -1510,6 +1485,76 @@ mod tests {
 
     fn plain(text: &str) -> Line {
         (text.to_string(), vec![(text.len(), 0xFF0000)])
+    }
+
+    #[test]
+    fn cached_python_item_bakes_with_file_type_item_fill() {
+        let child = SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Item {
+                    label: "class".into(),
+                },
+                qualified_path: "main.py::Widget".into(),
+                ordinal: 0,
+            },
+            name: "Widget".into(),
+            byte_range: None,
+            signature: None,
+            doc: None,
+            measure: 0,
+            churn: 0.0,
+            churn_count: 0,
+            children: Vec::new(),
+        };
+        let root = SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Folder,
+                qualified_path: "src".into(),
+                ordinal: 0,
+            },
+            name: "src".into(),
+            byte_range: None,
+            signature: None,
+            doc: None,
+            measure: 0,
+            churn: 0.0,
+            churn_count: 0,
+            children: vec![child.clone()],
+        };
+        let root_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let child_rect = Rect {
+            x: 10.0,
+            y: 10.0,
+            w: 80.0,
+            h: 80.0,
+        };
+        let layout = PackLayout {
+            rects: [(root.id.clone(), root_rect), (child.id.clone(), child_rect)]
+                .into_iter()
+                .collect(),
+        };
+
+        let texture = bake_container(&root, root_rect, &layout, 0, &|_| None);
+        let image = texture.image.expect("container texture");
+        let bytes = image.as_bytes(0).expect("BGRA pixels");
+        let center = (512 * 1024 + 512) * 4;
+        let fill = theme::box_fill(
+            theme::BoxKind::Item,
+            1,
+            theme::BoxTint::FileType(theme::extension_tint("py")),
+        );
+        let expected_bgra = [fill as u8, (fill >> 8) as u8, (fill >> 16) as u8, 255];
+        assert_eq!(&bytes[center..center + 4], &expected_bgra);
+    }
+
+    #[test]
+    fn render_schema_tracks_shared_file_type_classification() {
+        assert_eq!(RENDER_SCHEMA_VERSION, 3);
     }
 
     #[test]

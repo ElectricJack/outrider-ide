@@ -970,28 +970,6 @@ fn leaf_text_zoom_floor(r: Rect) -> f64 {
     (content::MIN_TEXT_FONT_PX / FONT_PX).max(world::CODE_MIN_W / r.w)
 }
 
-/// Map a symbol node to the semantic tint for its box background.
-fn file_ext_tint(path: &str) -> theme::BoxTint {
-    let file = path.split("::").next().unwrap_or(path);
-    let ext = file.rsplit('.').next().unwrap_or("");
-    if ext == file {
-        return theme::BoxTint::Normal;
-    }
-    theme::BoxTint::FileType(theme::extension_tint(ext))
-}
-
-fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
-    match &node.id.kind {
-        SymbolKind::Folder => match node.name.as_str() {
-            "docs" | "doc" | "documentation" => theme::BoxTint::DocsFolder,
-            "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
-            _ => theme::BoxTint::Normal,
-        },
-        SymbolKind::Item { .. } => file_ext_tint(&node.id.qualified_path),
-        SymbolKind::File | SymbolKind::Chunk => file_ext_tint(&node.name),
-    }
-}
-
 fn resolve_fs_path(id: &SymbolId, repo_root: &std::path::Path) -> std::path::PathBuf {
     let rel = match id.kind {
         SymbolKind::Folder => id.qualified_path.as_str(),
@@ -1392,16 +1370,8 @@ impl TreemapView {
             }
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
             let is_focused = item.node.id == focus_id;
-            let box_kind = if is_leaf {
-                theme::BoxKind::Leaf
-            } else if item.node.id.kind == SymbolKind::Folder {
-                theme::BoxKind::Folder
-            } else if matches!(item.node.id.kind, SymbolKind::Item { .. }) {
-                theme::BoxKind::Item
-            } else {
-                theme::BoxKind::File
-            };
-            let tint = classify_tint(item.node);
+            let box_kind = theme::node_box_kind(is_leaf, &item.node.id.kind);
+            let tint = theme::node_box_tint(item.node);
             let fill = theme::box_fill(box_kind, item.level, tint);
             let mut body_font_px = FONT_PX as f32;
             let mut header_bg_h = 0.0f32;
@@ -4581,12 +4551,11 @@ mod tests {
 
     #[test]
     fn classify_tint_docs_folder() {
-        use super::classify_tint;
         use crate::theme::BoxTint;
         for name in &["docs", "doc", "documentation"] {
             let n = make_node(SymbolKind::Folder, name);
             assert_eq!(
-                classify_tint(&n),
+                crate::theme::node_box_tint(&n),
                 BoxTint::DocsFolder,
                 "expected DocsFolder for {name}"
             );
@@ -4595,12 +4564,11 @@ mod tests {
 
     #[test]
     fn classify_tint_test_folder() {
-        use super::classify_tint;
         use crate::theme::BoxTint;
         for name in &["test", "tests", "spec", "specs", "__tests__"] {
             let n = make_node(SymbolKind::Folder, name);
             assert_eq!(
-                classify_tint(&n),
+                crate::theme::node_box_tint(&n),
                 BoxTint::TestFolder,
                 "expected TestFolder for {name}"
             );
@@ -4609,7 +4577,6 @@ mod tests {
 
     #[test]
     fn classify_tint_items_use_file_extension() {
-        use super::classify_tint;
         use crate::theme::BoxTint;
         let mut n = make_node(
             SymbolKind::Item {
@@ -4619,38 +4586,37 @@ mod tests {
         );
         n.id.qualified_path = "src/main.rs::Foo".into();
         assert_eq!(
-            classify_tint(&n),
+            crate::theme::node_box_tint(&n),
             BoxTint::FileType(crate::theme::extension_tint("rs"))
         );
         n.id.qualified_path = "app.ts::Bar".into();
         assert_eq!(
-            classify_tint(&n),
+            crate::theme::node_box_tint(&n),
             BoxTint::FileType(crate::theme::extension_tint("ts"))
         );
     }
 
     #[test]
     fn classify_tint_normal_cases() {
-        use super::classify_tint;
         use crate::theme::BoxTint;
         // Unrecognized folder name
         assert_eq!(
-            classify_tint(&make_node(SymbolKind::Folder, "src")),
+            crate::theme::node_box_tint(&make_node(SymbolKind::Folder, "src")),
             BoxTint::Normal
         );
         // Item without file extension in qualified_path
         assert_eq!(
-            classify_tint(&make_node(SymbolKind::Item { label: "fn".into() }, "foo")),
+            crate::theme::node_box_tint(&make_node(SymbolKind::Item { label: "fn".into() }, "foo")),
             BoxTint::Normal
         );
         // File gets FileType tint based on extension
         assert_eq!(
-            classify_tint(&make_node(SymbolKind::File, "main.rs")),
+            crate::theme::node_box_tint(&make_node(SymbolKind::File, "main.rs")),
             BoxTint::FileType(crate::theme::extension_tint("rs"))
         );
         // Chunk without extension falls back to Normal
         assert_eq!(
-            classify_tint(&make_node(SymbolKind::Chunk, "chunk")),
+            crate::theme::node_box_tint(&make_node(SymbolKind::Chunk, "chunk")),
             BoxTint::Normal
         );
     }
