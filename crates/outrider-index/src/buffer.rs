@@ -9,6 +9,8 @@ use anyhow::Context;
 use ropey::Rope;
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::SourceLanguage;
+
 /// Handle to a tracked byte position (spec §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AnchorId(usize);
@@ -115,22 +117,40 @@ const TOML_HIGHLIGHTS: &str = r#"
 [(offset_date_time) (local_date_time) (local_date) (local_time)] @string.special
 "#;
 
+const HLSL_HIGHLIGHTS: &str = r##"
+(comment) @comment
+(string_literal) @string
+(char_literal) @string
+(number_literal) @number
+(type_identifier) @type
+(primitive_type) @type
+(field_identifier) @property
+(function_declarator declarator: (identifier) @function)
+(call_expression function: (identifier) @function)
+[
+ "cbuffer" "struct" "return" "if" "else" "for" "while" "switch"
+ "case" "break" "continue" "discard" "const" "static" "groupshared"
+] @keyword
+[(preproc_directive) "#define" "#include" "#if" "#ifdef" "#ifndef" "#endif"] @keyword
+"##;
+
 /// Construction, line/span access, minimap queries, and anchor management.
 impl FileBuffer {
     /// `ext` is the bare lowercase file extension (no dot). Known
     /// extensions parse and highlight; anything else is plain mode —
     /// no parse, every line's span list empty.
     pub fn new(text: String, ext: &str) -> anyhow::Result<Self> {
-        let lang: Option<(tree_sitter::Language, String)> = match ext {
-            "rs" => Some((
+        let lang: Option<(tree_sitter::Language, String)> = match SourceLanguage::for_extension(ext)
+        {
+            Some(SourceLanguage::Rust) => Some((
                 tree_sitter_rust::LANGUAGE.into(),
                 tree_sitter_rust::HIGHLIGHTS_QUERY.to_owned(),
             )),
-            "c" | "h" => Some((
+            Some(SourceLanguage::C) => Some((
                 tree_sitter_c::LANGUAGE.into(),
                 tree_sitter_c::HIGHLIGHT_QUERY.to_owned(),
             )),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some((
+            Some(SourceLanguage::Cpp) => Some((
                 tree_sitter_cpp::LANGUAGE.into(),
                 format!(
                     "{}\n{}",
@@ -138,33 +158,41 @@ impl FileBuffer {
                     tree_sitter_cpp::HIGHLIGHT_QUERY
                 ),
             )),
-            "md" => Some((
+            Some(SourceLanguage::Markdown) => Some((
                 tree_sitter_md::LANGUAGE.into(),
                 tree_sitter_md::HIGHLIGHT_QUERY_BLOCK.to_owned(),
             )),
-            "toml" => Some((
+            Some(SourceLanguage::Toml) => Some((
                 tree_sitter_toml_ng::LANGUAGE.into(),
                 TOML_HIGHLIGHTS.to_owned(),
             )),
-            "py" => Some((
+            Some(SourceLanguage::Python) => Some((
                 tree_sitter_python::LANGUAGE.into(),
                 tree_sitter_python::HIGHLIGHTS_QUERY.to_owned(),
             )),
-            "js" | "jsx" => Some((
+            Some(SourceLanguage::JavaScript) => Some((
                 tree_sitter_javascript::LANGUAGE.into(),
                 tree_sitter_javascript::HIGHLIGHT_QUERY.to_owned(),
             )),
-            "ts" => Some((
+            Some(SourceLanguage::TypeScript) => Some((
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
             )),
-            "tsx" => Some((
+            Some(SourceLanguage::Tsx) => Some((
                 tree_sitter_typescript::LANGUAGE_TSX.into(),
                 tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
             )),
-            "cs" => Some((
+            Some(SourceLanguage::CSharp) => Some((
                 tree_sitter_c_sharp::LANGUAGE.into(),
                 tree_sitter_c_sharp::HIGHLIGHTS_QUERY.to_owned(),
+            )),
+            Some(SourceLanguage::Glsl) => Some((
+                tree_sitter_glsl::LANGUAGE_GLSL.into(),
+                tree_sitter_glsl::HIGHLIGHTS_QUERY.to_owned(),
+            )),
+            Some(SourceLanguage::Hlsl) => Some((
+                tree_sitter_hlsl::LANGUAGE_HLSL.into(),
+                HLSL_HIGHLIGHTS.to_owned(),
             )),
             _ => None,
         };
@@ -477,6 +505,57 @@ mod tests {
                 "{ext} did not highlight a C++ comment: {comment_spans:?}"
             );
         }
+    }
+
+    #[test]
+    fn shader_extensions_enable_syntax_highlighting() {
+        let glsl = "#version 450\n// note\nvoid main() { float x = 1.0; }\n";
+        for ext in ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese"] {
+            let buf = FileBuffer::new(glsl.to_string(), ext).unwrap();
+            assert!(
+                buf.line(1)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Comment),
+                "{ext}"
+            );
+            assert!(
+                buf.line(2)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Function),
+                "{ext}"
+            );
+        }
+
+        let hlsl = "// note\ncbuffer Camera { float4x4 view; };\nfloat4 main() : SV_Target { return 1; }\n";
+        for ext in ["hlsl", "fx", "fxh"] {
+            let buf = FileBuffer::new(hlsl.to_string(), ext).unwrap();
+            assert!(
+                buf.line(0)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Comment),
+                "{ext}"
+            );
+            assert!(
+                buf.line(2)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Function),
+                "{ext}"
+            );
+        }
+        assert!(FileBuffer::new(glsl.to_string(), "vs")
+            .unwrap()
+            .line(1)
+            .unwrap()
+            .1
+            .is_empty());
     }
 
     #[test]

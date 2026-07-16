@@ -19,6 +19,11 @@ pub enum SourceLanguage {
 impl SourceLanguage {
     pub fn for_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        Self::for_extension(&ext)
+    }
+
+    pub fn for_extension(ext: &str) -> Option<Self> {
+        let ext = ext.to_ascii_lowercase();
         Some(match ext.as_str() {
             "rs" => Self::Rust,
             "c" | "h" => Self::C,
