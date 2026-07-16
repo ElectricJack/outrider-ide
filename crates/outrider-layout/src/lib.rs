@@ -4,5 +4,7 @@
 //! receive a `PackLayout` mapping every `SymbolId` to an absolute `Rect`.
 
 pub mod pack;
+mod skyline;
+mod zones;
 
 pub use pack::{pack, PackConfig, PackLayout, Rect};

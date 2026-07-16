@@ -1,11 +1,13 @@
-//! Shelf-pack algorithm: bottom-up sizing pass followed by a top-down
-//! absolute-position pass. Children are sorted by kind group and height
-//! (or by source order for prose / C-family files) then placed column-first
-//! toward a configurable aspect ratio, producing stable, deterministic layouts.
+//! Bottom-up sizing pass followed by a top-down absolute-position pass.
+//! Real folders skyline-pack semantic role blocks; other containers retain
+//! kind/height or source-ordered shelf placement. Layout stays deterministic.
 
 use std::collections::BTreeMap;
 
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
+
+use crate::skyline::{skyline_pack, SkylineLayout};
+use crate::zones::{build_profiles, effective_role, RoleProfiles, SemanticRole};
 
 /// An absolute world rectangle. World units are natural pixels: a leaf
 /// page at zoom 1.0 renders at exactly this size.
@@ -44,12 +46,13 @@ pub struct PackLayout {
     pub rects: BTreeMap<SymbolId, Rect>,
 }
 
-/// Shelf-pack the tree bottom-up (spec §3). Pure and deterministic; a
+/// Pack the tree bottom-up (spec §3). Pure and deterministic; a
 /// container's internal layout depends only on its own children's sizes,
 /// so an edit repacks only its ancestor chain (hierarchical stability).
 pub fn pack(tree: &SymbolTree, cfg: &PackConfig) -> PackLayout {
+    let profiles = build_profiles(&tree.root);
     let mut rel = BTreeMap::new();
-    size(&tree.root, cfg, &mut rel);
+    size(&tree.root, SemanticRole::Source, &profiles, cfg, &mut rel);
     let mut rects = BTreeMap::new();
     absolute(&tree.root, 0.0, 0.0, &rel, &mut rects);
     PackLayout { rects }
@@ -95,48 +98,58 @@ fn file_ext(qualified_path: &str) -> Option<&str> {
     file.rfind('.').map(|dot| &file[dot + 1..])
 }
 
-/// True if the plain file name (no path) has a documentation extension.
-fn name_is_doc(name: &str) -> bool {
-    name.rfind('.')
-        .is_some_and(|dot| is_doc_ext(&name[dot + 1..]))
-}
-
-/// (doc files, total files) under a folder, recursively. Symbol items
-/// inside files are not files and don't count.
-fn doc_stats(node: &SymbolNode) -> (u64, u64) {
-    let (mut doc, mut total) = (0, 0);
-    for c in &node.children {
-        match c.id.kind {
-            SymbolKind::File => {
-                total += 1;
-                doc += name_is_doc(&c.name) as u64;
-            }
-            SymbolKind::Folder => {
-                let (d, t) = doc_stats(c);
-                doc += d;
-                total += t;
-            }
-            _ => {}
-        }
-    }
-    (doc, total)
-}
-
-/// 1 if this folder child is documentation — a doc file, or a folder
-/// whose files are more than 70% doc — else 0. Doc children pack after
-/// source children so source never competes with docs purely by size.
-fn doc_rank(node: &SymbolNode) -> u8 {
-    match node.id.kind {
-        SymbolKind::File => name_is_doc(&node.name) as u8,
-        SymbolKind::Folder => {
-            let (doc, total) = doc_stats(node);
-            (doc * 10 > total * 7) as u8
-        }
-        _ => 0,
-    }
-}
-
 const TARGET_HEIGHT_FACTORS: [f64; 9] = [0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.5, 2.0, 3.0];
+
+struct FolderChild<'a> {
+    node: &'a SymbolNode,
+    size: (f64, f64),
+    role: SemanticRole,
+}
+
+struct FolderArrangement {
+    positions: Vec<(SymbolId, f64, f64)>,
+    bounds: (f64, f64),
+}
+
+fn arrange_folder(children: &mut [FolderChild<'_>], gap: f64, aspect: f64) -> FolderArrangement {
+    children.sort_by(|a, b| {
+        a.role
+            .cmp(&b.role)
+            .then(b.size.1.total_cmp(&a.size.1))
+            .then(a.node.name.as_bytes().cmp(b.node.name.as_bytes()))
+            .then(a.node.id.ordinal.cmp(&b.node.id.ordinal))
+    });
+
+    let mut groups: Vec<(SemanticRole, Vec<&FolderChild<'_>>, SkylineLayout)> = Vec::new();
+    for role in [
+        SemanticRole::Source,
+        SemanticRole::Test,
+        SemanticRole::Example,
+        SemanticRole::ShaderAsset,
+        SemanticRole::Docs,
+        SemanticRole::Generated,
+    ] {
+        let members: Vec<_> = children.iter().filter(|child| child.role == role).collect();
+        if !members.is_empty() {
+            let sizes: Vec<_> = members.iter().map(|child| child.size).collect();
+            let layout = skyline_pack(&sizes, gap, aspect);
+            groups.push((role, members, layout));
+        }
+    }
+
+    let block_sizes: Vec<_> = groups.iter().map(|(_, _, layout)| layout.bounds).collect();
+    let blocks = skyline_pack(&block_sizes, gap, aspect);
+    let mut positions = Vec::with_capacity(children.len());
+    for ((_, members, layout), (block_x, block_y)) in groups.iter().zip(blocks.positions) {
+        for ((child_x, child_y), child) in layout.positions.iter().zip(members) {
+            positions.push((child.node.id.clone(), block_x + child_x, block_y + child_y));
+        }
+    }
+    FolderArrangement {
+        positions,
+        bounds: blocks.bounds,
+    }
+}
 
 fn shelf_bounds(sizes: &[(f64, f64)], gap: f64, target_h: f64) -> (f64, f64) {
     let (mut x, mut y, mut col_w, mut content_h) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
@@ -185,11 +198,12 @@ fn choose_target_height(sizes: &[(f64, f64)], gap: f64, aspect: f64) -> f64 {
 }
 
 /// Bottom-up size pass: returns (w, h) and records each node's position
-/// relative to its parent's origin in `rel` (x, y, w, h). Children fill
-/// columns top-to-bottom, wrapping right toward a square aspect (spec §5).
-/// The root's relative position stays (0, 0).
+/// relative to its parent's origin in `rel` (x, y, w, h). The root's
+/// relative position stays (0, 0).
 fn size(
     node: &SymbolNode,
+    inherited_role: SemanticRole,
+    profiles: &RoleProfiles,
     cfg: &PackConfig,
     rel: &mut BTreeMap<SymbolId, (f64, f64, f64, f64)>,
 ) -> (f64, f64) {
@@ -198,12 +212,42 @@ fn size(
         rel.insert(node.id.clone(), (0.0, 0.0, cfg.page_w, h));
         return (cfg.page_w, h);
     }
-    // Re-derive the ordering invariant locally; never trust input Vec order.
-    let mut order: Vec<(&SymbolNode, (f64, f64), u8)> = node
+    let folder = matches!(node.id.kind, SymbolKind::Folder);
+    let measured: Vec<(&SymbolNode, (f64, f64), SemanticRole)> = node
         .children
         .iter()
-        .map(|c| (c, size(c, cfg, rel), doc_rank(c)))
+        .map(|child| {
+            let role = if folder {
+                effective_role(&child.id, inherited_role, profiles)
+            } else {
+                SemanticRole::Source
+            };
+            let dimensions = size(child, role, profiles, cfg, rel);
+            (child, dimensions, role)
+        })
         .collect();
+
+    if folder {
+        let mut children: Vec<_> = measured
+            .into_iter()
+            .map(|(node, size, role)| FolderChild { node, size, role })
+            .collect();
+        let arrangement = arrange_folder(&mut children, cfg.gap, cfg.aspect);
+        for (id, x, y) in &arrangement.positions {
+            let entry = rel.get_mut(id).expect("child sized above");
+            entry.0 = cfg.gap + x;
+            entry.1 = cfg.container_header + cfg.gap + y;
+        }
+        let wh = (
+            arrangement.bounds.0 + 2.0 * cfg.gap,
+            cfg.container_header + arrangement.bounds.1 + 2.0 * cfg.gap,
+        );
+        rel.insert(node.id.clone(), (0.0, 0.0, wh.0, wh.1));
+        return wh;
+    }
+
+    // Re-derive the ordering invariant locally; never trust input Vec order.
+    let mut order = measured;
     // Chunk children, and all descendants of source-ordered files (prose,
     // declare-before-use C/C++), pack in source order: reorganizing them
     // would break top-to-bottom reading.
@@ -217,14 +261,12 @@ fn size(
             ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
         });
     } else {
-        // Docs sink last; then kind groups (types → fns → classes →
-        // modules), tallest first within a group so greedy column fill
-        // becomes FFD; name then ordinal keep equal-height runs
-        // alphabetical/deterministic. Doc ranks were precomputed above —
-        // no tree walks inside the comparator.
-        order.sort_by(|(a, sa, da), (b, sb, db)| {
-            da.cmp(db)
-                .then(kind_rank(&a.id.kind).cmp(&kind_rank(&b.id.kind)))
+        // Kind groups (types → fns → classes → modules), tallest first within
+        // a group so greedy column fill becomes FFD; name then ordinal keep
+        // equal-height runs alphabetical and deterministic.
+        order.sort_by(|(a, sa, _), (b, sb, _)| {
+            kind_rank(&a.id.kind)
+                .cmp(&kind_rank(&b.id.kind))
                 .then(sb.1.total_cmp(&sa.1))
                 .then(a.name.as_bytes().cmp(b.name.as_bytes()))
                 .then(a.id.ordinal.cmp(&b.id.ordinal))
@@ -274,10 +316,13 @@ fn absolute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zones::{build_profiles, effective_role, SemanticRole};
     use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
+    const GEOMETRY_EPSILON: f64 = 1e-9;
+
     fn close(a: f64, b: f64) {
-        assert!((a - b).abs() < 1e-9, "{a} != {b}");
+        assert!((a - b).abs() < GEOMETRY_EPSILON, "{a} != {b}");
     }
 
     fn cfg() -> PackConfig {
@@ -367,6 +412,321 @@ mod tests {
         close(r.y, y);
         close(r.w, w);
         close(r.h, h);
+    }
+
+    fn folder(qp: &str, name: &str, children: Vec<SymbolNode>) -> SymbolNode {
+        n(SymbolKind::Folder, qp, name, 0, children)
+    }
+
+    fn file(qp: &str, measure: u64) -> SymbolNode {
+        let name = qp.rsplit('/').next().unwrap_or(qp);
+        n(SymbolKind::File, qp, name, measure, vec![])
+    }
+
+    fn screenshot_shaped_tree() -> SymbolTree {
+        let project = |qp: &str, name: &str, files: &[(&str, u64)]| {
+            folder(
+                qp,
+                name,
+                files
+                    .iter()
+                    .map(|(file_name, measure)| file(&format!("{qp}/{file_name}"), *measure))
+                    .collect(),
+            )
+        };
+        SymbolTree {
+            root: folder(
+                "",
+                "",
+                vec![
+                    folder(
+                        "engine",
+                        "engine",
+                        vec![
+                            project(
+                                "engine/core",
+                                "core",
+                                &[("world.rs", 170), ("entity.rs", 95), ("math.rs", 44)],
+                            ),
+                            project(
+                                "engine/render",
+                                "render",
+                                &[("renderer.rs", 130), ("camera.rs", 35), ("mesh.rs", 18)],
+                            ),
+                            project("engine/io", "io", &[("scene.rs", 70), ("asset.rs", 28)]),
+                        ],
+                    ),
+                    project(
+                        "editor",
+                        "editor",
+                        &[("workspace.rs", 74), ("panel.rs", 38), ("command.rs", 16)],
+                    ),
+                    project("tests", "tests", &[("layout_test.rs", 18), ("smoke.rs", 4)]),
+                    project("examples", "examples", &[("demo.rs", 14)]),
+                    project(
+                        "assets",
+                        "assets",
+                        &[("lighting.frag", 11), ("icon.png", 2)],
+                    ),
+                    project("docs", "docs", &[("guide.md", 16)]),
+                    project("vendor", "vendor", &[("shim.rs", 12)]),
+                    project("tools", "tools", &[("xtask.rs", 10)]),
+                    project("samples", "samples", &[("hello.rs", 7)]),
+                    project("generated", "generated", &[("bindings.rs", 6)]),
+                ],
+            ),
+            repo_root: "/x".into(),
+        }
+    }
+
+    fn assert_tree_geometry(node: &SymbolNode, packed: &PackLayout, config: &PackConfig) {
+        let parent = packed.rects[&node.id];
+        assert!(
+            [parent.x, parent.y, parent.w, parent.h]
+                .into_iter()
+                .all(f64::is_finite),
+            "{} has a non-finite rectangle",
+            node.id.qualified_path
+        );
+        if node.children.is_empty() {
+            return;
+        }
+        let content_left = parent.x + config.gap;
+        let content_top = parent.y + config.container_header + config.gap;
+        let content_right = parent.x + parent.w - config.gap;
+        let content_bottom = parent.y + parent.h - config.gap;
+        for child in &node.children {
+            let child_rect = packed.rects[&child.id];
+            assert!(
+                child_rect.x + GEOMETRY_EPSILON >= content_left
+                    && child_rect.y + GEOMETRY_EPSILON >= content_top
+                    && child_rect.x + child_rect.w <= content_right + GEOMETRY_EPSILON
+                    && child_rect.y + child_rect.h <= content_bottom + GEOMETRY_EPSILON,
+                "{} {child_rect:?} lies outside {}'s {parent:?} content region ({content_left}, {content_top})-({content_right}, {content_bottom})",
+                child.id.qualified_path,
+                node.id.qualified_path
+            );
+        }
+        for (index, left) in node.children.iter().enumerate() {
+            let left_rect = packed.rects[&left.id];
+            for right in node.children.iter().skip(index + 1) {
+                let right_rect = packed.rects[&right.id];
+                let separated = left_rect.x + left_rect.w + config.gap
+                    <= right_rect.x + GEOMETRY_EPSILON
+                    || right_rect.x + right_rect.w + config.gap <= left_rect.x + GEOMETRY_EPSILON
+                    || left_rect.y + left_rect.h + config.gap <= right_rect.y + GEOMETRY_EPSILON
+                    || right_rect.y + right_rect.h + config.gap <= left_rect.y + GEOMETRY_EPSILON;
+                assert!(
+                    separated,
+                    "{} overlaps {} inside {}",
+                    left.id.qualified_path, right.id.qualified_path, node.id.qualified_path
+                );
+            }
+        }
+        for child in &node.children {
+            assert_tree_geometry(child, packed, config);
+        }
+    }
+
+    fn node_count(node: &SymbolNode) -> usize {
+        1 + node.children.iter().map(node_count).sum::<usize>()
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite")]
+    fn geometry_validation_rejects_non_finite_leaf_rectangles() {
+        let tree = SymbolTree {
+            root: file("only.rs", 1),
+            repo_root: "/x".into(),
+        };
+        let config = cfg();
+        let mut packed = pack(&tree, &config);
+        packed.rects.get_mut(&tree.root.id).unwrap().w = f64::INFINITY;
+
+        assert_tree_geometry(&tree.root, &packed, &config);
+    }
+
+    #[test]
+    fn screenshot_shaped_folder_tree_is_denser_than_shelves_and_valid() {
+        let tree = screenshot_shaped_tree();
+        let config = cfg();
+        let packed = pack(&tree, &config);
+        let root = rect(&packed, "");
+        let skyline_content = (
+            root.w - 2.0 * config.gap,
+            root.h - config.container_header - 2.0 * config.gap,
+        );
+        let mut child_sizes: Vec<_> = tree
+            .root
+            .children
+            .iter()
+            .map(|child| {
+                let child_rect = packed.rects[&child.id];
+                (child.name.as_str(), (child_rect.w, child_rect.h))
+            })
+            .collect();
+        child_sizes.sort_by(|(left_name, left), (right_name, right)| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then(left_name.as_bytes().cmp(right_name.as_bytes()))
+        });
+        let child_sizes: Vec<_> = child_sizes.into_iter().map(|(_, size)| size).collect();
+        let shelf_target = choose_target_height(&child_sizes, config.gap, config.aspect);
+        let shelf_content = shelf_bounds(&child_sizes, config.gap, shelf_target);
+
+        assert!(
+            aspect_envelope_area(skyline_content, config.aspect)
+                < aspect_envelope_area(shelf_content, config.aspect),
+            "skyline {skyline_content:?} must beat shelves {shelf_content:?}"
+        );
+        assert_tree_geometry(&tree.root, &packed, &config);
+        assert_eq!(packed.rects.len(), node_count(&tree.root));
+    }
+
+    #[test]
+    fn large_role_varied_folder_packs_with_valid_geometry() {
+        let children = (0..540)
+            .map(|index| {
+                let role_index = index % 6;
+                let sequence = index / 6;
+                let name = match role_index {
+                    0 => format!("ordinary_{sequence}.rs"),
+                    1 => format!("case_{sequence}_test.rs"),
+                    2 => format!("demo_{sequence}.rs"),
+                    3 => format!("material_{sequence}.frag"),
+                    4 => format!("guide_{sequence}.md"),
+                    5 => format!("generated_{sequence}.rs"),
+                    _ => unreachable!(),
+                };
+                file(&format!("large/{name}"), 1 + ((index * 37) % 200) as u64)
+            })
+            .collect();
+        let tree = SymbolTree {
+            root: folder("large", "large", children),
+            repo_root: "/x".into(),
+        };
+        let config = cfg();
+
+        let packed = pack(&tree, &config);
+
+        assert_eq!(packed.rects.len(), 541);
+        assert_tree_geometry(&tree.root, &packed, &config);
+    }
+
+    #[test]
+    fn folder_semantic_zones_preserve_hierarchy_and_do_not_interleave() {
+        let examples = n(
+            SymbolKind::Folder,
+            "examples",
+            "examples",
+            0,
+            vec![n(
+                SymbolKind::File,
+                "examples/demo.rs",
+                "demo.rs",
+                8,
+                vec![],
+            )],
+        );
+        let tree = SymbolTree {
+            root: n(
+                SymbolKind::Folder,
+                "",
+                "",
+                0,
+                vec![
+                    n(SymbolKind::File, "src/tall.rs", "tall.rs", 120, vec![]),
+                    n(SymbolKind::File, "src/small.rs", "small.rs", 4, vec![]),
+                    n(
+                        SymbolKind::File,
+                        "tests/large_test.rs",
+                        "large_test.rs",
+                        90,
+                        vec![],
+                    ),
+                    n(
+                        SymbolKind::File,
+                        "tests/tiny_test.rs",
+                        "tiny_test.rs",
+                        1,
+                        vec![],
+                    ),
+                    examples,
+                    n(
+                        SymbolKind::File,
+                        "assets/lighting.frag",
+                        "lighting.frag",
+                        12,
+                        vec![],
+                    ),
+                    n(SymbolKind::File, "README.md", "README.md", 40, vec![]),
+                ],
+            ),
+            repo_root: "/x".into(),
+        };
+
+        fn collect_ids(node: &SymbolNode, ids: &mut std::collections::BTreeSet<SymbolId>) {
+            ids.insert(node.id.clone());
+            for child in &node.children {
+                collect_ids(child, ids);
+            }
+        }
+
+        let packed = pack(&tree, &cfg());
+        let mut input_ids = std::collections::BTreeSet::new();
+        collect_ids(&tree.root, &mut input_ids);
+        assert_eq!(
+            packed
+                .rects
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            input_ids
+        );
+
+        let profiles = build_profiles(&tree.root);
+        let mut role_bounds = BTreeMap::<SemanticRole, Rect>::new();
+        for child in &tree.root.children {
+            let role = effective_role(&child.id, SemanticRole::Source, &profiles);
+            let child_rect = packed.rects[&child.id];
+            role_bounds
+                .entry(role)
+                .and_modify(|bounds| {
+                    let min_x = bounds.x.min(child_rect.x);
+                    let min_y = bounds.y.min(child_rect.y);
+                    let max_x = (bounds.x + bounds.w).max(child_rect.x + child_rect.w);
+                    let max_y = (bounds.y + bounds.h).max(child_rect.y + child_rect.h);
+                    bounds.x = min_x;
+                    bounds.y = min_y;
+                    bounds.w = max_x - min_x;
+                    bounds.h = max_y - min_y;
+                })
+                .or_insert(child_rect);
+        }
+
+        let test_bounds = role_bounds[&SemanticRole::Test];
+        for path in ["tests/large_test.rs", "tests/tiny_test.rs"] {
+            let child = rect(&packed, path);
+            assert!(
+                child.x >= test_bounds.x
+                    && child.y >= test_bounds.y
+                    && child.x + child.w <= test_bounds.x + test_bounds.w
+                    && child.y + child.h <= test_bounds.y + test_bounds.h,
+                "{path} must remain inside the test role block"
+            );
+        }
+
+        let bounds: Vec<_> = role_bounds.into_iter().collect();
+        for (index, (left_role, left)) in bounds.iter().enumerate() {
+            for (right_role, right) in bounds.iter().skip(index + 1) {
+                let separated = left.x + left.w <= right.x
+                    || right.x + right.w <= left.x
+                    || left.y + left.h <= right.y
+                    || right.y + right.h <= left.y;
+                assert!(separated, "{left_role:?} and {right_role:?} interleave");
+            }
+        }
     }
 
     #[test]
@@ -675,49 +1035,9 @@ mod tests {
     }
 
     #[test]
-    fn doc_rank_files_by_name_folders_by_recursive_share() {
-        let f = |name: &str| n(SymbolKind::File, name, name, 1, vec![]);
-        assert_eq!(doc_rank(&f("README.md")), 1);
-        assert_eq!(doc_rank(&f("main.rs")), 0);
-        // 3 of 4 files doc (75% > 70%) — doc, counted through a subfolder
-        let d75 = n(
-            SymbolKind::Folder,
-            "d",
-            "d",
-            0,
-            vec![
-                n(
-                    SymbolKind::Folder,
-                    "d/sub",
-                    "sub",
-                    0,
-                    vec![f("a.md"), f("b.md")],
-                ),
-                f("c.md"),
-                f("x.rs"),
-            ],
-        );
-        assert_eq!(doc_rank(&d75), 1);
-        // 1 of 2 (50%, not > 70%) — not doc
-        let mixed = n(SymbolKind::Folder, "m", "m", 0, vec![f("a.md"), f("x.rs")]);
-        assert_eq!(doc_rank(&mixed), 0);
-        // empty folder — not doc
-        assert_eq!(doc_rank(&n(SymbolKind::Folder, "e", "e", 0, vec![])), 0);
-        // non-file/folder kinds never rank
-        let it = n(
-            SymbolKind::Item { label: "fn".into() },
-            "a.md::x",
-            "x",
-            1,
-            vec![],
-        );
-        assert_eq!(doc_rank(&it), 0);
-    }
-
-    #[test]
-    fn c_file_children_pack_in_source_order_not_kind_or_size() {
+    fn folder_skyline_does_not_change_cpp_file_layout() {
         // Scrambled: the tall struct is declared LAST. Kind/size order would
-        // place it first (rank 0, tallest); a .c file must keep byte order.
+        // place it first (rank 0, tallest); a .cpp file must keep byte order.
         let item = |label: &str, qp: &str, name: &str, measure: u64, start: usize| {
             let mut it = n(
                 SymbolKind::Item {
@@ -733,13 +1053,13 @@ mod tests {
         };
         let mut file = n(
             SymbolKind::File,
-            "src/m.c",
-            "m.c",
+            "src/m.cpp",
+            "m.cpp",
             60,
             vec![
-                item("struct", "src/m.c::S", "S", 50, 200),
-                item("fn", "src/m.c::zebra", "zebra", 2, 0),
-                item("fn", "src/m.c::mid", "mid", 5, 100),
+                item("struct", "src/m.cpp::S", "S", 50, 200),
+                item("fn", "src/m.cpp::zebra", "zebra", 2, 0),
+                item("fn", "src/m.cpp::mid", "mid", 5, 100),
             ],
         );
         file.byte_range = Some(0..300);
@@ -748,14 +1068,23 @@ mod tests {
             repo_root: "/x".into(),
         };
         let p = pack(&tree, &cfg());
-        let z = rect(&p, "src/m.c::zebra"); // byte 0
-        let m = rect(&p, "src/m.c::mid"); // byte 100
-        let s = rect(&p, "src/m.c::S"); // byte 200
-                                        // zebra and mid stack in the first column in byte order; the struct —
-                                        // which kind/size order would have placed first — packs last (wraps)
+        let file = rect(&p, "src/m.cpp");
+        let z = rect(&p, "src/m.cpp::zebra"); // byte 0
+        let m = rect(&p, "src/m.cpp::mid"); // byte 100
+        let s = rect(&p, "src/m.cpp::S"); // byte 200
+                                          // zebra and mid stack in the first column in byte order; the struct —
+                                          // which kind/size order would have placed first — packs last (wraps)
         close(z.x, m.x);
         assert!(z.y < m.y, "zebra(0) above mid(100)");
         assert!(s.x > m.x, "S(200) last despite kind rank 0 and max height");
+        assert_eq!(
+            [
+                (z.x - file.x, z.y - file.y),
+                (m.x - file.x, m.y - file.y),
+                (s.x - file.x, s.y - file.y),
+            ],
+            [(8.0, 60.0), (8.0, 141.6), (656.0, 60.0)]
+        );
     }
 
     #[test]
@@ -797,75 +1126,6 @@ mod tests {
         assert!(
             zz.x < aa.x || (zz.x == aa.x && zz.y < aa.y),
             "zz(0) before aa(100)"
-        );
-    }
-
-    #[test]
-    fn doc_file_sinks_below_source_in_folder() {
-        // README.md is far taller; size order would place it first, but doc
-        // rank sinks it below the source file.
-        let tree = SymbolTree {
-            root: n(
-                SymbolKind::Folder,
-                "",
-                "",
-                0,
-                vec![
-                    n(SymbolKind::File, "README.md", "README.md", 500, vec![]),
-                    n(SymbolKind::File, "main.rs", "main.rs", 5, vec![]),
-                ],
-            ),
-            repo_root: "/x".into(),
-        };
-        let p = pack(&tree, &cfg());
-        let (r, m) = (rect(&p, "README.md"), rect(&p, "main.rs"));
-        // main.rs first: top-left of the content area
-        close(m.x, 8.0);
-        close(m.y, 60.0);
-        // README wraps to the second column
-        close(r.x, 656.0);
-        close(r.y, 60.0);
-    }
-
-    #[test]
-    fn folder_doc_share_over_70_percent_sinks() {
-        let f = |qp: &str, name: &str| n(SymbolKind::File, qp, name, 1, vec![]);
-        // "a_docs" (3/4 doc, recursive through sub) sinks after "mixed"
-        // (1/2 doc, not doc) even though a_docs wins BOTH fallback keys:
-        // it is taller (more children) and alphabetically first.
-        let docs = n(
-            SymbolKind::Folder,
-            "a_docs",
-            "a_docs",
-            0,
-            vec![
-                n(
-                    SymbolKind::Folder,
-                    "a_docs/sub",
-                    "sub",
-                    0,
-                    vec![f("a_docs/sub/a.md", "a.md"), f("a_docs/sub/b.md", "b.md")],
-                ),
-                f("a_docs/c.md", "c.md"),
-                f("a_docs/x.rs", "x.rs"),
-            ],
-        );
-        let mixed = n(
-            SymbolKind::Folder,
-            "mixed",
-            "mixed",
-            0,
-            vec![f("mixed/a.md", "a.md"), f("mixed/x.rs", "x.rs")],
-        );
-        let tree = SymbolTree {
-            root: n(SymbolKind::Folder, "", "", 0, vec![docs, mixed]),
-            repo_root: "/x".into(),
-        };
-        let p = pack(&tree, &cfg());
-        let (d, m) = (rect(&p, "a_docs"), rect(&p, "mixed"));
-        assert!(
-            m.x < d.x || (m.x == d.x && m.y < d.y),
-            "mixed before a_docs"
         );
     }
 }
