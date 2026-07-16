@@ -478,10 +478,17 @@ mod tests {
     }
 
     fn assert_tree_geometry(node: &SymbolNode, packed: &PackLayout, config: &PackConfig) {
+        let parent = packed.rects[&node.id];
+        assert!(
+            [parent.x, parent.y, parent.w, parent.h]
+                .into_iter()
+                .all(f64::is_finite),
+            "{} has a non-finite rectangle",
+            node.id.qualified_path
+        );
         if node.children.is_empty() {
             return;
         }
-        let parent = packed.rects[&node.id];
         let content_left = parent.x + config.gap;
         let content_top = parent.y + config.container_header + config.gap;
         let content_right = parent.x + parent.w - config.gap;
@@ -520,6 +527,20 @@ mod tests {
 
     fn node_count(node: &SymbolNode) -> usize {
         1 + node.children.iter().map(node_count).sum::<usize>()
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite")]
+    fn geometry_validation_rejects_non_finite_leaf_rectangles() {
+        let tree = SymbolTree {
+            root: file("only.rs", 1),
+            repo_root: "/x".into(),
+        };
+        let config = cfg();
+        let mut packed = pack(&tree, &config);
+        packed.rects.get_mut(&tree.root.id).unwrap().w = f64::INFINITY;
+
+        assert_tree_geometry(&tree.root, &packed, &config);
     }
 
     #[test]
