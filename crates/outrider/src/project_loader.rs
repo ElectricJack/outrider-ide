@@ -192,6 +192,61 @@ impl Default for ProjectLoader {
     }
 }
 
+use outrider_index::scan::PreScanResult;
+
+pub enum PreScanPoll {
+    Idle,
+    Scanning,
+    Ready(Result<PreScanResult, String>),
+}
+
+pub struct PreScanner {
+    result: Option<Receiver<Result<PreScanResult, String>>>,
+}
+
+impl PreScanner {
+    pub fn new() -> Self {
+        Self { result: None }
+    }
+
+    pub fn start(&mut self, repo_root: PathBuf) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let res = outrider_index::scan::pre_scan(&repo_root)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+        self.result = Some(rx);
+    }
+
+    pub fn poll(&mut self) -> PreScanPoll {
+        let Some(rx) = &self.result else {
+            return PreScanPoll::Idle;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.result = None;
+                PreScanPoll::Ready(result)
+            }
+            Err(TryRecvError::Empty) => PreScanPoll::Scanning,
+            Err(TryRecvError::Disconnected) => {
+                self.result = None;
+                PreScanPoll::Ready(Err("pre-scan worker disconnected".into()))
+            }
+        }
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.result.is_some()
+    }
+}
+
+impl Default for PreScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 fn load_project(
     project_root: &Path,
@@ -231,7 +286,7 @@ fn load_project_cancellable(
     cancellation.checkpoint()?;
     let tree = outcome.tree;
     cancellation.checkpoint()?;
-    let layout = outrider_layout::pack(&tree, &crate::world::pack_config());
+    let layout = outrider_layout::pack(&tree, &crate::world::pack_config(settings.node_padding));
     cancellation.checkpoint()?;
     let result = LoadResult {
         generation,

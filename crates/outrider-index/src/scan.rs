@@ -343,6 +343,109 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+/// Per-extension or per-folder aggregate stats from a pre-scan.
+#[derive(Debug, Clone, Default)]
+pub struct ExtensionStats {
+    pub count: usize,
+    pub bytes: u64,
+}
+
+/// Result of a lightweight pre-scan: extension and folder stats without reading content.
+#[derive(Debug, Clone)]
+pub struct PreScanResult {
+    pub extensions: BTreeMap<String, ExtensionStats>,
+    /// Folder stats keyed by full relative path (e.g. `"src"`, `"src/lib"`,
+    /// `"src/lib/utils"`). Stats are recursive — a parent includes all
+    /// descendant files.
+    pub folders: BTreeMap<String, ExtensionStats>,
+    /// Top-level directory names that exist on disk but were excluded by
+    /// gitignore or hidden-file rules (e.g. `"node_modules"`, `"target"`).
+    pub gitignored_folders: Vec<String>,
+    pub total_files: usize,
+    pub total_bytes: u64,
+}
+
+/// Lightweight pre-scan: walks the repo honoring .gitignore, collects file
+/// extension counts/bytes and folder counts/bytes at every depth via
+/// `fs::metadata`. No file content is read.
+pub fn pre_scan(repo_root: &Path) -> anyhow::Result<PreScanResult> {
+    let mut extensions: BTreeMap<String, ExtensionStats> = BTreeMap::new();
+    let mut folders: BTreeMap<String, ExtensionStats> = BTreeMap::new();
+    let mut total_files: usize = 0;
+    let mut total_bytes: u64 = 0;
+
+    let walker = WalkBuilder::new(repo_root).require_git(false).build();
+    for entry in walker {
+        let entry = entry?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if entry.path().extension().is_some_and(|e| e == "lock") {
+            continue;
+        }
+        let file_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+
+        let ext = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let ext_stats = extensions.entry(ext).or_default();
+        ext_stats.count += 1;
+        ext_stats.bytes += file_bytes;
+
+        if let Ok(rel) = entry.path().strip_prefix(repo_root) {
+            let comps: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            if comps.len() > 1 {
+                let mut path = String::new();
+                for comp in &comps[..comps.len() - 1] {
+                    if !path.is_empty() {
+                        path.push('/');
+                    }
+                    path.push_str(comp);
+                    let folder_stats = folders.entry(path.clone()).or_default();
+                    folder_stats.count += 1;
+                    folder_stats.bytes += file_bytes;
+                }
+            }
+        }
+
+        total_files += 1;
+        total_bytes += file_bytes;
+    }
+
+    let mut gitignored_folders = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(repo_root) {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if !folders.contains_key(&name) {
+                gitignored_folders.push(name);
+            }
+        }
+        gitignored_folders.sort();
+    }
+
+    Ok(PreScanResult {
+        extensions,
+        folders,
+        gitignored_folders,
+        total_files,
+        total_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

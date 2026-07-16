@@ -21,6 +21,7 @@ actions!(
         OpenFolder,
         ClearDiskCache,
         ToggleSettings,
+        ToggleProjectSettings,
         OpenFilePalette,
         OpenSymbolPalette,
         RevealInFileManager,
@@ -42,7 +43,8 @@ use crate::paint_model::{
     NameRow, PaintItem, TexQuad,
 };
 use crate::palette;
-use crate::project_loader::{LoadProgress, LoadResult, LoaderPoll, ProjectLoader};
+use crate::project_loader::{LoadProgress, LoadResult, LoaderPoll, PreScanPoll, PreScanner, ProjectLoader};
+use crate::project_settings::{self, ExtensionCategory, ProjectSettings};
 use crate::rasterize::{self, TextureCache};
 use crate::settings;
 use crate::theme;
@@ -60,6 +62,7 @@ enum SettingsField {
     Folders,
     CacheMb,
     DiskCacheGb,
+    NodePadding,
 }
 
 struct SettingsDraft {
@@ -67,6 +70,7 @@ struct SettingsDraft {
     filter_folders: String,
     cache_mb: String,
     disk_cache_gb: String,
+    node_padding: String,
     notification: Option<String>,
     active: SettingsField,
 }
@@ -78,6 +82,7 @@ impl SettingsDraft {
             filter_folders: s.filter_folders.join(", "),
             cache_mb: s.cache_mb.to_string(),
             disk_cache_gb: format_gibibytes(s.disk_cache_bytes(project)),
+            node_padding: s.node_padding.to_string(),
             notification: None,
             active: SettingsField::Extensions,
         }
@@ -89,6 +94,7 @@ impl SettingsDraft {
             SettingsField::Folders => &mut self.filter_folders,
             SettingsField::CacheMb => &mut self.cache_mb,
             SettingsField::DiskCacheGb => &mut self.disk_cache_gb,
+            SettingsField::NodePadding => &mut self.node_padding,
         }
     }
 
@@ -114,12 +120,277 @@ impl SettingsDraft {
             ));
         }
         let disk_cache_bytes = parse_gibibytes(&self.disk_cache_gb)?;
+        let node_padding = self
+            .node_padding
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| "Node padding must be a number".to_string())?;
+        if !(0.0..=64.0).contains(&node_padding) {
+            return Err("Node padding must be between 0 and 64".to_string());
+        }
         settings.filter_extensions = parse_list(&self.filter_extensions);
         settings.filter_folders = parse_list(&self.filter_folders);
         settings.show_welcome = false;
         settings.cache_mb = cache_mb;
+        settings.node_padding = node_padding;
         settings.set_disk_cache_bytes(project, disk_cache_bytes);
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SetupPanel {
+    Extensions,
+    Folders,
+}
+
+struct ProjectSetupDraft {
+    pre_scan: outrider_index::scan::PreScanResult,
+    extension_enabled: BTreeMap<String, bool>,
+    folder_enabled: BTreeMap<String, bool>,
+    folder_expanded: BTreeMap<String, bool>,
+    gitignored_set: std::collections::HashSet<String>,
+    category_expanded: BTreeMap<ExtensionCategory, bool>,
+    filtered_files: usize,
+    filtered_bytes: u64,
+    active_panel: SetupPanel,
+    ext_cursor: usize,
+    folder_cursor: usize,
+}
+
+impl ProjectSetupDraft {
+    fn from_pre_scan(
+        pre_scan: outrider_index::scan::PreScanResult,
+        existing: Option<&ProjectSettings>,
+    ) -> Self {
+        let mut extension_enabled = BTreeMap::new();
+        for ext in pre_scan.extensions.keys() {
+            let enabled = if let Some(ps) = existing {
+                !ps.filter_extensions.iter().any(|f| f.eq_ignore_ascii_case(ext))
+            } else {
+                project_settings::categorize_extension(ext).default_enabled()
+            };
+            extension_enabled.insert(ext.clone(), enabled);
+        }
+
+        let default_excluded: &[&str] = &[
+            "target", "node_modules", "dist", "build", "__pycache__",
+            ".next", ".nuxt", "out", "pkg", "vendor",
+        ];
+
+        let mut folder_enabled = BTreeMap::new();
+        for folder in pre_scan.folders.keys() {
+            let enabled = if let Some(ps) = existing {
+                !ps.filter_folders.iter().any(|f| f == folder)
+            } else {
+                let first = folder.split('/').next().unwrap_or(folder);
+                !default_excluded.iter().any(|d| d.eq_ignore_ascii_case(first))
+            };
+            folder_enabled.insert(folder.clone(), enabled);
+        }
+
+        let mut gitignored_set = std::collections::HashSet::new();
+        for name in &pre_scan.gitignored_folders {
+            folder_enabled.insert(name.clone(), false);
+            gitignored_set.insert(name.clone());
+        }
+
+        let mut draft = Self {
+            pre_scan,
+            extension_enabled,
+            folder_enabled,
+            folder_expanded: BTreeMap::new(),
+            gitignored_set,
+            category_expanded: BTreeMap::new(),
+            filtered_files: 0,
+            filtered_bytes: 0,
+            active_panel: SetupPanel::Extensions,
+            ext_cursor: 0,
+            folder_cursor: 0,
+        };
+        draft.recompute_stats();
+        draft
+    }
+
+    fn recompute_stats(&mut self) {
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        for (ext, stats) in &self.pre_scan.extensions {
+            if self.extension_enabled.get(ext).copied().unwrap_or(true) {
+                files += stats.count;
+                bytes += stats.bytes;
+            }
+        }
+        // Collect disabled folder paths, then only subtract top-level
+        // (non-nested) disabled paths so child counts aren't double-subtracted.
+        let disabled: Vec<&String> = self
+            .folder_enabled
+            .iter()
+            .filter(|(_, &v)| !v)
+            .map(|(k, _)| k)
+            .collect();
+        for folder in &disabled {
+            let is_child_of_disabled = disabled.iter().any(|parent| {
+                *parent != *folder && folder.starts_with(parent.as_str()) && folder.as_bytes().get(parent.len()) == Some(&b'/')
+            });
+            if is_child_of_disabled {
+                continue;
+            }
+            if let Some(stats) = self.pre_scan.folders.get(*folder) {
+                files = files.saturating_sub(stats.count);
+                bytes = bytes.saturating_sub(stats.bytes);
+            }
+        }
+        self.filtered_files = files;
+        self.filtered_bytes = bytes;
+    }
+
+    fn to_project_settings(&self) -> ProjectSettings {
+        let filter_extensions: Vec<String> = self
+            .extension_enabled
+            .iter()
+            .filter(|(_, &v)| !v)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let filter_folders: Vec<String> = self
+            .folder_enabled
+            .iter()
+            .filter(|(_, &v)| !v)
+            .map(|(k, _)| k.clone())
+            .collect();
+        ProjectSettings {
+            filter_extensions,
+            filter_folders,
+        }
+    }
+
+    fn sorted_categories(&self) -> Vec<(ExtensionCategory, Vec<(&String, &outrider_index::scan::ExtensionStats)>)> {
+        let mut by_cat: BTreeMap<ExtensionCategory, Vec<(&String, &outrider_index::scan::ExtensionStats)>> =
+            BTreeMap::new();
+        for (ext, stats) in &self.pre_scan.extensions {
+            let cat = project_settings::categorize_extension(ext);
+            by_cat.entry(cat).or_default().push((ext, stats));
+        }
+        let mut cats: Vec<_> = by_cat.into_iter().collect();
+        cats.sort_by_key(|(cat, _)| cat.sort_order());
+        cats
+    }
+
+    fn is_category_all_enabled(&self, exts: &[(&String, &outrider_index::scan::ExtensionStats)]) -> bool {
+        exts.iter().all(|(ext, _)| self.extension_enabled.get(*ext).copied().unwrap_or(true))
+    }
+
+    fn flat_ext_count(&self) -> usize {
+        let categories = self.sorted_categories();
+        let mut count = 0;
+        for (cat, exts) in &categories {
+            count += 1;
+            if self.category_expanded.get(cat).copied().unwrap_or(false) {
+                count += exts.len();
+            }
+        }
+        count
+    }
+
+    fn toggle_ext_at_cursor(&mut self) {
+        let categories = self.sorted_categories();
+        let mut idx = 0usize;
+        for (cat, exts) in &categories {
+            if idx == self.ext_cursor {
+                let all_on = self.is_category_all_enabled(&exts);
+                let keys: Vec<String> = exts.iter().map(|(e, _)| (*e).clone()).collect();
+                for ext in keys {
+                    self.extension_enabled.insert(ext, !all_on);
+                }
+                return;
+            }
+            idx += 1;
+            if self.category_expanded.get(cat).copied().unwrap_or(false) {
+                for (ext, _) in exts {
+                    if idx == self.ext_cursor {
+                        let key = (*ext).clone();
+                        let v = self.extension_enabled.get(&key).copied().unwrap_or(true);
+                        self.extension_enabled.insert(key, !v);
+                        return;
+                    }
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    fn toggle_folder_recursive(&mut self, path: &str, new_val: bool) {
+        self.folder_enabled.insert(path.to_string(), new_val);
+        let prefix = format!("{path}/");
+        let children: Vec<String> = self
+            .folder_enabled
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for child in children {
+            self.folder_enabled.insert(child, new_val);
+        }
+    }
+
+    /// Direct children of `prefix` in the folder tree. Returns (name, full_path)
+    /// sorted by bytes descending.
+    fn folder_children(&self, prefix: &str) -> Vec<(String, String)> {
+        let mut children: BTreeMap<String, String> = BTreeMap::new();
+        for path in self.pre_scan.folders.keys() {
+            let child_name = if prefix.is_empty() {
+                if !path.contains('/') {
+                    Some(path.as_str())
+                } else {
+                    None
+                }
+            } else if let Some(rest) = path.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) {
+                if !rest.contains('/') {
+                    Some(rest)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(name) = child_name {
+                children.insert(name.to_string(), path.clone());
+            }
+        }
+        // Also include gitignored folders at root level
+        if prefix.is_empty() {
+            for name in &self.pre_scan.gitignored_folders {
+                children.entry(name.clone()).or_insert_with(|| name.clone());
+            }
+        }
+        let mut result: Vec<_> = children.into_iter().collect();
+        result.sort_by(|a, b| {
+            let a_bytes = self.pre_scan.folders.get(&a.1).map(|s| s.bytes).unwrap_or(0);
+            let b_bytes = self.pre_scan.folders.get(&b.1).map(|s| s.bytes).unwrap_or(0);
+            b_bytes.cmp(&a_bytes)
+        });
+        result
+    }
+
+    fn folder_has_children(&self, path: &str) -> bool {
+        let prefix = format!("{path}/");
+        self.pre_scan.folders.keys().any(|k| k.starts_with(&prefix))
+    }
+
+    /// Build the flat visible folder list for cursor navigation.
+    fn visible_folder_paths(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        self.collect_visible_folders("", &mut result);
+        result
+    }
+
+    fn collect_visible_folders(&self, prefix: &str, out: &mut Vec<String>) {
+        for (_, full_path) in self.folder_children(prefix) {
+            out.push(full_path.clone());
+            if self.folder_expanded.get(&full_path).copied().unwrap_or(false) {
+                self.collect_visible_folders(&full_path, out);
+            }
+        }
     }
 }
 
@@ -217,8 +488,10 @@ pub struct TreemapView {
     nav_history: NavigationHistory,
     /// Search palette (Ctrl+P = file mode, Ctrl+T = symbol mode).
     palette: palette::Palette,
-    /// Persisted user preferences.
+    /// Persisted user preferences (effective = global merged with project).
     settings: settings::Settings,
+    /// Unmodified global settings for the Settings window (Cmd+,).
+    global_settings: settings::Settings,
     /// Whether to show the welcome overlay this session.
     show_welcome: bool,
     /// Working copy of settings while the settings panel is open.
@@ -238,6 +511,10 @@ pub struct TreemapView {
     /// Background indexing controller (Open Folder, startup, or re-index).
     loader: ProjectLoader,
     load_progress: Option<LoadProgress>,
+    /// Lightweight pre-scan for the project setup screen.
+    pre_scanner: PreScanner,
+    /// Working copy of the project setup screen while open.
+    project_setup: Option<ProjectSetupDraft>,
 }
 
 struct RenameState {
@@ -278,6 +555,7 @@ fn group_edges(edges: Vec<CallEdge>) -> Vec<CgEdgeGroup> {
 
 const CG_SCROLL_SECS: f64 = 0.20;
 const CG_CARD_H: f32 = 120.0;
+const CG_SELECTED_H: f32 = 300.0;
 const CG_CARD_GAP: f32 = 6.0;
 
 struct CgScrollState {
@@ -315,6 +593,19 @@ impl CgScrollState {
 
 fn cg_scroll_target(selected_idx: usize) -> f32 {
     selected_idx as f32 * (CG_CARD_H + CG_CARD_GAP)
+}
+
+fn cg_card_top(i: usize, selected: Option<usize>) -> f32 {
+    let mut y = 0.0_f32;
+    for j in 0..i {
+        y += if selected == Some(j) { CG_SELECTED_H } else { CG_CARD_H };
+        y += CG_CARD_GAP;
+    }
+    y
+}
+
+fn cg_card_height(i: usize, selected: Option<usize>) -> f32 {
+    if selected == Some(i) { CG_SELECTED_H } else { CG_CARD_H }
 }
 
 #[derive(Clone, PartialEq)]
@@ -680,6 +971,15 @@ fn leaf_text_zoom_floor(r: Rect) -> f64 {
 }
 
 /// Map a symbol node to the semantic tint for its box background.
+fn file_ext_tint(path: &str) -> theme::BoxTint {
+    let file = path.split("::").next().unwrap_or(path);
+    let ext = file.rsplit('.').next().unwrap_or("");
+    if ext == file {
+        return theme::BoxTint::Normal;
+    }
+    theme::BoxTint::FileType(theme::extension_tint(ext))
+}
+
 fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
     match &node.id.kind {
         SymbolKind::Folder => match node.name.as_str() {
@@ -687,13 +987,8 @@ fn classify_tint(node: &SymbolNode) -> theme::BoxTint {
             "test" | "tests" | "spec" | "specs" | "__tests__" => theme::BoxTint::TestFolder,
             _ => theme::BoxTint::Normal,
         },
-        SymbolKind::Item { label } => match label.as_str() {
-            "struct" | "enum" | "trait" | "class" | "interface" | "type" | "typedef" => {
-                theme::BoxTint::TypeDef
-            }
-            _ => theme::BoxTint::Normal,
-        },
-        _ => theme::BoxTint::Normal,
+        SymbolKind::Item { .. } => file_ext_tint(&node.id.qualified_path),
+        SymbolKind::File | SymbolKind::Chunk => file_ext_tint(&node.name),
     }
 }
 
@@ -785,8 +1080,8 @@ impl TreemapView {
             root,
             repo_root: project_root.clone(),
         };
-        let layout = outrider_layout::pack(&tree, &world::pack_config());
         let (settings, settings_notification) = loaded_settings.into_parts();
+        let layout = outrider_layout::pack(&tree, &world::pack_config(settings.node_padding));
         let mut view = Self::from_parts(
             tree,
             layout,
@@ -796,7 +1091,14 @@ impl TreemapView {
             cx,
         );
         let show_welcome = view.show_welcome;
-        view.start_loading(project_root);
+        if ProjectSettings::exists(&project_root) {
+            if let Some(ps) = ProjectSettings::load(&project_root) {
+                view.merge_project_settings(&ps);
+            }
+            view.start_loading(project_root);
+        } else {
+            view.pre_scanner.start(project_root);
+        }
         view.show_welcome = show_welcome;
         view
     }
@@ -817,6 +1119,7 @@ impl TreemapView {
         if let Some(message) = settings_notification {
             notifications.push(Notification::warning(message));
         }
+        let global_settings = settings.clone();
         Self {
             tree,
             layout,
@@ -836,6 +1139,7 @@ impl TreemapView {
             nav_history: NavigationHistory::new(root_id, 64),
             palette: palette::Palette::new(),
             settings,
+            global_settings,
             show_welcome,
             settings_draft: None,
             notifications,
@@ -847,6 +1151,8 @@ impl TreemapView {
             cg_resolver: CallGraphResolver::new(),
             loader: ProjectLoader::new(),
             load_progress: None,
+            pre_scanner: PreScanner::new(),
+            project_setup: None,
         }
     }
 
@@ -1090,6 +1396,8 @@ impl TreemapView {
                 theme::BoxKind::Leaf
             } else if item.node.id.kind == SymbolKind::Folder {
                 theme::BoxKind::Folder
+            } else if matches!(item.node.id.kind, SymbolKind::Item { .. }) {
+                theme::BoxKind::Item
             } else {
                 theme::BoxKind::File
             };
@@ -1277,7 +1585,8 @@ impl TreemapView {
                 },
                 fill,
                 border: theme::border_for(fill),
-                stripe: (item.node.churn > 0.0).then(|| theme::churn_heat(item.node.churn)),
+                stripe: (self.settings.show_churn && item.node.churn > 0.0)
+                    .then(|| theme::churn_heat(item.node.churn)),
                 focused: is_focused,
                 deferred_overlay: defer_leaf_to_overlay(is_focused, is_leaf),
                 neighbor: !is_focused && neighbor_ids.iter().flatten().any(|n| *n == item.node.id),
@@ -1733,6 +2042,10 @@ impl TreemapView {
             self.on_call_graph_key(e, window, cx);
             return;
         }
+        if self.project_setup.is_some() {
+            self.on_project_setup_key(e, cx);
+            return;
+        }
         if self.show_welcome {
             if e.keystroke.key.as_str() == "escape" {
                 self.show_welcome = false;
@@ -1748,7 +2061,8 @@ impl TreemapView {
                         SettingsField::Extensions => SettingsField::Folders,
                         SettingsField::Folders => SettingsField::CacheMb,
                         SettingsField::CacheMb => SettingsField::DiskCacheGb,
-                        SettingsField::DiskCacheGb => SettingsField::Extensions,
+                        SettingsField::DiskCacheGb => SettingsField::NodePadding,
+                        SettingsField::NodePadding => SettingsField::Extensions,
                     };
                 }
                 "backspace" => {
@@ -1766,10 +2080,15 @@ impl TreemapView {
                     }) {
                         if matches!(
                             draft.active,
-                            SettingsField::CacheMb | SettingsField::DiskCacheGb
+                            SettingsField::CacheMb
+                                | SettingsField::DiskCacheGb
+                                | SettingsField::NodePadding
                         ) {
                             if ch.is_ascii_digit()
-                                || (draft.active == SettingsField::DiskCacheGb && ch == '.')
+                                || (matches!(
+                                    draft.active,
+                                    SettingsField::DiskCacheGb | SettingsField::NodePadding
+                                ) && ch == '.')
                             {
                                 draft.active_text_mut().push(ch);
                             }
@@ -1938,6 +2257,37 @@ impl TreemapView {
         self.start_loading(repo);
     }
 
+    fn merge_project_settings(&mut self, ps: &ProjectSettings) {
+        self.settings.filter_extensions = self.global_settings.filter_extensions.clone();
+        self.settings.filter_folders = self.global_settings.filter_folders.clone();
+        for ext in &ps.filter_extensions {
+            if !self.settings.filter_extensions.iter().any(|e| e == ext) {
+                self.settings.filter_extensions.push(ext.clone());
+            }
+        }
+        for folder in &ps.filter_folders {
+            if !self.settings.filter_folders.iter().any(|f| f == folder) {
+                self.settings.filter_folders.push(folder.clone());
+            }
+        }
+    }
+
+    fn hide_folder(&mut self, rel_path: &str) {
+        let mut ps = ProjectSettings::load(&self.tree.repo_root).unwrap_or(ProjectSettings {
+            filter_extensions: vec![],
+            filter_folders: vec![],
+        });
+        if !ps.filter_folders.iter().any(|f| f == rel_path) {
+            ps.filter_folders.push(rel_path.to_string());
+        }
+        if let Err(e) = ps.save(&self.tree.repo_root) {
+            self.notifications.push(Notification::warning(e));
+            return;
+        }
+        self.merge_project_settings(&ps);
+        self.reindex();
+    }
+
     fn enter_call_graph(&mut self, _window: &Window) {
         let center = self.focus.current.clone();
         let node = Self::find_node(&self.tree.root, &center);
@@ -2033,6 +2383,96 @@ impl TreemapView {
                 self.start_tween(to);
             }
         }
+    }
+
+    fn on_project_setup_key(&mut self, e: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let draft = match &mut self.project_setup {
+            Some(d) => d,
+            None => return,
+        };
+        match e.keystroke.key.as_str() {
+            "escape" => {
+                self.project_setup = None;
+            }
+            "enter" => {
+                self.confirm_project_setup();
+            }
+            "tab" => {
+                draft.active_panel = match draft.active_panel {
+                    SetupPanel::Extensions => SetupPanel::Folders,
+                    SetupPanel::Folders => SetupPanel::Extensions,
+                };
+            }
+            "up" => match draft.active_panel {
+                SetupPanel::Extensions => {
+                    if draft.ext_cursor > 0 {
+                        draft.ext_cursor -= 1;
+                    }
+                }
+                SetupPanel::Folders => {
+                    if draft.folder_cursor > 0 {
+                        draft.folder_cursor -= 1;
+                    }
+                }
+            },
+            "down" => match draft.active_panel {
+                SetupPanel::Extensions => {
+                    let max = draft.flat_ext_count().saturating_sub(1);
+                    if draft.ext_cursor < max {
+                        draft.ext_cursor += 1;
+                    }
+                }
+                SetupPanel::Folders => {
+                    let visible = draft.visible_folder_paths();
+                    let max = visible.len().saturating_sub(1);
+                    if draft.folder_cursor < max {
+                        draft.folder_cursor += 1;
+                    }
+                }
+            },
+            "right" => {
+                if draft.active_panel == SetupPanel::Folders {
+                    let visible = draft.visible_folder_paths();
+                    if let Some(path) = visible.get(draft.folder_cursor) {
+                        if draft.folder_has_children(path) {
+                            draft.folder_expanded.insert(path.clone(), true);
+                        }
+                    }
+                }
+            }
+            "left" => {
+                if draft.active_panel == SetupPanel::Folders {
+                    let visible = draft.visible_folder_paths();
+                    if let Some(path) = visible.get(draft.folder_cursor) {
+                        if draft.folder_expanded.get(path).copied().unwrap_or(false) {
+                            draft.folder_expanded.insert(path.clone(), false);
+                        } else if let Some(parent_end) = path.rfind('/') {
+                            let parent = &path[..parent_end];
+                            if let Some(idx) = visible.iter().position(|p| p == parent) {
+                                draft.folder_cursor = idx;
+                            }
+                        }
+                    }
+                }
+            }
+            "space" => {
+                match draft.active_panel {
+                    SetupPanel::Extensions => {
+                        draft.toggle_ext_at_cursor();
+                    }
+                    SetupPanel::Folders => {
+                        let visible = draft.visible_folder_paths();
+                        if let Some(path) = visible.get(draft.folder_cursor).cloned() {
+                            let v = draft.folder_enabled.get(&path).copied().unwrap_or(true);
+                            draft.toggle_folder_recursive(&path, !v);
+                        }
+                    }
+                }
+                draft.recompute_stats();
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     fn on_call_graph_key(
@@ -2247,6 +2687,38 @@ impl TreemapView {
         }
     }
 
+    fn poll_pre_scan(&mut self) -> bool {
+        match self.pre_scanner.poll() {
+            PreScanPoll::Idle | PreScanPoll::Scanning => self.pre_scanner.is_scanning(),
+            PreScanPoll::Ready(result) => match result {
+                Ok(scan) => {
+                    let existing = ProjectSettings::load(&self.tree.repo_root);
+                    self.project_setup = Some(ProjectSetupDraft::from_pre_scan(scan, existing.as_ref()));
+                    self.show_welcome = false;
+                    true
+                }
+                Err(error) => {
+                    self.notifications.push(Notification::warning(format!(
+                        "Pre-scan failed: {error}"
+                    )));
+                    self.start_loading(self.tree.repo_root.clone());
+                    true
+                }
+            },
+        }
+    }
+
+    fn confirm_project_setup(&mut self) {
+        if let Some(draft) = self.project_setup.take() {
+            let ps = draft.to_project_settings();
+            if let Err(e) = ps.save(&self.tree.repo_root) {
+                self.notifications.push(Notification::warning(e));
+            }
+            self.merge_project_settings(&ps);
+            self.start_loading(self.tree.repo_root.clone());
+        }
+    }
+
     fn install_project(&mut self, project: LoadResult) {
         let LoadResult {
             generation,
@@ -2372,6 +2844,23 @@ impl TreemapView {
                         })
                     }),
                 );
+
+        let is_folder = target.kind == SymbolKind::Folder && !target.qualified_path.is_empty();
+        let menu_div = if is_folder {
+            let hide_folder = rel_path.clone();
+            menu_div
+                .child(crate::overlays::context_menu_separator())
+                .child(
+                    crate::overlays::context_menu_row("ctx-hide-folder", "Hide this Folder")
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.hide_folder(&hide_folder);
+                            this.context_menu = None;
+                            cx.notify();
+                        })),
+                )
+        } else {
+            menu_div
+        };
 
         Some(menu_div)
     }
@@ -2515,9 +3004,9 @@ impl TreemapView {
             .collect();
 
         let callers_col =
-            Self::render_cg_column(&caller_items, "Callers", true, col_w, col_h, loading, caller_scroll);
+            Self::render_cg_column(&caller_items, "Callers", true, col_w, col_h, loading, caller_scroll, caller_sel);
         let callees_col =
-            Self::render_cg_column(&callee_items, "Callees", false, col_w, col_h, loading, callee_scroll);
+            Self::render_cg_column(&callee_items, "Callees", false, col_w, col_h, loading, callee_scroll, callee_sel);
 
         Some(
             div()
@@ -2538,6 +3027,7 @@ impl TreemapView {
         col_h: f32,
         loading: bool,
         scroll_pos: f32,
+        selected_idx: Option<usize>,
     ) -> gpui::Stateful<gpui::Div> {
         let col_id = if is_callers { "cg-callers" } else { "cg-callees" };
         let header_h: f32 = 28.0;
@@ -2595,15 +3085,16 @@ impl TreemapView {
             return col;
         }
 
-        let step = CG_CARD_H + CG_CARD_GAP;
         let content_top = header_h + 10.0;
+        let first_card_h = cg_card_height(0, selected_idx);
         let avail_h = col_h - content_top;
-        let center_y = content_top + (avail_h / 2.0 - CG_CARD_H / 2.0).max(0.0);
+        let center_y = content_top + (avail_h / 2.0 - first_card_h / 2.0).max(0.0);
 
         for (i, item) in items.iter().enumerate() {
-            let card_y = center_y + i as f32 * step - scroll_pos;
+            let card_h = cg_card_height(i, selected_idx);
+            let card_y = center_y + cg_card_top(i, selected_idx) - scroll_pos;
 
-            if card_y + CG_CARD_H < 0.0 || card_y > col_h {
+            if card_y + card_h < 0.0 || card_y > col_h {
                 continue;
             }
 
@@ -2640,6 +3131,8 @@ impl TreemapView {
                 .top(px(card_y))
                 .left(px(8.0))
                 .right(px(8.0))
+                .h(px(card_h))
+                .overflow_hidden()
                 .px(px(8.0))
                 .py(px(6.0))
                 .bg(rgb(theme::CODE_BG))
@@ -2803,8 +3296,226 @@ impl TreemapView {
         )
     }
 
+    fn render_project_setup(&self, map_w: f64, map_h: f64, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::overlays::{action_button, category_header, checkbox_row, project_setup_element};
+        use gpui::ElementId;
+
+        let draft = self.project_setup.as_ref().unwrap();
+        let project_name = self
+            .tree
+            .repo_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".into());
+        let title = format!("Project Setup — {project_name}");
+        let stats_line = format!(
+            "{} files · {} will be indexed",
+            draft.filtered_files,
+            project_settings::format_bytes(draft.filtered_bytes),
+        );
+
+        let categories = draft.sorted_categories();
+        let mut ext_rows: Vec<gpui::AnyElement> = Vec::new();
+        let mut flat_ext_idx: usize = 0;
+
+        for (cat, exts) in &categories {
+            let expanded = draft.category_expanded.get(cat).copied().unwrap_or(false);
+            let all_on = draft.is_category_all_enabled(exts);
+            let cat_count: usize = exts.iter().map(|(_, s)| s.count).sum();
+            let cat_bytes: u64 = exts.iter().map(|(_, s)| s.bytes).sum();
+            let detail = format!("({cat_count} files · {})", project_settings::format_bytes(cat_bytes));
+            let is_sel = draft.active_panel == SetupPanel::Extensions && draft.ext_cursor == flat_ext_idx;
+
+            let cat_for_expand = *cat;
+            let cat_for_toggle = *cat;
+            let ext_keys: Vec<String> = exts.iter().map(|(e, _)| (*e).clone()).collect();
+            let expand_listener = cx.listener(move |this, _, _, cx| {
+                if let Some(d) = &mut this.project_setup {
+                    let exp = d.category_expanded.get(&cat_for_expand).copied().unwrap_or(false);
+                    d.category_expanded.insert(cat_for_expand, !exp);
+                }
+                cx.notify();
+            });
+            let toggle_listener = cx.listener(move |this, _, _, cx| {
+                if let Some(d) = &mut this.project_setup {
+                    let all_on = ext_keys.iter().all(|e| d.extension_enabled.get(e).copied().unwrap_or(true));
+                    for ext in &ext_keys {
+                        d.extension_enabled.insert(ext.clone(), !all_on);
+                    }
+                    d.recompute_stats();
+                }
+                cx.notify();
+            });
+            ext_rows.push(
+                category_header(
+                    ElementId::Name(format!("cat-arrow-{}", cat_for_toggle.label()).into()),
+                    ElementId::Name(format!("cat-cb-{}", cat_for_toggle.label()).into()),
+                    format!("{} ({})", cat.label(), exts.len()),
+                    detail,
+                    all_on,
+                    expanded,
+                    is_sel,
+                    |arrow| arrow.on_click(expand_listener),
+                    |cb| cb.on_click(toggle_listener),
+                )
+                .into_any_element(),
+            );
+            flat_ext_idx += 1;
+
+            if expanded {
+                for (ext, stats) in exts {
+                    let enabled = draft.extension_enabled.get(*ext).copied().unwrap_or(true);
+                    let detail = format!("{} · {}", stats.count, project_settings::format_bytes(stats.bytes));
+                    let is_sel = draft.active_panel == SetupPanel::Extensions && draft.ext_cursor == flat_ext_idx;
+                    let ext_owned = (*ext).clone();
+                    ext_rows.push(
+                        checkbox_row(
+                            ElementId::Name(format!("ext-{ext}").into()),
+                            format!(".{ext}"),
+                            detail,
+                            enabled,
+                            is_sel,
+                            24.0,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(d) = &mut this.project_setup {
+                                let v = d.extension_enabled.get(&ext_owned).copied().unwrap_or(true);
+                                d.extension_enabled.insert(ext_owned.clone(), !v);
+                                d.recompute_stats();
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    );
+                    flat_ext_idx += 1;
+                }
+            }
+        }
+
+        let visible_folders = draft.visible_folder_paths();
+        let mut folder_rows: Vec<gpui::AnyElement> = Vec::new();
+        let mut flat_idx = 0usize;
+        self.build_folder_rows(draft, "", 0, &visible_folders, &mut flat_idx, &mut folder_rows, cx);
+
+        let actions = vec![
+            action_button("setup-confirm", "Start Indexing", true).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.confirm_project_setup();
+                    cx.notify();
+                }),
+            ),
+            action_button("setup-cancel", "Cancel", false).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.project_setup = None;
+                    cx.notify();
+                }),
+            ),
+        ];
+
+        project_setup_element(map_w, map_h, title, stats_line, ext_rows, folder_rows, actions)
+    }
+
     /// Build the settings overlay div (absolutely positioned, centered).
     /// Shows current filter settings read-only with action buttons.
+    fn build_folder_rows(
+        &self,
+        draft: &ProjectSetupDraft,
+        prefix: &str,
+        depth: usize,
+        visible_folders: &[String],
+        flat_idx: &mut usize,
+        out: &mut Vec<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::overlays::{category_header, checkbox_row};
+        use gpui::ElementId;
+
+        let children = draft.folder_children(prefix);
+        let indent = 8.0 + depth as f32 * 16.0;
+
+        for (name, full_path) in children {
+            let enabled = draft.folder_enabled.get(&full_path).copied().unwrap_or(true);
+            let stats = draft.pre_scan.folders.get(&full_path);
+            let detail = if let Some(s) = stats {
+                format!("{} files · {}", s.count, project_settings::format_bytes(s.bytes))
+            } else {
+                "gitignored".into()
+            };
+            let is_sel = draft.active_panel == SetupPanel::Folders && draft.folder_cursor == *flat_idx;
+            let has_kids = draft.folder_has_children(&full_path);
+            let expanded = draft.folder_expanded.get(&full_path).copied().unwrap_or(false);
+            let is_gitignored = draft.gitignored_set.contains(&full_path);
+            let path_owned = full_path.clone();
+
+            let label = if is_gitignored {
+                format!("{name}/ (gitignored)")
+            } else {
+                format!("{name}/")
+            };
+
+            if has_kids {
+                let path_for_expand = full_path.clone();
+                let path_for_toggle = full_path.clone();
+                let expand_listener = cx.listener(move |this, _, _, cx| {
+                    if let Some(d) = &mut this.project_setup {
+                        let exp = d.folder_expanded.get(&path_for_expand).copied().unwrap_or(false);
+                        d.folder_expanded.insert(path_for_expand.clone(), !exp);
+                    }
+                    cx.notify();
+                });
+                let toggle_listener = cx.listener(move |this, _, _, cx| {
+                    if let Some(d) = &mut this.project_setup {
+                        let v = d.folder_enabled.get(&path_for_toggle).copied().unwrap_or(true);
+                        d.toggle_folder_recursive(&path_for_toggle, !v);
+                        d.recompute_stats();
+                    }
+                    cx.notify();
+                });
+                out.push(
+                    category_header(
+                        ElementId::Name(format!("folder-arrow-{full_path}").into()),
+                        ElementId::Name(format!("folder-cb-{full_path}").into()),
+                        label,
+                        detail,
+                        enabled,
+                        expanded,
+                        is_sel,
+                        |arrow| arrow.on_click(expand_listener),
+                        |cb| cb.on_click(toggle_listener),
+                    )
+                    .ml(px(indent - 8.0))
+                    .into_any_element(),
+                );
+            } else {
+                out.push(
+                    checkbox_row(
+                        ElementId::Name(format!("folder-{full_path}").into()),
+                        label,
+                        detail,
+                        enabled,
+                        is_sel,
+                        indent,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(d) = &mut this.project_setup {
+                            let v = d.folder_enabled.get(&path_owned).copied().unwrap_or(true);
+                            d.folder_enabled.insert(path_owned.clone(), !v);
+                            d.recompute_stats();
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                );
+            }
+
+            *flat_idx += 1;
+
+            if has_kids && expanded {
+                self.build_folder_rows(draft, &full_path, depth + 1, visible_folders, flat_idx, out, cx);
+            }
+        }
+    }
+
     fn render_settings_window(&self, map_w: f64, cx: &mut Context<Self>) -> gpui::Div {
         let draft = self.settings_draft.as_ref().unwrap();
         let field = |kind: SettingsField, text: String| {
@@ -2815,6 +3526,7 @@ impl TreemapView {
                 SettingsField::Folders => ("field-folders", "Filtered Folders (comma-separated):"),
                 SettingsField::CacheMb => ("field-cache-mb", "Texture Cache (MB):"),
                 SettingsField::DiskCacheGb => ("field-disk-cache-gb", "Project Disk Cache (GiB):"),
+                SettingsField::NodePadding => ("field-node-padding", "Node Padding (px):"),
             };
             let active = draft.active == kind;
             let text = if active { format!("{text}|") } else { text };
@@ -2835,18 +3547,23 @@ impl TreemapView {
             field(SettingsField::Folders, draft.filter_folders.clone()),
             field(SettingsField::CacheMb, draft.cache_mb.clone()),
             field(SettingsField::DiskCacheGb, draft.disk_cache_gb.clone()),
+            field(SettingsField::NodePadding, draft.node_padding.clone()),
         ];
         let validation = draft.notification.clone();
         let save = crate::overlays::action_button("settings-save", "Save & Close", true).on_click(
             cx.listener(|this, _event, _window, cx| {
                 if let Some(mut draft) = this.settings_draft.take() {
-                    let mut candidate = this.settings.clone();
+                    let mut candidate = this.global_settings.clone();
                     let result = draft
                         .apply_to(&mut candidate, &this.tree.repo_root)
                         .and_then(|()| candidate.save());
                     match result {
                         Ok(()) => {
+                            this.global_settings = candidate.clone();
                             this.settings = candidate;
+                            if let Some(ps) = ProjectSettings::load(&this.tree.repo_root) {
+                                this.merge_project_settings(&ps);
+                            }
                             this.reindex();
                         }
                         Err(message) => {
@@ -2863,7 +3580,11 @@ impl TreemapView {
                 let defaults = settings::Settings::default();
                 match defaults.save() {
                     Ok(()) => {
+                        this.global_settings = defaults.clone();
                         this.settings = defaults;
+                        if let Some(ps) = ProjectSettings::load(&this.tree.repo_root) {
+                            this.merge_project_settings(&ps);
+                        }
                         this.settings_draft = None;
                         this.reindex();
                     }
@@ -2915,6 +3636,7 @@ impl Render for TreemapView {
 
         let mut needs_notify = self.poll_loading();
         needs_notify |= self.poll_call_graph(window);
+        needs_notify |= self.poll_pre_scan();
         if needs_notify {
             cx.notify();
         }
@@ -2922,7 +3644,12 @@ impl Render for TreemapView {
         let (vw, vh) = Self::map_viewport(window);
         let is_loading = self.loader.is_loading();
 
-        let (items, doc_panel, cg_scrim) = self.paint_items(vw, vh);
+        let skip_treemap = self.project_setup.is_some();
+        let (items, doc_panel, cg_scrim) = if skip_treemap {
+            (Vec::new(), None, false)
+        } else {
+            self.paint_items(vw, vh)
+        };
 
         // Disk results are applied while building paint items. Drain their
         // diagnostics afterwards so a terminal worker failure is visible in
@@ -2940,7 +3667,8 @@ impl Render for TreemapView {
             }
         }
         let cg_animating = self.call_graph.as_ref().is_some_and(|cg| cg.scroll.is_animating());
-        if self.tween.is_some() || self.bake_pending || is_loading || self.cg_resolver.is_active() || cg_animating
+        let scanning = self.pre_scanner.is_scanning();
+        if self.tween.is_some() || self.bake_pending || is_loading || self.cg_resolver.is_active() || cg_animating || scanning
         {
             window.request_animation_frame();
         }
@@ -2957,6 +3685,28 @@ impl Render for TreemapView {
         // Build the welcome overlay (needs cx for click listeners).
         let welcome_overlay = self.show_welcome.then(|| self.render_welcome(vw, cx));
 
+        // Build the toolbar overlay.
+        let has_overlays = self.palette.is_open()
+            || self.settings_draft.is_some()
+            || self.show_welcome
+            || self.project_setup.is_some();
+        let toolbar_overlay = (!has_overlays).then(|| {
+            let show_churn = self.settings.show_churn;
+            div()
+                .absolute()
+                .top(px(8.0))
+                .right(px(8.0))
+                .child(
+                    crate::overlays::toolbar_toggle("churn-toggle", "Git Churn", show_churn)
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.settings.show_churn = !this.settings.show_churn;
+                            this.global_settings.show_churn = this.settings.show_churn;
+                            let _ = this.global_settings.save();
+                            cx.notify();
+                        })),
+                )
+        });
+
         // Build the context menu overlay (needs cx for click listeners).
         let context_menu_overlay = self.render_context_menu(cx);
 
@@ -2968,6 +3718,23 @@ impl Render for TreemapView {
 
         // Build the rename overlay.
         let rename_overlay = self.render_rename(vw, cx);
+
+        // Build the project setup overlay.
+        let project_setup_overlay = self
+            .project_setup
+            .is_some()
+            .then(|| self.render_project_setup(vw, vh, cx));
+
+        // Build the pre-scan loading spinner.
+        let pre_scan_overlay = (self.pre_scanner.is_scanning() && self.project_setup.is_none()).then(|| {
+            let folder_name = self
+                .tree
+                .repo_root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "project".into());
+            crate::overlays::pre_scan_loading_element(vw, &folder_name)
+        });
 
         // Build the loading overlay if indexing in background.
         let loading_overlay = self
@@ -2998,6 +3765,7 @@ impl Render for TreemapView {
                 {
                     let (settings, warning) =
                         crate::settings::Settings::load().into_parts();
+                    this.global_settings = settings.clone();
                     this.settings = settings;
                     if let Some(message) = warning {
                         this.notifications.push(Notification::warning(message));
@@ -3018,11 +3786,23 @@ impl Render for TreemapView {
                     this.settings_draft = None;
                 } else {
                     this.settings_draft = Some(SettingsDraft::from_settings(
-                        &this.settings,
+                        &this.global_settings,
                         &this.tree.repo_root,
                     ));
                     this.palette.close();
                     this.show_welcome = false;
+                    this.context_menu = None;
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleProjectSettings, _w, cx| {
+                if this.project_setup.is_some() {
+                    this.project_setup = None;
+                } else {
+                    this.pre_scanner.start(this.tree.repo_root.clone());
+                    this.palette.close();
+                    this.show_welcome = false;
+                    this.settings_draft = None;
                     this.context_menu = None;
                 }
                 cx.notify();
@@ -3346,6 +4126,7 @@ impl Render for TreemapView {
                 )
                 .size_full(),
             )
+            .children(toolbar_overlay)
             .children(palette_overlay)
             .children(settings_overlay)
             .children(welcome_overlay)
@@ -3354,6 +4135,8 @@ impl Render for TreemapView {
             .children(delete_overlay)
             .children(rename_overlay)
             .children(loading_overlay)
+            .children(pre_scan_overlay)
+            .children(project_setup_overlay)
             .children(notification_overlay);
 
         map
@@ -3825,30 +4608,25 @@ mod tests {
     }
 
     #[test]
-    fn classify_tint_typedef_items() {
+    fn classify_tint_items_use_file_extension() {
         use super::classify_tint;
         use crate::theme::BoxTint;
-        for label in &[
-            "struct",
-            "enum",
-            "trait",
-            "class",
-            "interface",
-            "type",
-            "typedef",
-        ] {
-            let n = make_node(
-                SymbolKind::Item {
-                    label: label.to_string(),
-                },
-                "Foo",
-            );
-            assert_eq!(
-                classify_tint(&n),
-                BoxTint::TypeDef,
-                "expected TypeDef for {label}"
-            );
-        }
+        let mut n = make_node(
+            SymbolKind::Item {
+                label: "struct".to_string(),
+            },
+            "Foo",
+        );
+        n.id.qualified_path = "src/main.rs::Foo".into();
+        assert_eq!(
+            classify_tint(&n),
+            BoxTint::FileType(crate::theme::extension_tint("rs"))
+        );
+        n.id.qualified_path = "app.ts::Bar".into();
+        assert_eq!(
+            classify_tint(&n),
+            BoxTint::FileType(crate::theme::extension_tint("ts"))
+        );
     }
 
     #[test]
@@ -3860,16 +4638,17 @@ mod tests {
             classify_tint(&make_node(SymbolKind::Folder, "src")),
             BoxTint::Normal
         );
-        // Non-typedef item label
+        // Item without file extension in qualified_path
         assert_eq!(
             classify_tint(&make_node(SymbolKind::Item { label: "fn".into() }, "foo")),
             BoxTint::Normal
         );
-        // File and Chunk always Normal
+        // File gets FileType tint based on extension
         assert_eq!(
             classify_tint(&make_node(SymbolKind::File, "main.rs")),
-            BoxTint::Normal
+            BoxTint::FileType(crate::theme::extension_tint("rs"))
         );
+        // Chunk without extension falls back to Normal
         assert_eq!(
             classify_tint(&make_node(SymbolKind::Chunk, "chunk")),
             BoxTint::Normal

@@ -100,6 +100,52 @@ pub enum BoxTint {
     DocsFolder,
     /// Folder whose contents are predominantly test files.
     TestFolder,
+    /// File-type tint derived from the source extension.
+    FileType(u32),
+}
+
+const FILE_TYPE_BLEND: f32 = 0.35;
+const ITEM_TYPE_BLEND: f32 = 0.25;
+const LEAF_TYPE_BLEND: f32 = 0.18;
+
+pub fn extension_tint(ext: &str) -> u32 {
+    match ext {
+        "rs" => 0xc06030,
+        "js" | "mjs" | "cjs" => 0xc0b030,
+        "jsx" => 0xd0a030,
+        "ts" | "mts" | "cts" => 0x3080d0,
+        "tsx" => 0x4070c0,
+        "py" => 0x30a060,
+        "rb" => 0xc03040,
+        "go" => 0x30b0b0,
+        "java" => 0xb04030,
+        "kt" | "kts" => 0xa050c0,
+        "swift" => 0xe06030,
+        "c" | "h" => 0x5070a0,
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => 0x5060c0,
+        "cs" => 0x7050b0,
+        "html" | "htm" => 0xd05030,
+        "css" => 0xc040a0,
+        "scss" | "sass" | "less" => 0xb050a0,
+        "vue" => 0x40b070,
+        "svelte" => 0xd04020,
+        "json" => 0x908040,
+        "yaml" | "yml" => 0x906050,
+        "toml" => 0x807060,
+        "xml" => 0x808060,
+        "md" | "markdown" => 0x4080c0,
+        "txt" | "rst" => 0x808080,
+        "sh" | "bash" | "zsh" | "fish" => 0x50a040,
+        "sql" => 0xc08030,
+        "lua" => 0x3040c0,
+        "php" => 0x7060b0,
+        "r" => 0x3060c0,
+        "ex" | "exs" => 0x6040a0,
+        "zig" => 0xd0a020,
+        "dart" => 0x40a0c0,
+        "scala" => 0xc03020,
+        _ => 0x606068,
+    }
 }
 /// Churn heat stripe width at the box's left edge.
 pub const STRIPE_W: f32 = 3.0;
@@ -135,8 +181,10 @@ pub fn depth_fill(level: u8) -> u32 {
 pub enum BoxKind {
     /// A leaf symbol page that renders source code lines.
     Leaf,
-    /// A file or item container; uses the warm depth ramp.
+    /// A file container; uses the warm depth ramp.
     File,
+    /// An item container (class, module, impl block); darker than File.
+    Item,
     /// A folder container; uses the cool depth ramp.
     Folder,
 }
@@ -146,22 +194,41 @@ pub fn file_fill(level: u8) -> u32 {
     lerp_rgb(depth_fill(level), FILE_TINT, FILE_BLEND)
 }
 
-/// Box background: leaf pages keep the editor background, file containers
-/// use a warm depth ramp, folder containers use the cool depth ramp.
-/// Tints blend a semantic color at TINT_BLEND.
+/// Item-container fill: halfway between CODE_BG and file_fill (darker than file).
+pub fn item_fill(level: u8) -> u32 {
+    lerp_rgb(CODE_BG, file_fill(level), 0.45)
+}
+
+/// Leaf code fill: just above CODE_BG (darkest tier).
+pub fn leaf_fill(level: u8) -> u32 {
+    lerp_rgb(CODE_BG, file_fill(level), 0.15)
+}
+
+/// Box background: three tiers of brightness for file-type coloring.
+/// File containers are brightest, item containers (classes) are darker,
+/// leaf code pages are darkest. Folder containers use the cool depth ramp.
 pub fn box_fill(kind: BoxKind, level: u8, tint: BoxTint) -> u32 {
     let base = match kind {
         BoxKind::Leaf => CODE_BG,
+        BoxKind::Item => item_fill(level),
         BoxKind::File => file_fill(level),
         BoxKind::Folder => depth_fill(level),
     };
-    let target = match tint {
-        BoxTint::Normal => return base,
-        BoxTint::TypeDef => TINT_TYPEDEF,
-        BoxTint::DocsFolder => TINT_DOCS,
-        BoxTint::TestFolder => TINT_TEST,
-    };
-    lerp_rgb(base, target, TINT_BLEND)
+    match tint {
+        BoxTint::Normal => base,
+        BoxTint::TypeDef => lerp_rgb(base, TINT_TYPEDEF, TINT_BLEND),
+        BoxTint::DocsFolder => lerp_rgb(base, TINT_DOCS, TINT_BLEND),
+        BoxTint::TestFolder => lerp_rgb(base, TINT_TEST, TINT_BLEND),
+        BoxTint::FileType(color) => {
+            let blend = match kind {
+                BoxKind::File => FILE_TYPE_BLEND,
+                BoxKind::Item => ITEM_TYPE_BLEND,
+                BoxKind::Leaf => LEAF_TYPE_BLEND,
+                BoxKind::Folder => FILE_TYPE_BLEND,
+            };
+            lerp_rgb(base, color, blend)
+        }
+    }
 }
 
 /// Border: fill lightened 12% toward white.
@@ -250,11 +317,13 @@ mod tests {
         for level in [0, 3, 8] {
             let folder = box_fill(BoxKind::Folder, level, BoxTint::Normal);
             let file = box_fill(BoxKind::File, level, BoxTint::Normal);
+            let item = box_fill(BoxKind::Item, level, BoxTint::Normal);
             assert_ne!(
                 file, folder,
                 "file and folder fills must differ at level {level}"
             );
             assert_eq!(file, file_fill(level));
+            assert_eq!(item, item_fill(level));
         }
     }
 
@@ -275,8 +344,15 @@ mod tests {
     #[test]
     fn tinted_fill_border_contract() {
         // border_for must remain lighter than the tinted fill on every channel.
-        for kind in [BoxKind::Folder, BoxKind::File] {
-            for tint in [BoxTint::TypeDef, BoxTint::DocsFolder, BoxTint::TestFolder] {
+        for kind in [BoxKind::Folder, BoxKind::File, BoxKind::Item] {
+            for tint in [
+                BoxTint::TypeDef,
+                BoxTint::DocsFolder,
+                BoxTint::TestFolder,
+                BoxTint::FileType(extension_tint("rs")),
+                BoxTint::FileType(extension_tint("ts")),
+                BoxTint::FileType(extension_tint("py")),
+            ] {
                 let fill = box_fill(kind, 2, tint);
                 let border = border_for(fill);
                 assert!((border >> 16) & 0xff >= (fill >> 16) & 0xff);
@@ -284,6 +360,28 @@ mod tests {
                 assert!(border & 0xff >= fill & 0xff);
                 assert_ne!(border, fill);
             }
+        }
+    }
+
+    fn brightness(color: u32) -> u32 {
+        ((color >> 16) & 0xff) + ((color >> 8) & 0xff) + (color & 0xff)
+    }
+
+    #[test]
+    fn file_type_three_tier_brightness() {
+        for ext in ["rs", "ts", "py", "js", "go"] {
+            let tint = BoxTint::FileType(extension_tint(ext));
+            let file = box_fill(BoxKind::File, 2, tint);
+            let item = box_fill(BoxKind::Item, 2, tint);
+            let leaf = box_fill(BoxKind::Leaf, 2, tint);
+            assert!(
+                brightness(file) > brightness(item),
+                "{ext}: file ({file:#x}) must be brighter than item ({item:#x})"
+            );
+            assert!(
+                brightness(item) > brightness(leaf),
+                "{ext}: item ({item:#x}) must be brighter than leaf ({leaf:#x})"
+            );
         }
     }
 }

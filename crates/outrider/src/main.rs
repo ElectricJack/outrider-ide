@@ -12,6 +12,7 @@ mod overlays;
 mod paint_model;
 mod palette;
 mod project_loader;
+mod project_settings;
 mod rasterize;
 mod settings;
 mod texture_store;
@@ -26,7 +27,7 @@ use gpui_platform::application;
 
 use crate::treemap::{
     ClearDiskCache, OpenFilePalette, OpenFolder, OpenSymbolPalette, Quit, RevealInFileManager,
-    ToggleSettings, TreemapView,
+    ToggleProjectSettings, ToggleSettings, TreemapView,
 };
 
 fn main() {
@@ -60,6 +61,7 @@ fn main() {
             gpui::KeyBinding::new("secondary-p", OpenFilePalette, None),
             gpui::KeyBinding::new("secondary-t", OpenSymbolPalette, None),
             gpui::KeyBinding::new("secondary-,", ToggleSettings, None),
+            gpui::KeyBinding::new("secondary-shift-,", ToggleProjectSettings, None),
             gpui::KeyBinding::new("secondary-shift-e", RevealInFileManager, None),
             gpui::KeyBinding::new("secondary-q", Quit, None),
         ]);
@@ -72,6 +74,7 @@ fn main() {
                 disabled: false,
                 items: vec![
                     MenuItem::action("Settings...", ToggleSettings),
+                    MenuItem::action("Project Settings...", ToggleProjectSettings),
                     MenuItem::separator(),
                     MenuItem::action("Quit outrider", Quit),
                 ],

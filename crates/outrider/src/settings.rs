@@ -38,8 +38,20 @@ pub struct Settings {
     pub show_welcome: bool,
     #[serde(default = "default_cache_mb")]
     pub cache_mb: u32,
+    #[serde(default = "default_node_padding")]
+    pub node_padding: f64,
+    #[serde(default = "default_show_churn")]
+    pub show_churn: bool,
     #[serde(default)]
     pub(crate) disk_cache_bytes: BTreeMap<String, u64>,
+}
+
+fn default_node_padding() -> f64 {
+    8.0
+}
+
+fn default_show_churn() -> bool {
+    true
 }
 
 fn default_cache_mb() -> u32 {
@@ -75,6 +87,8 @@ impl Default for Settings {
             .collect(),
             show_welcome: true,
             cache_mb: default_cache_mb(),
+            node_padding: default_node_padding(),
+            show_churn: default_show_churn(),
             disk_cache_bytes: BTreeMap::new(),
         }
     }
