@@ -136,6 +136,54 @@ fn doc_rank(node: &SymbolNode) -> u8 {
     }
 }
 
+const TARGET_HEIGHT_FACTORS: [f64; 9] = [0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.5, 2.0, 3.0];
+
+fn shelf_bounds(sizes: &[(f64, f64)], gap: f64, target_h: f64) -> (f64, f64) {
+    let (mut x, mut y, mut col_w, mut content_h) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    for &(w, h) in sizes {
+        if y > 0.0 && y + h > target_h {
+            x += col_w + gap;
+            y = 0.0;
+            col_w = 0.0;
+        }
+        col_w = col_w.max(w);
+        content_h = content_h.max(y + h);
+        y += h + gap;
+    }
+    (x + col_w, content_h)
+}
+
+fn aspect_envelope_area((w, h): (f64, f64), aspect: f64) -> f64 {
+    let envelope_w = w.max(h * aspect);
+    envelope_w * (envelope_w / aspect)
+}
+
+fn choose_target_height(sizes: &[(f64, f64)], gap: f64, aspect: f64) -> f64 {
+    if let [(_, height)] = sizes {
+        return *height;
+    }
+    let area: f64 = sizes.iter().map(|&(w, h)| w * h).sum();
+    let tallest = sizes.iter().map(|&(_, h)| h).fold(0.0, f64::max);
+    let baseline = tallest.max((area / aspect).sqrt());
+    let mut best_height = baseline;
+    let mut best_score = aspect_envelope_area(shelf_bounds(sizes, gap, baseline), aspect);
+    let mut previous: Option<f64> = None;
+
+    for factor in TARGET_HEIGHT_FACTORS {
+        let candidate = tallest.max(baseline * factor);
+        if previous == Some(candidate) {
+            continue;
+        }
+        previous = Some(candidate);
+        let score = aspect_envelope_area(shelf_bounds(sizes, gap, candidate), aspect);
+        if score.total_cmp(&best_score).is_lt() {
+            best_height = candidate;
+            best_score = score;
+        }
+    }
+    best_height
+}
+
 /// Bottom-up size pass: returns (w, h) and records each node's position
 /// relative to its parent's origin in `rel` (x, y, w, h). Children fill
 /// columns top-to-bottom, wrapping right toward a square aspect (spec §5).
@@ -182,10 +230,8 @@ fn size(
                 .then(a.id.ordinal.cmp(&b.id.ordinal))
         });
     }
-    let area: f64 = order.iter().map(|(_, (w, h), _)| w * h).sum();
-    let tallest = order.iter().map(|&(_, (_, h), _)| h).fold(0.0, f64::max);
-    // tallest.max(...) guarantees no child is ever forced to wrap alone.
-    let target_h = tallest.max((area / cfg.aspect).sqrt());
+    let sizes: Vec<(f64, f64)> = order.iter().map(|(_, size, _)| *size).collect();
+    let target_h = choose_target_height(&sizes, cfg.gap, cfg.aspect);
     let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for &(child, (w, h), _) in &order {
         if y > 0.0 && y + h > target_h {
@@ -342,6 +388,54 @@ mod tests {
     }
 
     #[test]
+    fn candidate_height_reduces_aspect_envelope_for_mixed_child_shapes() {
+        let sizes = vec![
+            (1400.0, 700.0),
+            (640.0, 100.0),
+            (640.0, 100.0),
+            (640.0, 100.0),
+            (640.0, 100.0),
+        ];
+        let area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
+        let baseline = 700.0_f64.max((area / 1.6).sqrt());
+        let selected = choose_target_height(&sizes, 8.0, 1.6);
+        let baseline_bounds = shelf_bounds(&sizes, 8.0, baseline);
+        let selected_bounds = shelf_bounds(&sizes, 8.0, selected);
+
+        assert!(selected > baseline);
+        assert!(
+            aspect_envelope_area(selected_bounds, 1.6) < aspect_envelope_area(baseline_bounds, 1.6)
+        );
+    }
+
+    #[test]
+    fn single_child_uses_its_height_as_target() {
+        close(choose_target_height(&[(640.0, 58.0)], 8.0, 1.6), 58.0);
+    }
+
+    #[test]
+    fn candidate_height_never_falls_below_tallest_child() {
+        let sizes = [(640.0, 800.0), (640.0, 10.0), (640.0, 10.0)];
+        assert!(choose_target_height(&sizes, 8.0, 1.6) >= 800.0);
+    }
+
+    #[test]
+    fn candidate_height_selection_is_repeatable() {
+        let sizes = [(1400.0, 700.0), (640.0, 100.0), (640.0, 100.0)];
+        let first = choose_target_height(&sizes, 8.0, 1.6);
+        let second = choose_target_height(&sizes, 8.0, 1.6);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn equal_score_keeps_the_baseline_candidate() {
+        let sizes = [(640.0, 700.0), (640.0, 700.0)];
+        let area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
+        let baseline = 700.0_f64.max((area / 1.6).sqrt());
+        close(choose_target_height(&sizes, 8.0, 1.6), baseline);
+    }
+
+    #[test]
     fn children_placed_tallest_first_names_break_ties() {
         // "zeta" is huge, "alpha" tiny — zeta packs first now (size-aware).
         let tree = SymbolTree {
@@ -462,9 +556,10 @@ mod tests {
     }
 
     #[test]
-    fn columns_fill_down_then_wrap_right() {
-        // Four equal 640×120.4 pages, aspect 1.6 (test cfg): target_h ≈ 380
-        // holds three per column, the fourth wraps to a second column.
+    fn multi_candidate_height_can_keep_equal_pages_in_one_column() {
+        // Four equal 640×120.4 pages fit in one column. Its 640×505.6
+        // content bounds have a smaller 1.6-aspect envelope than the old
+        // three-plus-one, two-column result.
         let files: Vec<SymbolNode> = (1..=4)
             .map(|i| {
                 n(
@@ -484,8 +579,8 @@ mod tests {
         assert_rect(rect(&p, "c1.rs"), 8.0, 60.0, 640.0, 120.4);
         assert_rect(rect(&p, "c2.rs"), 8.0, 188.4, 640.0, 120.4);
         assert_rect(rect(&p, "c3.rs"), 8.0, 316.8, 640.0, 120.4);
-        assert_rect(rect(&p, "c4.rs"), 656.0, 60.0, 640.0, 120.4);
-        assert_rect(rect(&p, ""), 0.0, 0.0, 1304.0, 445.2);
+        assert_rect(rect(&p, "c4.rs"), 8.0, 445.2, 640.0, 120.4);
+        assert_rect(rect(&p, ""), 0.0, 0.0, 656.0, 573.6);
     }
 
     #[test]
