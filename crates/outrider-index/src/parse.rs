@@ -98,8 +98,20 @@ fn make_target(node: Node<'_>, source: &[u8]) -> RawItem {
         })
         .map(|target| node_text(target, source).trim().to_owned())
         .unwrap_or_default();
-    let text = node_text(node, source);
-    let signature = text.lines().next().unwrap_or_default().trim().to_owned();
+    let recipe_start = {
+        let mut cursor = node.walk();
+        let start = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "recipe")
+            .map(|recipe| recipe.start_byte());
+        start
+    };
+    let header_end = recipe_start.unwrap_or_else(|| node.end_byte());
+    let signature = String::from_utf8_lossy(&source[node.start_byte()..header_end])
+        .trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .to_owned();
     let range = node.byte_range();
     let line_count = source[range.clone()]
         .iter()
@@ -830,7 +842,11 @@ fn free() {
         }
         assert_eq!(items.first().unwrap().byte_range.start, 0);
         assert_eq!(items.last().unwrap().byte_range.end, source.len());
+        for item in items {
+            assert!(item.byte_range.start < item.byte_range.end);
+        }
         for pair in items.windows(2) {
+            assert!(pair[0].byte_range.start < pair[1].byte_range.start);
             assert_eq!(pair[0].byte_range.end, pair[1].byte_range.start);
         }
     }
@@ -853,6 +869,27 @@ fn free() {
         assert_eq!(targets[2].signature, "clean install: prep");
         assert_eq!(targets[2].children, vec![]);
         assert_eq!(targets[2].doc, None);
+        assert_make_coverage(src, &items);
+    }
+
+    #[test]
+    fn make_signature_includes_every_physical_line_of_a_continued_header() {
+        let src = concat!(
+            "bundle: first \\\n",
+            "    second \\\n",
+            "    third\n",
+            "\t@echo bundled\n",
+        )
+        .as_bytes();
+        let items = parse_make_items(src).unwrap();
+        let target = items
+            .iter()
+            .find(|item| item.kind.label() == "target")
+            .unwrap();
+        assert_eq!(
+            target.signature,
+            concat!("bundle: first \\\n", "    second \\\n", "    third")
+        );
         assert_make_coverage(src, &items);
     }
 
