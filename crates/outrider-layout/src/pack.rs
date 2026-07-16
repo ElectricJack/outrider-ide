@@ -412,6 +412,154 @@ mod tests {
         close(r.h, h);
     }
 
+    fn folder(qp: &str, name: &str, children: Vec<SymbolNode>) -> SymbolNode {
+        n(SymbolKind::Folder, qp, name, 0, children)
+    }
+
+    fn file(qp: &str, measure: u64) -> SymbolNode {
+        let name = qp.rsplit('/').next().unwrap_or(qp);
+        n(SymbolKind::File, qp, name, measure, vec![])
+    }
+
+    fn screenshot_shaped_tree() -> SymbolTree {
+        let project = |qp: &str, name: &str, files: &[(&str, u64)]| {
+            folder(
+                qp,
+                name,
+                files
+                    .iter()
+                    .map(|(file_name, measure)| file(&format!("{qp}/{file_name}"), *measure))
+                    .collect(),
+            )
+        };
+        SymbolTree {
+            root: folder(
+                "",
+                "",
+                vec![
+                    folder(
+                        "engine",
+                        "engine",
+                        vec![
+                            project(
+                                "engine/core",
+                                "core",
+                                &[("world.rs", 170), ("entity.rs", 95), ("math.rs", 44)],
+                            ),
+                            project(
+                                "engine/render",
+                                "render",
+                                &[("renderer.rs", 130), ("camera.rs", 35), ("mesh.rs", 18)],
+                            ),
+                            project("engine/io", "io", &[("scene.rs", 70), ("asset.rs", 28)]),
+                        ],
+                    ),
+                    project(
+                        "editor",
+                        "editor",
+                        &[("workspace.rs", 74), ("panel.rs", 38), ("command.rs", 16)],
+                    ),
+                    project("tests", "tests", &[("layout_test.rs", 18), ("smoke.rs", 4)]),
+                    project("examples", "examples", &[("demo.rs", 14)]),
+                    project(
+                        "assets",
+                        "assets",
+                        &[("lighting.frag", 11), ("icon.png", 2)],
+                    ),
+                    project("docs", "docs", &[("guide.md", 16)]),
+                    project("vendor", "vendor", &[("shim.rs", 12)]),
+                    project("tools", "tools", &[("xtask.rs", 10)]),
+                    project("samples", "samples", &[("hello.rs", 7)]),
+                    project("generated", "generated", &[("bindings.rs", 6)]),
+                ],
+            ),
+            repo_root: "/x".into(),
+        }
+    }
+
+    fn assert_tree_geometry(node: &SymbolNode, packed: &PackLayout, config: &PackConfig) {
+        if node.children.is_empty() {
+            return;
+        }
+        let parent = packed.rects[&node.id];
+        let content_left = parent.x + config.gap;
+        let content_top = parent.y + config.container_header + config.gap;
+        let content_right = parent.x + parent.w - config.gap;
+        let content_bottom = parent.y + parent.h - config.gap;
+        for child in &node.children {
+            let child_rect = packed.rects[&child.id];
+            assert!(
+                child_rect.x >= content_left
+                    && child_rect.y >= content_top
+                    && child_rect.x + child_rect.w <= content_right
+                    && child_rect.y + child_rect.h <= content_bottom,
+                "{} lies outside {}'s content region",
+                child.id.qualified_path,
+                node.id.qualified_path
+            );
+        }
+        for (index, left) in node.children.iter().enumerate() {
+            let left_rect = packed.rects[&left.id];
+            for right in node.children.iter().skip(index + 1) {
+                let right_rect = packed.rects[&right.id];
+                let separated = left_rect.x + left_rect.w + config.gap <= right_rect.x
+                    || right_rect.x + right_rect.w + config.gap <= left_rect.x
+                    || left_rect.y + left_rect.h + config.gap <= right_rect.y
+                    || right_rect.y + right_rect.h + config.gap <= left_rect.y;
+                assert!(
+                    separated,
+                    "{} overlaps {} inside {}",
+                    left.id.qualified_path, right.id.qualified_path, node.id.qualified_path
+                );
+            }
+        }
+        for child in &node.children {
+            assert_tree_geometry(child, packed, config);
+        }
+    }
+
+    fn node_count(node: &SymbolNode) -> usize {
+        1 + node.children.iter().map(node_count).sum::<usize>()
+    }
+
+    #[test]
+    fn screenshot_shaped_folder_tree_is_denser_than_shelves_and_valid() {
+        let tree = screenshot_shaped_tree();
+        let config = cfg();
+        let packed = pack(&tree, &config);
+        let root = rect(&packed, "");
+        let skyline_content = (
+            root.w - 2.0 * config.gap,
+            root.h - config.container_header - 2.0 * config.gap,
+        );
+        let mut child_sizes: Vec<_> = tree
+            .root
+            .children
+            .iter()
+            .map(|child| {
+                let child_rect = packed.rects[&child.id];
+                (child.name.as_str(), (child_rect.w, child_rect.h))
+            })
+            .collect();
+        child_sizes.sort_by(|(left_name, left), (right_name, right)| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then(left_name.as_bytes().cmp(right_name.as_bytes()))
+        });
+        let child_sizes: Vec<_> = child_sizes.into_iter().map(|(_, size)| size).collect();
+        let shelf_target = choose_target_height(&child_sizes, config.gap, config.aspect);
+        let shelf_content = shelf_bounds(&child_sizes, config.gap, shelf_target);
+
+        assert!(
+            aspect_envelope_area(skyline_content, config.aspect)
+                < aspect_envelope_area(shelf_content, config.aspect),
+            "skyline {skyline_content:?} must beat shelves {shelf_content:?}"
+        );
+        assert_tree_geometry(&tree.root, &packed, &config);
+        assert_eq!(packed.rects.len(), node_count(&tree.root));
+    }
+
     #[test]
     fn folder_semantic_zones_preserve_hierarchy_and_do_not_interleave() {
         let examples = n(
