@@ -2893,9 +2893,6 @@ impl TreemapView {
 
         let button = div()
             .id("file-menu-button")
-            .absolute()
-            .top(px(8.0))
-            .left(px(8.0))
             .px(px(12.0))
             .py(px(6.0))
             .rounded(px(4.0))
@@ -2936,7 +2933,14 @@ impl TreemapView {
                 )
         });
 
-        Some(div().child(button).children(popup))
+        Some(
+            div()
+                .absolute()
+                .top(px(8.0))
+                .left(px(8.0))
+                .child(button)
+                .children(popup),
+        )
     }
 
     fn cg_source_lines(
