@@ -26,7 +26,14 @@ impl TypeResolver for PythonTypeResolver {
             bind_parameters(&mut env, params, source, enclosing_class);
         }
 
-        walk_body_for_bindings(tree.root_node(), source, &scope_range, class_names, fn_return_types, &mut env);
+        walk_body_for_bindings(
+            tree.root_node(),
+            source,
+            &scope_range,
+            class_names,
+            fn_return_types,
+            &mut env,
+        );
         env
     }
 }
@@ -177,8 +184,14 @@ mod tests {
         let func_start = src.find("def bark").unwrap();
         let range = func_start..src.len();
         let resolver = PythonTypeResolver;
-        let env =
-            resolver.build_scope_types(&bytes, &tree, range, Some("Dog"), &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            Some("Dog"),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("self"), Some("Dog"));
     }
 
@@ -188,7 +201,14 @@ mod tests {
         let (bytes, tree) = parse(src);
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
@@ -198,7 +218,14 @@ mod tests {
         let (bytes, tree) = parse(src);
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
@@ -208,7 +235,14 @@ mod tests {
         let (bytes, tree) = parse(src);
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &class_names(&["Foo"]), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &class_names(&["Foo"]),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
@@ -218,7 +252,14 @@ mod tests {
         let (bytes, tree) = parse(src);
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
@@ -228,8 +269,14 @@ mod tests {
         let (bytes, tree) = parse(src);
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
-        let env =
-            resolver.build_scope_types(&bytes, &tree, range, None, &class_names(&["Foo", "Bar"]), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &class_names(&["Foo", "Bar"]),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
@@ -239,7 +286,14 @@ mod tests {
         let (bytes, tree) = parse(src);
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), None);
     }
 
@@ -249,12 +303,22 @@ mod tests {
         let (bytes, tree) = parse(src);
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("self"), None);
     }
 
     fn fn_returns(entries: &[(&str, &str)]) -> HashMap<String, String> {
-        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -264,7 +328,11 @@ mod tests {
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
         let env = resolver.build_scope_types(
-            &bytes, &tree, range, None, &HashSet::new(),
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
             &fn_returns(&[("get_dog", "Dog")]),
         );
         assert_eq!(env.resolve("x"), Some("Dog"));
@@ -277,7 +345,11 @@ mod tests {
         let range = 0..src.len();
         let resolver = PythonTypeResolver;
         let env = resolver.build_scope_types(
-            &bytes, &tree, range, None, &class_names(&["Foo"]),
+            &bytes,
+            &tree,
+            range,
+            None,
+            &class_names(&["Foo"]),
             &fn_returns(&[("Foo", "SomethingElse")]),
         );
         assert_eq!(env.resolve("x"), Some("Foo"));
@@ -290,8 +362,14 @@ mod tests {
         let func_start = src.find("def bark").unwrap();
         let range = func_start..src.len();
         let resolver = PythonTypeResolver;
-        let env =
-            resolver.build_scope_types(&bytes, &tree, range, Some("Dog"), &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            Some("Dog"),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("self"), Some("Dog"));
     }
 }

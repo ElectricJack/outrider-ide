@@ -979,8 +979,8 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_make_items,
-        parse_glsl_items, parse_hlsl_items, parse_python_items, parse_rust_items, parse_ts_items,
+        parse_c_items, parse_cpp_items, parse_csharp_items, parse_glsl_items, parse_hlsl_items,
+        parse_js_items, parse_make_items, parse_python_items, parse_rust_items, parse_ts_items,
     };
     use crate::types::SymbolKind;
 

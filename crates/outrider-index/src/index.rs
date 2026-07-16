@@ -13,15 +13,14 @@ use rayon::prelude::*;
 
 use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
 use crate::parse::{
-    parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_make_items,
-    parse_glsl_items, parse_hlsl_items, parse_python_items, parse_rust_items, parse_ts_items,
+    parse_c_items, parse_cpp_items, parse_csharp_items, parse_glsl_items, parse_hlsl_items,
+    parse_js_items, parse_make_items, parse_python_items, parse_rust_items, parse_ts_items,
     parse_tsx_items, RawItem,
 };
 use crate::scan::{build_indexed_tree, discover_files};
 use crate::types::{
     dedupe_ids, finalize_children, finalize_children_in_source_order, IndexedFile, ParsedFile,
-    SymbolId, SymbolKind, SymbolNode,
-    SymbolTree,
+    SymbolId, SymbolKind, SymbolNode, SymbolTree,
 };
 use crate::SourceLanguage;
 
@@ -820,10 +819,8 @@ mod shader_tests {
             "glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "hlsl", "fx", "fxh",
         ] {
             assert!(
-                parser_for(
-                    SourceLanguage::for_path(Path::new(&format!("shader.{ext}"))).unwrap()
-                )
-                .is_some(),
+                parser_for(SourceLanguage::for_path(Path::new(&format!("shader.{ext}"))).unwrap())
+                    .is_some(),
                 "missing parser for {ext}"
             );
         }

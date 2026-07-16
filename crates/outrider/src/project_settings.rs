@@ -102,24 +102,26 @@ impl ExtensionCategory {
 pub fn categorize_extension(ext: &str) -> ExtensionCategory {
     match ext {
         "rs" | "py" | "js" | "jsx" | "ts" | "tsx" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp"
-        | "hxx" | "hh" | "cs" | "java" | "kt" | "kts" | "go" | "rb" | "php" | "swift"
-        | "m" | "mm" | "r" | "R" | "scala" | "clj" | "cljs" | "erl" | "ex" | "exs" | "hs"
-        | "lua" | "pl" | "pm" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd"
-        | "zig" | "nim" | "v" | "d" | "f90" | "f95" | "jl" | "ml" | "mli" | "fs" | "fsx"
-        | "dart" | "groovy" | "vb" | "vbs" | "asm" | "s" | "S" => ExtensionCategory::Code,
+        | "hxx" | "hh" | "cs" | "java" | "kt" | "kts" | "go" | "rb" | "php" | "swift" | "m"
+        | "mm" | "r" | "R" | "scala" | "clj" | "cljs" | "erl" | "ex" | "exs" | "hs" | "lua"
+        | "pl" | "pm" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "zig" | "nim"
+        | "v" | "d" | "f90" | "f95" | "jl" | "ml" | "mli" | "fs" | "fsx" | "dart" | "groovy"
+        | "vb" | "vbs" | "asm" | "s" | "S" => ExtensionCategory::Code,
 
-        "toml" | "json" | "yaml" | "yml" | "xml" | "ini" | "cfg" | "conf" | "env" | "properties"
-        | "plist" | "editorconfig" | "eslintrc" | "prettierrc" | "babelrc" | "nvmrc"
-        | "dockerignore" | "gitattributes" => ExtensionCategory::Config,
+        "toml" | "json" | "yaml" | "yml" | "xml" | "ini" | "cfg" | "conf" | "env"
+        | "properties" | "plist" | "editorconfig" | "eslintrc" | "prettierrc" | "babelrc"
+        | "nvmrc" | "dockerignore" | "gitattributes" => ExtensionCategory::Config,
 
-        "md" | "markdown" | "txt" | "rst" | "adoc" | "org" | "tex" | "latex" | "rdoc"
-        | "pod" => ExtensionCategory::Docs,
+        "md" | "markdown" | "txt" | "rst" | "adoc" | "org" | "tex" | "latex" | "rdoc" | "pod" => {
+            ExtensionCategory::Docs
+        }
 
         "css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" => ExtensionCategory::Styles,
 
         "html" | "htm" | "vue" | "svelte" | "erb" | "ejs" | "hbs" | "handlebars" | "pug"
-        | "jade" | "slim" | "haml" | "twig" | "jinja" | "jinja2" | "mustache" | "njk"
-        | "astro" => ExtensionCategory::Markup,
+        | "jade" | "slim" | "haml" | "twig" | "jinja" | "jinja2" | "mustache" | "njk" | "astro" => {
+            ExtensionCategory::Markup
+        }
 
         "exe" | "dll" | "obj" | "o" | "so" | "dylib" | "a" | "lib" | "pdb" | "class" | "pyc"
         | "pyo" | "wasm" | "bin" | "dat" | "db" | "sqlite" | "mdb" => ExtensionCategory::Binary,
@@ -128,8 +130,8 @@ pub fn categorize_extension(ext: &str) -> ExtensionCategory {
         | "mp3" | "mp4" | "wav" | "flac" | "ogg" | "avi" | "mkv" | "mov" | "wmv" | "webm"
         | "aac" | "m4a" => ExtensionCategory::Media,
 
-        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "lz" | "lzma" | "zst"
-        | "cab" | "dmg" | "iso" | "jar" | "war" | "ear" => ExtensionCategory::Archive,
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "lz" | "lzma" | "zst" | "cab"
+        | "dmg" | "iso" | "jar" | "war" | "ear" => ExtensionCategory::Archive,
 
         "ttf" | "otf" | "woff" | "woff2" | "eot" => ExtensionCategory::Font,
 

@@ -33,8 +33,8 @@ pub const MAX_TEX_H: usize = 1024;
 /// Maximum pixel dimension (longer side) for a container thumbnail.
 const CONTAINER_TEX_MAX: f64 = 1024.0;
 /// Increment whenever rasterization semantics change incompatibly.
-// Version 2 invalidates textures baked with the former 480-world-unit page width.
-pub const RENDER_SCHEMA_VERSION: u64 = 3;
+// Version 4 includes shared file-type classification for line-chunk textures.
+pub const RENDER_SCHEMA_VERSION: u64 = 4;
 
 /// One source line: text plus colored runs (byte length, 0xRRGGBB).
 pub type Line = (String, Vec<(usize, u32)>);
@@ -1554,7 +1554,7 @@ mod tests {
 
     #[test]
     fn render_schema_tracks_shared_file_type_classification() {
-        assert_eq!(RENDER_SCHEMA_VERSION, 3);
+        assert_eq!(RENDER_SCHEMA_VERSION, 4);
     }
 
     #[test]

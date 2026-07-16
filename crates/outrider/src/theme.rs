@@ -206,6 +206,7 @@ pub fn node_box_kind(is_leaf: bool, symbol_kind: &SymbolKind) -> BoxKind {
 
 fn file_extension_tint(path: &str) -> BoxTint {
     let file = path.split("::").next().unwrap_or(path);
+    let file = file.split('#').next().unwrap_or(file);
     let ext = file.rsplit('.').next().unwrap_or("");
     if ext == file {
         BoxTint::Normal
@@ -223,7 +224,8 @@ pub fn node_box_tint(node: &SymbolNode) -> BoxTint {
             _ => BoxTint::Normal,
         },
         SymbolKind::Item { .. } => file_extension_tint(&node.id.qualified_path),
-        SymbolKind::File | SymbolKind::Chunk => file_extension_tint(&node.name),
+        SymbolKind::File => file_extension_tint(&node.name),
+        SymbolKind::Chunk => file_extension_tint(&node.id.qualified_path),
     }
 }
 
@@ -319,6 +321,7 @@ mod tests {
     #[test]
     fn python_nodes_share_extension_tint_and_use_three_brightness_tiers() {
         let file = node(SymbolKind::File, "main.py", "main.py");
+        let chunk = node(SymbolKind::Chunk, "1-60", "main.py#0");
         let mut item = node(
             SymbolKind::Item {
                 label: "class".into(),
@@ -340,6 +343,7 @@ mod tests {
 
         let expected_tint = BoxTint::FileType(extension_tint("py"));
         assert_eq!(node_box_tint(&file), expected_tint);
+        assert_eq!(node_box_tint(&chunk), expected_tint);
         assert_eq!(node_box_tint(&item), expected_tint);
         assert_eq!(node_box_tint(&leaf), expected_tint);
         assert_eq!(node_box_kind(false, &file.id.kind), BoxKind::File);

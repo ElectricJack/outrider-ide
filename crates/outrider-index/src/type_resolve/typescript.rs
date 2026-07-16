@@ -30,7 +30,14 @@ impl TypeResolver for TypeScriptTypeResolver {
             bind_parameters(&mut env, params, source);
         }
 
-        walk_body_for_bindings(tree.root_node(), source, &scope_range, class_names, fn_return_types, &mut env);
+        walk_body_for_bindings(
+            tree.root_node(),
+            source,
+            &scope_range,
+            class_names,
+            fn_return_types,
+            &mut env,
+        );
         env
     }
 }
@@ -215,8 +222,14 @@ mod tests {
         let func_start = src.find("bark()").unwrap();
         let range = func_start..src.find("  }\n}").unwrap() + 3;
         let resolver = TypeScriptTypeResolver;
-        let env =
-            resolver.build_scope_types(&bytes, &tree, range, Some("Dog"), &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            Some("Dog"),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("this"), Some("Dog"));
     }
 
@@ -226,7 +239,14 @@ mod tests {
         let (bytes, tree) = parse_ts(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("this"), None);
     }
 
@@ -236,7 +256,14 @@ mod tests {
         let (bytes, tree) = parse_ts(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Bar"));
     }
 
@@ -246,7 +273,14 @@ mod tests {
         let (bytes, tree) = parse_ts(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Bar"));
     }
 
@@ -257,7 +291,14 @@ mod tests {
         let arrow_start = src.find("(svc").unwrap();
         let range = arrow_start..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("svc"), Some("Service"));
     }
 
@@ -267,8 +308,14 @@ mod tests {
         let (bytes, tree) = parse_ts(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env =
-            resolver.build_scope_types(&bytes, &tree, range, None, &class_names(&["Foo"]), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &class_names(&["Foo"]),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
@@ -278,14 +325,20 @@ mod tests {
         let (bytes, tree) = parse_ts(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
     #[test]
     fn first_binding_wins() {
-        let src =
-            "function f() {\n  const x = new Foo();\n  const x = new Bar();\n}\n";
+        let src = "function f() {\n  const x = new Foo();\n  const x = new Bar();\n}\n";
         let (bytes, tree) = parse_ts(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
@@ -306,7 +359,14 @@ mod tests {
         let (bytes, tree) = parse_ts(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), None);
     }
 
@@ -316,7 +376,14 @@ mod tests {
         let (bytes, tree) = parse_tsx(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("props"), Some("MyProps"));
     }
 
@@ -326,8 +393,14 @@ mod tests {
         let (bytes, tree) = parse_js(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env =
-            resolver.build_scope_types(&bytes, &tree, range, None, &class_names(&["Foo"]), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &class_names(&["Foo"]),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), Some("Foo"));
     }
 
@@ -337,12 +410,22 @@ mod tests {
         let (bytes, tree) = parse_js(src);
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
-        let env = resolver.build_scope_types(&bytes, &tree, range, None, &HashSet::new(), &HashMap::new());
+        let env = resolver.build_scope_types(
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(env.resolve("x"), None);
     }
 
     fn fn_returns(entries: &[(&str, &str)]) -> HashMap<String, String> {
-        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -352,7 +435,11 @@ mod tests {
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
         let env = resolver.build_scope_types(
-            &bytes, &tree, range, None, &HashSet::new(),
+            &bytes,
+            &tree,
+            range,
+            None,
+            &HashSet::new(),
             &fn_returns(&[("getDog", "Dog")]),
         );
         assert_eq!(env.resolve("x"), Some("Dog"));
@@ -365,7 +452,11 @@ mod tests {
         let range = 0..src.len();
         let resolver = TypeScriptTypeResolver;
         let env = resolver.build_scope_types(
-            &bytes, &tree, range, None, &class_names(&["Foo"]),
+            &bytes,
+            &tree,
+            range,
+            None,
+            &class_names(&["Foo"]),
             &fn_returns(&[("Foo", "SomethingElse")]),
         );
         assert_eq!(env.resolve("x"), Some("Foo"));

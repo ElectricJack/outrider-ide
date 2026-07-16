@@ -326,7 +326,10 @@ pub(crate) fn welcome_element(
     let keybindings: Vec<(String, &str)> = vec![
         ("Enter / Esc".into(), "Step into / out of focused node"),
         ("Arrow keys".into(), "Move focus spatially"),
-        ("Alt+Left / Alt+Right".into(), "Navigate history back / forward"),
+        (
+            "Alt+Left / Alt+Right".into(),
+            "Navigate history back / forward",
+        ),
         ("Home".into(), "Reset camera to fit all nodes"),
         ("End".into(), "Frame the focused node"),
         ("Scroll".into(), "Zoom in / out at cursor"),
@@ -404,7 +407,11 @@ fn checkbox_icon(checked: bool) -> gpui::Div {
     }
 }
 
-pub(crate) fn toolbar_toggle(id: impl Into<ElementId>, label: &str, checked: bool) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn toolbar_toggle(
+    id: impl Into<ElementId>,
+    label: &str,
+    checked: bool,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id.into())
         .flex()

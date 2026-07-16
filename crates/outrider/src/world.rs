@@ -515,9 +515,9 @@ mod tests {
         // Text: font ≥ 4 (ph/natural ≥ 4/12) AND pw ≥ CODE_MIN_W
         assert_eq!(leaf_draw(80.0, 400.0, 100.0), Some(Text)); // font 9.6
         assert_eq!(leaf_draw(80.0, 400.0, 200.0), Some(Text)); // font 4.8
-                                                                // Minimap: tall page, font sub-4
+                                                               // Minimap: tall page, font sub-4
         assert_eq!(leaf_draw(80.0, 400.0, 300.0), Some(Minimap)); // font 3.2
-                                                                   // width gate forces Minimap even when font clears 4
+                                                                  // width gate forces Minimap even when font clears 4
         assert_eq!(leaf_draw(80.0, 299.9, 100.0), Some(Minimap));
     }
 

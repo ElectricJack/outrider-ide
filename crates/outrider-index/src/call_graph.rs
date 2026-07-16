@@ -31,10 +31,7 @@ pub fn resolve_calls(center: &SymbolId, tree: &SymbolTree) -> CallGraphData {
 
     let file_rel = file_path_of(&center.qualified_path);
     let file_path = tree.repo_root.join(file_rel);
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     let language = match language_for(ext) {
         Some(l) => l,
@@ -63,7 +60,11 @@ pub fn resolve_calls(center: &SymbolId, tree: &SymbolTree) -> CallGraphData {
         let enclosing_class = find_enclosing_class(center);
         let fn_return_types: std::collections::HashMap<String, String> = all_fns
             .iter()
-            .filter_map(|f| f.return_type.as_ref().map(|rt| (f.name.clone(), rt.clone())))
+            .filter_map(|f| {
+                f.return_type
+                    .as_ref()
+                    .map(|rt| (f.name.clone(), rt.clone()))
+            })
             .collect();
         resolver.build_scope_types(
             &source,
@@ -294,19 +295,29 @@ fn extract_return_type(signature: &str, ext: &str) -> Option<String> {
             let after = &signature[paren_close + 1..];
             let colon = after.find(':')?;
             let ty = after[colon + 1..].trim().trim_end_matches('{').trim();
-            let word = ty.split(|c: char| c.is_whitespace() || c == '{' || c == '<')
+            let word = ty
+                .split(|c: char| c.is_whitespace() || c == '{' || c == '<')
                 .next()
                 .unwrap_or(ty);
-            if word.is_empty() { None } else { Some(word.to_string()) }
+            if word.is_empty() {
+                None
+            } else {
+                Some(word.to_string())
+            }
         }
         _ => {
             let arrow = signature.find(" -> ")?;
             let after = &signature[arrow + 4..];
             let ty = after.trim().trim_end_matches(':').trim();
-            let word = ty.split(|c: char| c.is_whitespace() || c == '{' || c == ':' || c == '<')
+            let word = ty
+                .split(|c: char| c.is_whitespace() || c == '{' || c == ':' || c == '<')
                 .next()
                 .unwrap_or(ty);
-            if word.is_empty() { None } else { Some(word.to_string()) }
+            if word.is_empty() {
+                None
+            } else {
+                Some(word.to_string())
+            }
         }
     }
 }
@@ -480,30 +491,23 @@ fn find_callers(
         if func.id == *target_id {
             continue;
         }
-        let file_data = file_cache
-            .entry(func.file_rel.clone())
-            .or_insert_with(|| {
-                let path = tree.repo_root.join(&func.file_rel);
-                let bytes = std::fs::read(&path).ok()?;
-                if memchr::memmem::find(&bytes, target_bytes).is_none() {
-                    return None;
-                }
-                let ext = func
-                    .file_rel
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let language = language_for(&ext)?;
-                let mut parser = tree_sitter::Parser::new();
-                parser.set_language(&language).ok()?;
-                let parsed = parser.parse(&bytes, None)?;
-                Some(FileData {
-                    source: bytes,
-                    parsed,
-                    ext,
-                })
-            });
+        let file_data = file_cache.entry(func.file_rel.clone()).or_insert_with(|| {
+            let path = tree.repo_root.join(&func.file_rel);
+            let bytes = std::fs::read(&path).ok()?;
+            if memchr::memmem::find(&bytes, target_bytes).is_none() {
+                return None;
+            }
+            let ext = func.file_rel.rsplit('.').next().unwrap_or("").to_string();
+            let language = language_for(&ext)?;
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language).ok()?;
+            let parsed = parser.parse(&bytes, None)?;
+            Some(FileData {
+                source: bytes,
+                parsed,
+                ext,
+            })
+        });
         let fd = match file_data {
             Some(fd) => fd,
             None => continue,
@@ -670,7 +674,9 @@ fn main() {
 
         let dog_speak = FnEntry {
             id: SymbolId {
-                kind: SymbolKind::Item { label: "fn".to_string() },
+                kind: SymbolKind::Item {
+                    label: "fn".to_string(),
+                },
                 qualified_path: "test.py::Dog::speak".to_string(),
                 ordinal: 0,
             },
@@ -681,7 +687,9 @@ fn main() {
         };
         let cat_speak = FnEntry {
             id: SymbolId {
-                kind: SymbolKind::Item { label: "fn".to_string() },
+                kind: SymbolKind::Item {
+                    label: "fn".to_string(),
+                },
                 qualified_path: "test.py::Cat::speak".to_string(),
                 ordinal: 0,
             },
@@ -691,20 +699,26 @@ fn main() {
             return_type: None,
         };
         let main_id = SymbolId {
-            kind: SymbolKind::Item { label: "fn".to_string() },
+            kind: SymbolKind::Item {
+                label: "fn".to_string(),
+            },
             qualified_path: "test.py::main".to_string(),
             ordinal: 0,
         };
 
         let all_fns = &[dog_speak, cat_speak];
-        let edges_without_env =
-            match_calls_to_symbols(&calls, all_fns, &main_id, None);
-        let speak_edges: Vec<_> = edges_without_env.iter().filter(|e| e.raw_name == "speak").collect();
+        let edges_without_env = match_calls_to_symbols(&calls, all_fns, &main_id, None);
+        let speak_edges: Vec<_> = edges_without_env
+            .iter()
+            .filter(|e| e.raw_name == "speak")
+            .collect();
         assert_eq!(speak_edges.len(), 2);
 
-        let edges_with_env =
-            match_calls_to_symbols(&calls, all_fns, &main_id, Some(&env));
-        let speak_edges: Vec<_> = edges_with_env.iter().filter(|e| e.raw_name == "speak").collect();
+        let edges_with_env = match_calls_to_symbols(&calls, all_fns, &main_id, Some(&env));
+        let speak_edges: Vec<_> = edges_with_env
+            .iter()
+            .filter(|e| e.raw_name == "speak")
+            .collect();
         assert_eq!(speak_edges.len(), 1);
         assert_eq!(speak_edges[0].target.qualified_path, "test.py::Dog::speak");
     }

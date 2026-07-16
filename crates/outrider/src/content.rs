@@ -2,9 +2,9 @@
 //! for each symbol kind × rung combination (spec §§3–4.4).
 //! Pure functions — no rendering; shared by the layout and paint paths.
 
-use outrider_index::{SymbolKind, SymbolNode};
 #[cfg(test)]
 use crate::world::Rung;
+use outrider_index::{SymbolKind, SymbolNode};
 
 /// Monospace body font size (px); shared by content math and the paint path.
 pub const FONT_PX: f64 = 12.0;

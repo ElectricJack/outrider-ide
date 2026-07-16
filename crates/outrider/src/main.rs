@@ -30,6 +30,25 @@ use crate::treemap::{
     ToggleProjectSettings, ToggleSettings, TreemapView,
 };
 
+pub(crate) const fn uses_native_application_menu(target_os: &str) -> bool {
+    matches!(target_os.as_bytes(), b"macos")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uses_native_application_menu;
+
+    #[test]
+    fn windows_needs_an_in_window_application_menu() {
+        assert!(!uses_native_application_menu("windows"));
+    }
+
+    #[test]
+    fn macos_uses_the_native_application_menu() {
+        assert!(uses_native_application_menu("macos"));
+    }
+}
+
 fn main() {
     let repo = match std::env::args().nth(1).map(PathBuf::from) {
         Some(path) => path,

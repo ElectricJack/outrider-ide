@@ -212,8 +212,7 @@ impl PreScanner {
     pub fn start(&mut self, repo_root: PathBuf) {
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let res = outrider_index::scan::pre_scan(&repo_root)
-                .map_err(|e| format!("{e:#}"));
+            let res = outrider_index::scan::pre_scan(&repo_root).map_err(|e| format!("{e:#}"));
             let _ = tx.send(res);
         });
         self.result = Some(rx);
