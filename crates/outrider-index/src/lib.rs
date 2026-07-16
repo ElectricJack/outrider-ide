@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod churn;
 pub mod dump;
 pub mod index;
+pub mod language;
 pub mod parse;
 pub mod scan;
 pub mod type_resolve;
@@ -19,5 +20,6 @@ pub use index::{
     index_repo_with_progress_outcome, index_repo_with_progress_outcome_cancellable, IndexOutcome,
     IndexProgress,
 };
+pub use language::SourceLanguage;
 pub use types::{dedupe_ids, finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
 pub use types::{IndexedFile, ParsedFile};

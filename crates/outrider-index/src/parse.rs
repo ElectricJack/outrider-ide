@@ -24,6 +24,169 @@ pub struct RawItem {
     pub children: Vec<RawItem>,
 }
 
+/// Extract Make rules while retaining all non-rule bytes as adjacent sections.
+pub fn parse_make_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_make::LANGUAGE.into())
+        .context("loading tree-sitter-make grammar")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter parse failed")?;
+
+    let mut rules = Vec::new();
+    collect_make_rules(tree.root_node(), &mut rules);
+    rules.sort_by_key(|node| (node.start_byte(), node.end_byte()));
+    let mut end = 0;
+    rules.retain(|node| {
+        if node.start_byte() < end {
+            false
+        } else {
+            end = node.end_byte();
+            true
+        }
+    });
+
+    let mut items = Vec::with_capacity(rules.len() * 2 + 1);
+    let mut cursor = 0;
+    for rule in rules {
+        if cursor < rule.start_byte() {
+            items.push(make_section(
+                cursor..rule.start_byte(),
+                tree.root_node(),
+                source,
+                cursor == 0,
+            ));
+        }
+        items.push(make_target(rule, source));
+        cursor = rule.end_byte();
+    }
+    if cursor < source.len() {
+        items.push(make_section(
+            cursor..source.len(),
+            tree.root_node(),
+            source,
+            cursor == 0,
+        ));
+    }
+    Ok(items)
+}
+
+fn collect_make_rules<'tree>(node: Node<'tree>, rules: &mut Vec<Node<'tree>>) {
+    if node.kind() == "rule" {
+        rules.push(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_make_rules(child, rules);
+    }
+}
+
+fn make_target(node: Node<'_>, source: &[u8]) -> RawItem {
+    let target = node
+        .child_by_field_name("targets")
+        .or_else(|| {
+            let mut cursor = node.walk();
+            let target = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "targets");
+            target
+        })
+        .or_else(|| node.child_by_field_name("target"))
+        .map(|target| node_text(target, source).trim().to_owned())
+        .unwrap_or_default();
+    let recipe_start = {
+        let mut cursor = node.walk();
+        let start = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "recipe")
+            .map(|recipe| recipe.start_byte());
+        start
+    };
+    let header_end = recipe_start.unwrap_or_else(|| node.end_byte());
+    let signature = String::from_utf8_lossy(&source[node.start_byte()..header_end])
+        .trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .to_owned();
+    let range = node.byte_range();
+    let line_count = source[range.clone()]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+        + usize::from(!source[range.clone()].ends_with(b"\n"));
+    RawItem {
+        kind: SymbolKind::Item {
+            label: "target".into(),
+        },
+        name: target,
+        signature,
+        doc: None,
+        byte_range: range,
+        line_count: line_count as u64,
+        children: Vec::new(),
+    }
+}
+
+fn make_section(range: Range<usize>, root: Node<'_>, source: &[u8], is_preamble: bool) -> RawItem {
+    let priorities = [
+        (
+            "Definitions",
+            &["define_directive", "undefine_directive"][..],
+        ),
+        ("Conditionals", &["conditional"][..]),
+        ("Includes", &["include_directive"][..]),
+        (
+            "Variables",
+            &[
+                "variable_assignment",
+                "shell_assignment",
+                "RECIPEPREFIX_assignment",
+                "VPATH_assignment",
+            ][..],
+        ),
+    ];
+    let name = priorities
+        .iter()
+        .find(|(_, kinds)| make_range_contains_kind(root, &range, kinds))
+        .map(|(label, _)| *label)
+        .unwrap_or(if is_preamble { "Preamble" } else { "Section" });
+    let line_count = source[range.clone()]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+        + usize::from(!source[range.clone()].ends_with(b"\n"));
+    RawItem {
+        kind: SymbolKind::Item {
+            label: "section".into(),
+        },
+        name: name.to_owned(),
+        signature: String::new(),
+        doc: None,
+        byte_range: range,
+        line_count: line_count as u64,
+        children: Vec::new(),
+    }
+}
+
+fn make_range_contains_kind(node: Node<'_>, range: &Range<usize>, kinds: &[&str]) -> bool {
+    if node.end_byte() <= range.start || node.start_byte() >= range.end {
+        return false;
+    }
+    if kinds.contains(&node.kind()) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|child| make_range_contains_kind(child, range, kinds));
+    found
+}
+
 type KindClassifier = dyn for<'tree> Fn(&str, Node<'tree>, &[u8]) -> Option<&'static str>;
 type NameExtractor = dyn for<'tree> Fn(Node<'tree>, &[u8]) -> String;
 type DocExtractor = dyn for<'tree> Fn(Node<'tree>, &[u8]) -> Option<String>;
@@ -642,8 +805,8 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_python_items,
-        parse_rust_items, parse_ts_items,
+        parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_make_items,
+        parse_python_items, parse_rust_items, parse_ts_items,
     };
     use crate::types::SymbolKind;
 
@@ -672,6 +835,122 @@ fn free() {
     let _ = Point::new();
 }
 "#;
+
+    fn assert_make_coverage(source: &[u8], items: &[super::RawItem]) {
+        if source.is_empty() {
+            assert!(items.is_empty());
+            return;
+        }
+        assert_eq!(items.first().unwrap().byte_range.start, 0);
+        assert_eq!(items.last().unwrap().byte_range.end, source.len());
+        for item in items {
+            assert!(item.byte_range.start < item.byte_range.end);
+        }
+        for pair in items.windows(2) {
+            assert!(pair[0].byte_range.start < pair[1].byte_range.start);
+            assert_eq!(pair[0].byte_range.end, pair[1].byte_range.start);
+        }
+    }
+
+    #[test]
+    fn make_extracts_explicit_pattern_multi_target_and_recipe_rules() {
+        let src = b"all: build\n\t@echo done\n\n%.o: %.c\n\t$(CC) -c $<\n\nclean install: prep\n\trm -f *.o\n";
+        let items = parse_make_items(src).unwrap();
+        let targets: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind.label() == "target")
+            .collect();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].name, "all");
+        assert_eq!(targets[0].signature, "all: build");
+        assert_eq!(targets[0].line_count, 3);
+        assert_eq!(targets[1].name, "%.o");
+        assert_eq!(targets[1].signature, "%.o: %.c");
+        assert_eq!(targets[2].name, "clean install");
+        assert_eq!(targets[2].signature, "clean install: prep");
+        assert_eq!(targets[2].children, vec![]);
+        assert_eq!(targets[2].doc, None);
+        assert_make_coverage(src, &items);
+    }
+
+    #[test]
+    fn make_static_pattern_rule_uses_actual_targets_for_name() {
+        let items = parse_make_items(b"objects: %.o: %.c\n\t$(CC) -c $<\n").unwrap();
+        let target = items
+            .iter()
+            .find(|item| item.kind.label() == "target")
+            .unwrap();
+
+        assert_eq!(target.name, "objects");
+        assert_eq!(target.signature, "objects: %.o: %.c");
+    }
+
+    #[test]
+    fn make_signature_includes_every_physical_line_of_a_continued_header() {
+        let src = concat!(
+            "bundle: first \\\n",
+            "    second \\\n",
+            "    third\n",
+            "\t@echo bundled\n",
+        )
+        .as_bytes();
+        let items = parse_make_items(src).unwrap();
+        let target = items
+            .iter()
+            .find(|item| item.kind.label() == "target")
+            .unwrap();
+        assert_eq!(
+            target.signature,
+            concat!("bundle: first \\\n", "    second \\\n", "    third")
+        );
+        assert_make_coverage(src, &items);
+    }
+
+    #[test]
+    fn make_preserves_and_labels_non_target_constructs() {
+        let src = b"# heading\nCC := cc\ninclude common.mk\n\nifeq ($(DEBUG),1)\ndebug: ; @echo debug\nendif\n\ndefine banner\nhello\nendef\n";
+        let items = parse_make_items(src).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind.label() == "target")
+                .count(),
+            1
+        );
+        let section_names: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind.label() == "section")
+            .map(|item| item.name.as_str())
+            .collect();
+        assert!(section_names.contains(&"Definitions"));
+        assert!(section_names.contains(&"Conditionals"));
+        assert_make_coverage(src, &items);
+
+        for (construct, expected) in [
+            (b"CC := cc\n".as_slice(), "Variables"),
+            (b"include common.mk\n".as_slice(), "Includes"),
+            (b"# heading\n".as_slice(), "Preamble"),
+        ] {
+            let section = parse_make_items(construct).unwrap();
+            assert_eq!(section[0].name, expected);
+        }
+    }
+
+    #[test]
+    fn make_target_free_and_malformed_sources_preserve_every_byte() {
+        for src in [
+            b"VAR = value\ninclude config.mk\n# comment\n".as_slice(),
+            b"broken: target\n\tunterminated $(value\nifeq (x,y\ntrailing".as_slice(),
+        ] {
+            let items = parse_make_items(src).unwrap();
+            assert_make_coverage(src, &items);
+            if !src.starts_with(b"broken") {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].kind.label(), "section");
+            }
+        }
+        assert!(parse_make_items(b"").unwrap().is_empty());
+    }
 
     #[test]
     fn extracts_nested_items_with_names_kinds_measures() {

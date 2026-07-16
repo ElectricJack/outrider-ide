@@ -13,14 +13,16 @@ use rayon::prelude::*;
 
 use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
 use crate::parse::{
-    parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_python_items,
-    parse_rust_items, parse_ts_items, parse_tsx_items, RawItem,
+    parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_make_items,
+    parse_python_items, parse_rust_items, parse_ts_items, parse_tsx_items, RawItem,
 };
 use crate::scan::{build_indexed_tree, discover_files};
 use crate::types::{
-    dedupe_ids, finalize_children, IndexedFile, ParsedFile, SymbolId, SymbolKind, SymbolNode,
+    dedupe_ids, finalize_children, finalize_children_in_source_order, IndexedFile, ParsedFile,
+    SymbolId, SymbolKind, SymbolNode,
     SymbolTree,
 };
+use crate::SourceLanguage;
 
 type CancellationCheck<'a> = dyn Fn() -> bool + Sync + 'a;
 
@@ -295,7 +297,8 @@ fn materialize_file(
 ) -> anyhow::Result<IndexedFile> {
     cancellation_checkpoint(is_cancelled)?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let parser = parser_for(ext);
+    let language = SourceLanguage::for_path(path);
+    let parser = language.and_then(parser_for);
     let retain = parser.is_some() || is_retained_text(ext);
     let known_len = source
         .len(path)
@@ -322,11 +325,17 @@ fn materialize_file(
                     .into_iter()
                     .map(|item| to_symbol_node(item, &file_qual))
                     .collect();
-                finalize_children(&mut parsed.items);
-                if ext == "rs" {
-                    parsed.doc = crate::parse::file_doc(&bytes);
-                } else if ext == "py" {
-                    parsed.doc = crate::parse::python_file_doc(&bytes);
+                if language == Some(SourceLanguage::Make) {
+                    finalize_children_in_source_order(&mut parsed.items);
+                } else {
+                    finalize_children(&mut parsed.items);
+                }
+                match language {
+                    Some(SourceLanguage::Rust) => parsed.doc = crate::parse::file_doc(&bytes),
+                    Some(SourceLanguage::Python) => {
+                        parsed.doc = crate::parse::python_file_doc(&bytes)
+                    }
+                    _ => {}
                 }
                 if let Some(p) = progress {
                     p.files_parsed.fetch_add(1, Ordering::Relaxed);
@@ -375,17 +384,18 @@ fn materialize_file(
 
 type ParserFn = fn(&[u8]) -> anyhow::Result<Vec<RawItem>>;
 
-fn parser_for(ext: &str) -> Option<ParserFn> {
-    match ext {
-        "rs" => Some(parse_rust_items),
-        "c" | "h" => Some(parse_c_items),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(parse_cpp_items),
-        "py" => Some(parse_python_items),
-        "js" | "jsx" => Some(parse_js_items),
-        "ts" => Some(parse_ts_items),
-        "tsx" => Some(parse_tsx_items),
-        "cs" => Some(parse_csharp_items),
-        _ => None,
+fn parser_for(language: SourceLanguage) -> Option<ParserFn> {
+    match language {
+        SourceLanguage::Rust => Some(parse_rust_items),
+        SourceLanguage::C => Some(parse_c_items),
+        SourceLanguage::Cpp => Some(parse_cpp_items),
+        SourceLanguage::Python => Some(parse_python_items),
+        SourceLanguage::JavaScript => Some(parse_js_items),
+        SourceLanguage::TypeScript => Some(parse_ts_items),
+        SourceLanguage::Tsx => Some(parse_tsx_items),
+        SourceLanguage::CSharp => Some(parse_csharp_items),
+        SourceLanguage::Make => Some(parse_make_items),
+        SourceLanguage::Markdown | SourceLanguage::Toml => None,
     }
 }
 

@@ -62,11 +62,7 @@ impl BufferManager {
             self.entries.push(e);
         } else {
             let text = std::fs::read_to_string(self.repo_root.join(rel_path)).ok()?;
-            let ext = std::path::Path::new(rel_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let mut buffer = FileBuffer::new(text, ext).ok()?;
+            let mut buffer = FileBuffer::new(text, std::path::Path::new(rel_path)).ok()?;
             let anchors = symbols
                 .iter()
                 .map(|(id, start)| (id.clone(), buffer.create_anchor(*start)))
@@ -167,6 +163,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = BufferManager::new(dir.path().to_path_buf());
         assert!(mgr.get("nope.rs", &[]).is_none());
+    }
+
+    #[test]
+    fn extensionless_makefile_materializes_with_highlights() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "Makefile", "# build\nall:\n\t@echo done\n");
+        let mut mgr = BufferManager::new(dir.path().to_path_buf());
+
+        let materialized = mgr.get("Makefile", &[]).unwrap();
+        assert!(materialized
+            .buffer
+            .line(0)
+            .unwrap()
+            .1
+            .iter()
+            .any(|span| { span.kind == outrider_index::buffer::HighlightKind::Comment }));
+        assert!(materialized
+            .buffer
+            .line(1)
+            .unwrap()
+            .1
+            .iter()
+            .any(|span| { span.kind == outrider_index::buffer::HighlightKind::Function }));
     }
 
     #[test]

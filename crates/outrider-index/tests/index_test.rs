@@ -9,6 +9,20 @@ fn find<'a>(node: &'a SymbolNode, qual: &str) -> Option<&'a SymbolNode> {
     node.children.iter().find_map(|c| find(c, qual))
 }
 
+fn assert_children_cover_source(file: &SymbolNode, source: &[u8]) {
+    assert!(!file.children.is_empty(), "expected parsed children");
+    let ranges: Vec<_> = file
+        .children
+        .iter()
+        .map(|child| child.byte_range.clone().expect("child byte range"))
+        .collect();
+    assert_eq!(ranges.first().unwrap().start, 0);
+    assert_eq!(ranges.last().unwrap().end, source.len());
+    for pair in ranges.windows(2) {
+        assert_eq!(pair[0].end, pair[1].start, "gap or overlap in coverage");
+    }
+}
+
 #[test]
 fn index_repo_parses_rust_files_into_items() {
     let dir = common::copy_fixture("mini_repo");
@@ -113,4 +127,47 @@ fn index_outcome_preserves_normalized_retained_source_fingerprints() {
         .keys()
         .all(|path| !path.contains('\\')));
     assert!(!outcome.source_fingerprints.contains_key("opaque"));
+}
+
+#[test]
+fn index_repo_parses_makefiles_by_complete_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let makefile = b"CC := cc\n\nall: build\n\t@echo done\n";
+    let rules = b"%.o: %.c\n\t$(CC) -c $<\n\nclean:\n\trm -f *.o\n";
+    std::fs::create_dir(dir.path().join("config")).unwrap();
+    std::fs::write(dir.path().join("Makefile"), makefile).unwrap();
+    std::fs::write(dir.path().join("config/rules.mk"), rules).unwrap();
+
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
+    let makefile_node = find(&tree.root, "Makefile").expect("Makefile node");
+    let rules_node = find(&tree.root, "config/rules.mk").expect("rules.mk node");
+
+    assert!(makefile_node.children.iter().any(|child| {
+        child.name == "all"
+            && child.id.kind
+                == SymbolKind::Item {
+                    label: "target".into(),
+                }
+    }));
+    assert!(rules_node.children.iter().any(|child| {
+        child.name == "clean"
+            && child.id.kind
+                == SymbolKind::Item {
+                    label: "target".into(),
+                }
+    }));
+    assert_children_cover_source(makefile_node, makefile);
+    assert_children_cover_source(rules_node, rules);
+}
+
+#[test]
+fn index_repo_keeps_make_children_in_source_byte_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = b"z-last: first\n\t@echo z\n\nVAR := value\n\na-first: last\n\t@echo a\n";
+    std::fs::write(dir.path().join("Makefile"), source).unwrap();
+
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
+    let makefile = find(&tree.root, "Makefile").expect("Makefile node");
+
+    assert_children_cover_source(makefile, source);
 }

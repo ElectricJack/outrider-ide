@@ -4,10 +4,13 @@
 //! Anchors track byte offsets through edits (Phase 6 incremental re-parse).
 
 use std::ops::Range;
+use std::path::Path;
 
 use anyhow::Context;
 use ropey::Rope;
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
+
+use crate::language::SourceLanguage;
 
 /// Handle to a tracked byte position (spec §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,59 +118,82 @@ const TOML_HIGHLIGHTS: &str = r#"
 [(offset_date_time) (local_date_time) (local_date) (local_time)] @string.special
 "#;
 
+/// Focused Make highlights using only stable grammar nodes and tokens.
+const MAKE_HIGHLIGHTS: &str = r#"
+(comment) @comment
+(variable_assignment name: (word) @property)
+(shell_assignment name: (word) @property)
+(targets (word) @function)
+[
+  "ifeq" "ifneq" "ifdef" "ifndef" "else" "endif" "if" "or" "and"
+] @conditional
+"foreach" @repeat
+[
+  "define" "endef" "vpath" "undefine" "export" "unexport" "override" "private"
+] @keyword
+["include" "sinclude" "-include"] @include
+["error" "warning" "info"] @exception
+[(text) (string) (raw_text)] @string
+"#;
+
 /// Construction, line/span access, minimap queries, and anchor management.
 impl FileBuffer {
-    /// `ext` is the bare lowercase file extension (no dot). Known
-    /// extensions parse and highlight; anything else is plain mode —
+    /// `path` selects a language from its complete filename. Known paths
+    /// parse and highlight; anything else is plain mode —
     /// no parse, every line's span list empty.
-    pub fn new(text: String, ext: &str) -> anyhow::Result<Self> {
-        let lang: Option<(tree_sitter::Language, String)> = match ext {
-            "rs" => Some((
-                tree_sitter_rust::LANGUAGE.into(),
-                tree_sitter_rust::HIGHLIGHTS_QUERY.to_owned(),
-            )),
-            "c" | "h" => Some((
-                tree_sitter_c::LANGUAGE.into(),
-                tree_sitter_c::HIGHLIGHT_QUERY.to_owned(),
-            )),
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some((
-                tree_sitter_cpp::LANGUAGE.into(),
-                format!(
-                    "{}\n{}",
-                    tree_sitter_c::HIGHLIGHT_QUERY,
-                    tree_sitter_cpp::HIGHLIGHT_QUERY
-                ),
-            )),
-            "md" => Some((
-                tree_sitter_md::LANGUAGE.into(),
-                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK.to_owned(),
-            )),
-            "toml" => Some((
-                tree_sitter_toml_ng::LANGUAGE.into(),
-                TOML_HIGHLIGHTS.to_owned(),
-            )),
-            "py" => Some((
-                tree_sitter_python::LANGUAGE.into(),
-                tree_sitter_python::HIGHLIGHTS_QUERY.to_owned(),
-            )),
-            "js" | "jsx" => Some((
-                tree_sitter_javascript::LANGUAGE.into(),
-                tree_sitter_javascript::HIGHLIGHT_QUERY.to_owned(),
-            )),
-            "ts" => Some((
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
-            )),
-            "tsx" => Some((
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
-                tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
-            )),
-            "cs" => Some((
-                tree_sitter_c_sharp::LANGUAGE.into(),
-                tree_sitter_c_sharp::HIGHLIGHTS_QUERY.to_owned(),
-            )),
-            _ => None,
-        };
+    pub fn new(text: String, path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let lang: Option<(tree_sitter::Language, String)> =
+            match SourceLanguage::for_path(path.as_ref()) {
+                Some(SourceLanguage::Rust) => Some((
+                    tree_sitter_rust::LANGUAGE.into(),
+                    tree_sitter_rust::HIGHLIGHTS_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::C) => Some((
+                    tree_sitter_c::LANGUAGE.into(),
+                    tree_sitter_c::HIGHLIGHT_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::Cpp) => Some((
+                    tree_sitter_cpp::LANGUAGE.into(),
+                    format!(
+                        "{}\n{}",
+                        tree_sitter_c::HIGHLIGHT_QUERY,
+                        tree_sitter_cpp::HIGHLIGHT_QUERY
+                    ),
+                )),
+                Some(SourceLanguage::Markdown) => Some((
+                    tree_sitter_md::LANGUAGE.into(),
+                    tree_sitter_md::HIGHLIGHT_QUERY_BLOCK.to_owned(),
+                )),
+                Some(SourceLanguage::Toml) => Some((
+                    tree_sitter_toml_ng::LANGUAGE.into(),
+                    TOML_HIGHLIGHTS.to_owned(),
+                )),
+                Some(SourceLanguage::Python) => Some((
+                    tree_sitter_python::LANGUAGE.into(),
+                    tree_sitter_python::HIGHLIGHTS_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::JavaScript) => Some((
+                    tree_sitter_javascript::LANGUAGE.into(),
+                    tree_sitter_javascript::HIGHLIGHT_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::TypeScript) => Some((
+                    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::Tsx) => Some((
+                    tree_sitter_typescript::LANGUAGE_TSX.into(),
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::CSharp) => Some((
+                    tree_sitter_c_sharp::LANGUAGE.into(),
+                    tree_sitter_c_sharp::HIGHLIGHTS_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::Make) => Some((
+                    tree_sitter_make::LANGUAGE.into(),
+                    MAKE_HIGHLIGHTS.to_owned(),
+                )),
+                _ => None,
+            };
         let (tree, lines) = match lang {
             Some((language, query_src)) => {
                 let mut parser = tree_sitter::Parser::new();
@@ -298,7 +324,9 @@ fn kind_for(capture: &str) -> Option<HighlightKind> {
         _ => {}
     }
     match capture.split('.').next().unwrap_or(capture) {
-        "keyword" => Some(HighlightKind::Keyword),
+        "keyword" | "conditional" | "repeat" | "include" | "exception" => {
+            Some(HighlightKind::Keyword)
+        }
         "function" => Some(HighlightKind::Function),
         "type" | "constructor" => Some(HighlightKind::Type),
         "string" | "escape" => Some(HighlightKind::String),
@@ -435,7 +463,7 @@ mod tests {
 
     #[test]
     fn highlight_kinds_and_bounds() {
-        let buf = FileBuffer::new(SNIPPET.to_string(), "rs").unwrap();
+        let buf = FileBuffer::new(SNIPPET.to_string(), "src/lib.rs").unwrap();
         assert_eq!(buf.len_lines(), 5);
         let (t0, s0) = buf.line(0).unwrap();
         assert_eq!(t0, "// a comment line");
@@ -468,7 +496,8 @@ mod tests {
     fn cpp_extensions_enable_syntax_highlighting() {
         let text = "// note\nclass Widget {\npublic:\n    int value = 42;\n};\n";
         for ext in ["cpp", "cc", "cxx", "hpp", "hxx", "hh"] {
-            let buf = FileBuffer::new(text.to_string(), ext).unwrap();
+            let path = format!("sample.{ext}");
+            let buf = FileBuffer::new(text.to_string(), path).unwrap();
             let (comment, comment_spans) = buf.line(0).unwrap();
             assert!(
                 comment_spans.iter().any(|span| {
@@ -481,7 +510,7 @@ mod tests {
 
     #[test]
     fn byte_to_line_and_anchor_roundtrip() {
-        let mut buf = FileBuffer::new(SNIPPET.to_string(), "rs").unwrap();
+        let mut buf = FileBuffer::new(SNIPPET.to_string(), "src/lib.rs").unwrap();
         assert_eq!(buf.byte_to_line(0), 0);
         assert_eq!(buf.byte_to_line(18), 1); // first byte of "fn free…"
         let a = buf.create_anchor(18);
@@ -492,7 +521,7 @@ mod tests {
     #[test]
     fn plain_mode_has_lines_but_no_spans() {
         let text = "alpha beta\n\ngamma\n";
-        let buf = FileBuffer::new(text.to_string(), "txt").unwrap();
+        let buf = FileBuffer::new(text.to_string(), "notes.txt").unwrap();
         assert_eq!(buf.len_lines(), 3);
         let (t0, s0) = buf.line(0).unwrap();
         assert_eq!(t0, "alpha beta");
@@ -504,7 +533,7 @@ mod tests {
         assert_eq!(t2, "gamma");
         assert!(s2.is_empty());
         // anchors still work in plain mode
-        let mut buf = FileBuffer::new(text.to_string(), "").unwrap();
+        let mut buf = FileBuffer::new(text.to_string(), "LICENSE").unwrap();
         let a = buf.create_anchor(12);
         assert_eq!(buf.byte_to_line(buf.resolve_anchor(a)), 2);
     }
@@ -513,7 +542,7 @@ mod tests {
 
     #[test]
     fn markdown_headings_and_fences_highlight() {
-        let buf = FileBuffer::new(MD_SNIPPET.to_string(), "md").unwrap();
+        let buf = FileBuffer::new(MD_SNIPPET.to_string(), "docs/guide.md").unwrap();
         assert_eq!(buf.len_lines(), 7);
         // heading content is Type ("text.title")
         let (t0, s0) = buf.line(0).unwrap();
@@ -540,7 +569,7 @@ mod tests {
 
     #[test]
     fn toml_keys_and_values_highlight() {
-        let buf = FileBuffer::new(TOML_SNIPPET.to_string(), "toml").unwrap();
+        let buf = FileBuffer::new(TOML_SNIPPET.to_string(), "Cargo.toml").unwrap();
         assert_eq!(buf.len_lines(), 4);
         let (t0, s0) = buf.line(0).unwrap();
         assert!(s0
@@ -566,7 +595,7 @@ mod tests {
     fn minimap_rows_report_indent_len_and_dominant_kind() {
         // line 0: comment; line 1: indented let with a string; line 2: blank
         let text = "// hello world\n    let s = \"xy\";\n\n";
-        let buf = FileBuffer::new(text.to_string(), "rs").unwrap();
+        let buf = FileBuffer::new(text.to_string(), "src/main.rs").unwrap();
         assert_eq!(buf.len_lines(), 3);
         let r0 = buf.minimap_row(0);
         assert_eq!(r0.indent, 0);
@@ -584,8 +613,66 @@ mod tests {
     #[test]
     fn minimap_dominant_kind_breaks_ties_by_first_occurrence() {
         // plain-mode line has no spans → Default
-        let buf = FileBuffer::new("abcdef\n".to_string(), "txt").unwrap();
+        let buf = FileBuffer::new("abcdef\n".to_string(), "notes.txt").unwrap();
         assert_eq!(buf.minimap_row(0).kind, HighlightKind::Default);
         assert_eq!(buf.minimap_row(0).len, 6);
+    }
+
+    #[test]
+    fn conventional_make_paths_highlight_make_syntax() {
+        const MAKE: &str =
+            "# build settings\nMODE := debug\ninclude common.mk\nifeq ($(MODE),debug)\nall: app\nendif\n";
+
+        for path in ["Makefile", "makefile", "GNUmakefile", "build/rules.mk"] {
+            let buf = FileBuffer::new(MAKE.to_string(), path).unwrap();
+            let (comment, comment_spans) = buf.line(0).unwrap();
+            assert!(
+                comment_spans.iter().any(|span| {
+                    span.kind == HighlightKind::Comment
+                        && &comment[span.range.clone()] == "# build settings"
+                }),
+                "{path}: missing comment highlight: {comment_spans:?}"
+            );
+
+            let (variable, variable_spans) = buf.line(1).unwrap();
+            assert!(
+                variable_spans.iter().any(|span| {
+                    span.kind == HighlightKind::Property && &variable[span.range.clone()] == "MODE"
+                }),
+                "{path}: missing variable highlight: {variable_spans:?}"
+            );
+
+            let (include, include_spans) = buf.line(2).unwrap();
+            assert!(
+                include_spans.iter().any(|span| {
+                    span.kind == HighlightKind::Keyword && &include[span.range.clone()] == "include"
+                }),
+                "{path}: missing include highlight: {include_spans:?}"
+            );
+
+            let (conditional, conditional_spans) = buf.line(3).unwrap();
+            assert!(
+                conditional_spans.iter().any(|span| {
+                    span.kind == HighlightKind::Keyword
+                        && &conditional[span.range.clone()] == "ifeq"
+                }),
+                "{path}: missing conditional highlight: {conditional_spans:?}"
+            );
+
+            let (target, target_spans) = buf.line(4).unwrap();
+            assert!(
+                target_spans.iter().any(|span| {
+                    span.kind == HighlightKind::Function && &target[span.range.clone()] == "all"
+                }),
+                "{path}: missing target highlight: {target_spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn make_capture_categories_map_to_existing_palette() {
+        for capture in ["conditional", "repeat", "include", "exception"] {
+            assert_eq!(kind_for(capture), Some(HighlightKind::Keyword), "{capture}");
+        }
     }
 }
