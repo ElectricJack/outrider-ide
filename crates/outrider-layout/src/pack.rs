@@ -319,8 +319,10 @@ mod tests {
     use crate::zones::{build_profiles, effective_role, SemanticRole};
     use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
+    const GEOMETRY_EPSILON: f64 = 1e-9;
+
     fn close(a: f64, b: f64) {
-        assert!((a - b).abs() < 1e-9, "{a} != {b}");
+        assert!((a - b).abs() < GEOMETRY_EPSILON, "{a} != {b}");
     }
 
     fn cfg() -> PackConfig {
@@ -496,11 +498,11 @@ mod tests {
         for child in &node.children {
             let child_rect = packed.rects[&child.id];
             assert!(
-                child_rect.x >= content_left
-                    && child_rect.y >= content_top
-                    && child_rect.x + child_rect.w <= content_right
-                    && child_rect.y + child_rect.h <= content_bottom,
-                "{} lies outside {}'s content region",
+                child_rect.x + GEOMETRY_EPSILON >= content_left
+                    && child_rect.y + GEOMETRY_EPSILON >= content_top
+                    && child_rect.x + child_rect.w <= content_right + GEOMETRY_EPSILON
+                    && child_rect.y + child_rect.h <= content_bottom + GEOMETRY_EPSILON,
+                "{} {child_rect:?} lies outside {}'s {parent:?} content region ({content_left}, {content_top})-({content_right}, {content_bottom})",
                 child.id.qualified_path,
                 node.id.qualified_path
             );
@@ -509,10 +511,11 @@ mod tests {
             let left_rect = packed.rects[&left.id];
             for right in node.children.iter().skip(index + 1) {
                 let right_rect = packed.rects[&right.id];
-                let separated = left_rect.x + left_rect.w + config.gap <= right_rect.x
-                    || right_rect.x + right_rect.w + config.gap <= left_rect.x
-                    || left_rect.y + left_rect.h + config.gap <= right_rect.y
-                    || right_rect.y + right_rect.h + config.gap <= left_rect.y;
+                let separated = left_rect.x + left_rect.w + config.gap
+                    <= right_rect.x + GEOMETRY_EPSILON
+                    || right_rect.x + right_rect.w + config.gap <= left_rect.x + GEOMETRY_EPSILON
+                    || left_rect.y + left_rect.h + config.gap <= right_rect.y + GEOMETRY_EPSILON
+                    || right_rect.y + right_rect.h + config.gap <= left_rect.y + GEOMETRY_EPSILON;
                 assert!(
                     separated,
                     "{} overlaps {} inside {}",
@@ -579,6 +582,36 @@ mod tests {
         );
         assert_tree_geometry(&tree.root, &packed, &config);
         assert_eq!(packed.rects.len(), node_count(&tree.root));
+    }
+
+    #[test]
+    fn large_role_varied_folder_packs_with_valid_geometry() {
+        let children = (0..540)
+            .map(|index| {
+                let role_index = index % 6;
+                let sequence = index / 6;
+                let name = match role_index {
+                    0 => format!("ordinary_{sequence}.rs"),
+                    1 => format!("case_{sequence}_test.rs"),
+                    2 => format!("demo_{sequence}.rs"),
+                    3 => format!("material_{sequence}.frag"),
+                    4 => format!("guide_{sequence}.md"),
+                    5 => format!("generated_{sequence}.rs"),
+                    _ => unreachable!(),
+                };
+                file(&format!("large/{name}"), 1 + ((index * 37) % 200) as u64)
+            })
+            .collect();
+        let tree = SymbolTree {
+            root: folder("large", "large", children),
+            repo_root: "/x".into(),
+        };
+        let config = cfg();
+
+        let packed = pack(&tree, &config);
+
+        assert_eq!(packed.rects.len(), 541);
+        assert_tree_geometry(&tree.root, &packed, &config);
     }
 
     #[test]

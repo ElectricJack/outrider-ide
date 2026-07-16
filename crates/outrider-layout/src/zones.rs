@@ -103,10 +103,11 @@ fn explicit_folder_role(name: &str) -> Option<SemanticRole> {
 }
 
 fn classify_file(name: &str) -> RoleProfile {
-    let (tokens, collapsed) = normalized(name);
-    let extension = name
+    let (stem, extension) = name
         .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase());
+        .map(|(stem, ext)| (stem, Some(ext.to_ascii_lowercase())))
+        .unwrap_or((name, None));
+    let (tokens, collapsed) = normalized(stem);
     let role = ROLES_BY_PRECEDENCE
         .into_iter()
         .find(|role| file_matches(*role, &tokens, &collapsed, extension.as_deref()))
@@ -333,6 +334,20 @@ mod tests {
         ];
         for (name, expected) in cases {
             assert_eq!(classify_file(name).role, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn generated_file_stem_punctuation_variants_share_role() {
+        for name in ["third_party.rs", "third-party.rs", "thirdparty.rs"] {
+            assert_eq!(
+                classify_file(name),
+                RoleProfile {
+                    role: SemanticRole::Generated,
+                    strong: true,
+                },
+                "{name}"
+            );
         }
     }
 
