@@ -13,14 +13,15 @@ use rayon::prelude::*;
 
 use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
 use crate::parse::{
-    parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_python_items,
-    parse_rust_items, parse_ts_items, parse_tsx_items, RawItem,
+    parse_c_items, parse_cpp_items, parse_csharp_items, parse_glsl_items, parse_hlsl_items,
+    parse_js_items, parse_python_items, parse_rust_items, parse_ts_items, parse_tsx_items, RawItem,
 };
 use crate::scan::{build_indexed_tree, discover_files};
 use crate::types::{
     dedupe_ids, finalize_children, IndexedFile, ParsedFile, SymbolId, SymbolKind, SymbolNode,
     SymbolTree,
 };
+use crate::SourceLanguage;
 
 type CancellationCheck<'a> = dyn Fn() -> bool + Sync + 'a;
 
@@ -295,7 +296,8 @@ fn materialize_file(
 ) -> anyhow::Result<IndexedFile> {
     cancellation_checkpoint(is_cancelled)?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let parser = parser_for(ext);
+    let language = SourceLanguage::for_path(path);
+    let parser = parser_for(language);
     let retain = parser.is_some() || is_retained_text(ext);
     let known_len = source
         .len(path)
@@ -375,16 +377,18 @@ fn materialize_file(
 
 type ParserFn = fn(&[u8]) -> anyhow::Result<Vec<RawItem>>;
 
-fn parser_for(ext: &str) -> Option<ParserFn> {
-    match ext {
-        "rs" => Some(parse_rust_items),
-        "c" | "h" => Some(parse_c_items),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(parse_cpp_items),
-        "py" => Some(parse_python_items),
-        "js" | "jsx" => Some(parse_js_items),
-        "ts" => Some(parse_ts_items),
-        "tsx" => Some(parse_tsx_items),
-        "cs" => Some(parse_csharp_items),
+fn parser_for(language: Option<SourceLanguage>) -> Option<ParserFn> {
+    match language? {
+        SourceLanguage::Rust => Some(parse_rust_items),
+        SourceLanguage::C => Some(parse_c_items),
+        SourceLanguage::Cpp => Some(parse_cpp_items),
+        SourceLanguage::Python => Some(parse_python_items),
+        SourceLanguage::JavaScript => Some(parse_js_items),
+        SourceLanguage::TypeScript => Some(parse_ts_items),
+        SourceLanguage::Tsx => Some(parse_tsx_items),
+        SourceLanguage::CSharp => Some(parse_csharp_items),
+        SourceLanguage::Glsl => Some(parse_glsl_items),
+        SourceLanguage::Hlsl => Some(parse_hlsl_items),
         _ => None,
     }
 }
@@ -795,5 +799,26 @@ mod tests {
 
         assert!(format!("{error:#}").contains("cancelled"));
         assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+}
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+
+    #[test]
+    fn shader_extensions_select_structural_parsers() {
+        for ext in [
+            "glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "hlsl", "fx", "fxh",
+        ] {
+            assert!(
+                parser_for(SourceLanguage::for_path(Path::new(&format!(
+                    "shader.{ext}"
+                ))))
+                .is_some(),
+                "missing parser for {ext}"
+            );
+        }
+        assert!(parser_for(SourceLanguage::for_path(Path::new("shader.vs"))).is_none());
+        assert!(parser_for(SourceLanguage::for_path(Path::new("shader.cs"))).is_some());
     }
 }
