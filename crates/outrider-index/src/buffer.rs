@@ -121,39 +121,50 @@ impl FileBuffer {
     /// extensions parse and highlight; anything else is plain mode —
     /// no parse, every line's span list empty.
     pub fn new(text: String, ext: &str) -> anyhow::Result<Self> {
-        let lang: Option<(tree_sitter::Language, &str)> = match ext {
+        let lang: Option<(tree_sitter::Language, String)> = match ext {
             "rs" => Some((
                 tree_sitter_rust::LANGUAGE.into(),
-                tree_sitter_rust::HIGHLIGHTS_QUERY,
+                tree_sitter_rust::HIGHLIGHTS_QUERY.to_owned(),
             )),
             "c" | "h" => Some((
                 tree_sitter_c::LANGUAGE.into(),
-                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_c::HIGHLIGHT_QUERY.to_owned(),
+            )),
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some((
+                tree_sitter_cpp::LANGUAGE.into(),
+                format!(
+                    "{}\n{}",
+                    tree_sitter_c::HIGHLIGHT_QUERY,
+                    tree_sitter_cpp::HIGHLIGHT_QUERY
+                ),
             )),
             "md" => Some((
                 tree_sitter_md::LANGUAGE.into(),
-                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+                tree_sitter_md::HIGHLIGHT_QUERY_BLOCK.to_owned(),
             )),
-            "toml" => Some((tree_sitter_toml_ng::LANGUAGE.into(), TOML_HIGHLIGHTS)),
+            "toml" => Some((
+                tree_sitter_toml_ng::LANGUAGE.into(),
+                TOML_HIGHLIGHTS.to_owned(),
+            )),
             "py" => Some((
                 tree_sitter_python::LANGUAGE.into(),
-                tree_sitter_python::HIGHLIGHTS_QUERY,
+                tree_sitter_python::HIGHLIGHTS_QUERY.to_owned(),
             )),
             "js" | "jsx" => Some((
                 tree_sitter_javascript::LANGUAGE.into(),
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_javascript::HIGHLIGHT_QUERY.to_owned(),
             )),
             "ts" => Some((
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
             )),
             "tsx" => Some((
                 tree_sitter_typescript::LANGUAGE_TSX.into(),
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                tree_sitter_typescript::HIGHLIGHTS_QUERY.to_owned(),
             )),
             "cs" => Some((
                 tree_sitter_c_sharp::LANGUAGE.into(),
-                tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+                tree_sitter_c_sharp::HIGHLIGHTS_QUERY.to_owned(),
             )),
             _ => None,
         };
@@ -166,7 +177,7 @@ impl FileBuffer {
                 let tree = parser
                     .parse(&text, None)
                     .context("tree-sitter parse failed")?;
-                let lines = highlight_lines(&text, &tree, &language, query_src)?;
+                let lines = highlight_lines(&text, &tree, &language, &query_src)?;
                 (Some(tree), lines)
             }
             None => (None, vec![Vec::new(); line_bounds(&text).len()]),
@@ -451,6 +462,21 @@ mod tests {
             }
         }
         assert!(buf.line(5).is_none());
+    }
+
+    #[test]
+    fn cpp_extensions_enable_syntax_highlighting() {
+        let text = "// note\nclass Widget {\npublic:\n    int value = 42;\n};\n";
+        for ext in ["cpp", "cc", "cxx", "hpp", "hxx", "hh"] {
+            let buf = FileBuffer::new(text.to_string(), ext).unwrap();
+            let (comment, comment_spans) = buf.line(0).unwrap();
+            assert!(
+                comment_spans.iter().any(|span| {
+                    span.kind == HighlightKind::Comment && &comment[span.range.clone()] == "// note"
+                }),
+                "{ext} did not highlight a C++ comment: {comment_spans:?}"
+            );
+        }
     }
 
     #[test]
