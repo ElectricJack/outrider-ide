@@ -3644,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "outrider"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cosmic-text",
  "dirs",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "outrider-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3687,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "outrider-layout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "outrider-index",
 ]
