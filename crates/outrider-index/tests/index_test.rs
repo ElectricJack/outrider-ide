@@ -11,12 +11,11 @@ fn find<'a>(node: &'a SymbolNode, qual: &str) -> Option<&'a SymbolNode> {
 
 fn assert_children_cover_source(file: &SymbolNode, source: &[u8]) {
     assert!(!file.children.is_empty(), "expected parsed children");
-    let mut ranges: Vec<_> = file
+    let ranges: Vec<_> = file
         .children
         .iter()
         .map(|child| child.byte_range.clone().expect("child byte range"))
         .collect();
-    ranges.sort_by_key(|range| range.start);
     assert_eq!(ranges.first().unwrap().start, 0);
     assert_eq!(ranges.last().unwrap().end, source.len());
     for pair in ranges.windows(2) {
@@ -159,4 +158,16 @@ fn index_repo_parses_makefiles_by_complete_path() {
     }));
     assert_children_cover_source(makefile_node, makefile);
     assert_children_cover_source(rules_node, rules);
+}
+
+#[test]
+fn index_repo_keeps_make_children_in_source_byte_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = b"z-last: first\n\t@echo z\n\nVAR := value\n\na-first: last\n\t@echo a\n";
+    std::fs::write(dir.path().join("Makefile"), source).unwrap();
+
+    let tree = index_repo(dir.path(), &[], &[]).unwrap();
+    let makefile = find(&tree.root, "Makefile").expect("Makefile node");
+
+    assert_children_cover_source(makefile, source);
 }

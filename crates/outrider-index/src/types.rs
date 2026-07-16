@@ -108,6 +108,16 @@ pub fn finalize_children(children: &mut [SymbolNode]) {
     }
 }
 
+/// Assign same-name ordinals while retaining the caller's source order.
+pub(crate) fn finalize_children_in_source_order(children: &mut [SymbolNode]) {
+    let mut next_ordinals = BTreeMap::<String, u16>::new();
+    for child in children {
+        let next = next_ordinals.entry(child.name.clone()).or_default();
+        child.id.ordinal = *next;
+        *next += 1;
+    }
+}
+
 /// Enforce tree-wide `SymbolId` uniqueness (spec §4.1: the ID is the stable
 /// identity used by layout keys). `finalize_children` disambiguates only
 /// within one sibling group; same-named children of same-named containers

@@ -88,7 +88,7 @@ fn collect_make_rules<'tree>(node: Node<'tree>, rules: &mut Vec<Node<'tree>>) {
 
 fn make_target(node: Node<'_>, source: &[u8]) -> RawItem {
     let target = node
-        .child_by_field_name("target")
+        .child_by_field_name("targets")
         .or_else(|| {
             let mut cursor = node.walk();
             let target = node
@@ -96,6 +96,7 @@ fn make_target(node: Node<'_>, source: &[u8]) -> RawItem {
                 .find(|child| child.kind() == "targets");
             target
         })
+        .or_else(|| node.child_by_field_name("target"))
         .map(|target| node_text(target, source).trim().to_owned())
         .unwrap_or_default();
     let recipe_start = {
@@ -870,6 +871,18 @@ fn free() {
         assert_eq!(targets[2].children, vec![]);
         assert_eq!(targets[2].doc, None);
         assert_make_coverage(src, &items);
+    }
+
+    #[test]
+    fn make_static_pattern_rule_uses_actual_targets_for_name() {
+        let items = parse_make_items(b"objects: %.o: %.c\n\t$(CC) -c $<\n").unwrap();
+        let target = items
+            .iter()
+            .find(|item| item.kind.label() == "target")
+            .unwrap();
+
+        assert_eq!(target.name, "objects");
+        assert_eq!(target.signature, "objects: %.o: %.c");
     }
 
     #[test]

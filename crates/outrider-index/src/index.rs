@@ -18,7 +18,8 @@ use crate::parse::{
 };
 use crate::scan::{build_indexed_tree, discover_files};
 use crate::types::{
-    dedupe_ids, finalize_children, IndexedFile, ParsedFile, SymbolId, SymbolKind, SymbolNode,
+    dedupe_ids, finalize_children, finalize_children_in_source_order, IndexedFile, ParsedFile,
+    SymbolId, SymbolKind, SymbolNode,
     SymbolTree,
 };
 use crate::SourceLanguage;
@@ -324,7 +325,11 @@ fn materialize_file(
                     .into_iter()
                     .map(|item| to_symbol_node(item, &file_qual))
                     .collect();
-                finalize_children(&mut parsed.items);
+                if language == Some(SourceLanguage::Make) {
+                    finalize_children_in_source_order(&mut parsed.items);
+                } else {
+                    finalize_children(&mut parsed.items);
+                }
                 match language {
                     Some(SourceLanguage::Rust) => parsed.doc = crate::parse::file_doc(&bytes),
                     Some(SourceLanguage::Python) => {
