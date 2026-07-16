@@ -803,6 +803,15 @@ fn expanded_leaf_bounds(packed: Rect, expanded_w: f64, extra_rows: usize) -> Rec
     }
 }
 
+fn call_graph_column_lefts(
+    focus_left: f32,
+    focus_right: f32,
+    column_width: f32,
+) -> (f32, f32) {
+    const GAP: f32 = 12.0;
+    (focus_left - column_width - GAP, focus_right + GAP)
+}
+
 fn defer_leaf_to_overlay(is_focused: bool, is_leaf: bool) -> bool {
     is_focused && is_leaf
 }
@@ -2868,12 +2877,32 @@ impl TreemapView {
 
     fn render_call_graph(
         &mut self,
+        vw: f64,
         vh: f64,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
-        let mode = self.call_graph.as_ref()?;
         let col_w = 320.0_f32;
         let col_h = (vh as f32 - 96.0).max(200.0);
+        let column_lefts = self.camera.and_then(|camera| {
+            let packed = *self.layout.rects.get(&self.focus.current)?;
+            let index = TreeIndex::new(&self.tree);
+            let node = index.node(&self.focus.current)?;
+            let expanded_w = if content::is_leaf_item(node) {
+                focused_width(max_line_chars(node, &mut self.buffers, &self.file_symbols))
+            } else {
+                packed.w
+            };
+            let (focus_left, _) = camera.world_to_screen(packed.x, packed.y, vw, vh);
+            let focus_right = focus_left + expanded_w * camera.zoom;
+            Some(call_graph_column_lefts(
+                focus_left as f32,
+                focus_right as f32,
+                col_w,
+            ))
+        });
+        let (callers_left, callees_left) =
+            column_lefts.unwrap_or((12.0, vw as f32 - col_w - 12.0));
+        let mode = self.call_graph.as_ref()?;
         let loading = mode.loading;
         let (caller_scroll, callee_scroll) = mode.scroll.current_offsets();
 
@@ -2973,10 +3002,28 @@ impl TreemapView {
             })
             .collect();
 
-        let callers_col =
-            Self::render_cg_column(&caller_items, "Callers", true, col_w, col_h, loading, caller_scroll, caller_sel);
-        let callees_col =
-            Self::render_cg_column(&callee_items, "Callees", false, col_w, col_h, loading, callee_scroll, callee_sel);
+        let callers_col = Self::render_cg_column(
+            &caller_items,
+            "Callers",
+            true,
+            callers_left,
+            col_w,
+            col_h,
+            loading,
+            caller_scroll,
+            caller_sel,
+        );
+        let callees_col = Self::render_cg_column(
+            &callee_items,
+            "Callees",
+            false,
+            callees_left,
+            col_w,
+            col_h,
+            loading,
+            callee_scroll,
+            callee_sel,
+        );
 
         Some(
             div()
@@ -2993,6 +3040,7 @@ impl TreemapView {
         items: &[CgColumnItem],
         title: &str,
         is_callers: bool,
+        left: f32,
         width: f32,
         col_h: f32,
         loading: bool,
@@ -3016,16 +3064,11 @@ impl TreemapView {
             .id(col_id)
             .absolute()
             .top(px(48.0))
+            .left(px(left))
             .w(px(width))
             .h(px(col_h))
             .overflow_hidden()
             .child(header);
-
-        if is_callers {
-            col = col.left(px(12.0));
-        } else {
-            col = col.right(px(12.0));
-        }
 
         if loading {
             col = col.child(
@@ -3681,7 +3724,7 @@ impl Render for TreemapView {
         let context_menu_overlay = self.render_context_menu(cx);
 
         // Build the call graph overlay.
-        let call_graph_overlay = self.render_call_graph(vh, cx);
+        let call_graph_overlay = self.render_call_graph(vw, vh, cx);
 
         // Build the delete-confirmation overlay.
         let delete_overlay = self.render_delete_confirm(vw, cx);
@@ -4200,7 +4243,8 @@ mod tests {
 
     use super::{
         container_body, container_children_have_images,
-        container_header_bg_h, container_header_layout, container_header_px, focused_width,
+        call_graph_column_lefts, container_header_bg_h, container_header_layout, container_header_px,
+        focused_width,
         header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body, leaf_texture_is_visible,
         max_line_chars, HEADER, LINE_STEP, BODY_PAD,
     };
@@ -4263,6 +4307,14 @@ mod tests {
         assert!((expanded.h - (100.0 + 3.0 * LINE_STEP)).abs() < 1e-9);
         assert_eq!(expanded.x + expanded.w / 2.0, 510.0);
         assert_eq!(expanded.y + expanded.h / 2.0, 20.0 + expanded.h / 2.0);
+    }
+
+    #[test]
+    fn call_graph_columns_are_anchored_to_the_focused_leaf() {
+        let (callers_left, callees_left) = call_graph_column_lefts(1520.0, 2320.0, 320.0);
+
+        assert_eq!(callers_left, 1188.0);
+        assert_eq!(callees_left, 2332.0);
     }
 
     #[test]
