@@ -136,6 +136,23 @@ const MAKE_HIGHLIGHTS: &str = r#"
 [(text) (string) (raw_text)] @string
 "#;
 
+const HLSL_HIGHLIGHTS: &str = r##"
+(comment) @comment
+(string_literal) @string
+(char_literal) @string
+(number_literal) @number
+(type_identifier) @type
+(primitive_type) @type
+(field_identifier) @property
+(function_declarator declarator: (identifier) @function)
+(call_expression function: (identifier) @function)
+[
+ "cbuffer" "struct" "return" "if" "else" "for" "while" "switch"
+ "case" "break" "continue" "discard" "const" "static" "groupshared"
+] @keyword
+[(preproc_directive) "#define" "#include" "#if" "#ifdef" "#ifndef" "#endif"] @keyword
+"##;
+
 /// Construction, line/span access, minimap queries, and anchor management.
 impl FileBuffer {
     /// `path` selects a language from its complete filename. Known paths
@@ -191,6 +208,14 @@ impl FileBuffer {
                 Some(SourceLanguage::Make) => Some((
                     tree_sitter_make::LANGUAGE.into(),
                     MAKE_HIGHLIGHTS.to_owned(),
+                )),
+                Some(SourceLanguage::Glsl) => Some((
+                    tree_sitter_glsl::LANGUAGE_GLSL.into(),
+                    tree_sitter_glsl::HIGHLIGHTS_QUERY.to_owned(),
+                )),
+                Some(SourceLanguage::Hlsl) => Some((
+                    tree_sitter_hlsl::LANGUAGE_HLSL.into(),
+                    HLSL_HIGHLIGHTS.to_owned(),
                 )),
                 _ => None,
             };
@@ -506,6 +531,57 @@ mod tests {
                 "{ext} did not highlight a C++ comment: {comment_spans:?}"
             );
         }
+    }
+
+    #[test]
+    fn shader_extensions_enable_syntax_highlighting() {
+        let glsl = "#version 450\n// note\nvoid main() { float x = 1.0; }\n";
+        for ext in ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese"] {
+            let buf = FileBuffer::new(glsl.to_string(), format!("shader.{ext}")).unwrap();
+            assert!(
+                buf.line(1)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Comment),
+                "{ext}"
+            );
+            assert!(
+                buf.line(2)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Function),
+                "{ext}"
+            );
+        }
+
+        let hlsl = "// note\ncbuffer Camera { float4x4 view; };\nfloat4 main() : SV_Target { return 1; }\n";
+        for ext in ["hlsl", "fx", "fxh"] {
+            let buf = FileBuffer::new(hlsl.to_string(), format!("shader.{ext}")).unwrap();
+            assert!(
+                buf.line(0)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Comment),
+                "{ext}"
+            );
+            assert!(
+                buf.line(2)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .any(|span| span.kind == HighlightKind::Function),
+                "{ext}"
+            );
+        }
+        assert!(FileBuffer::new(glsl.to_string(), "shader.vs")
+            .unwrap()
+            .line(1)
+            .unwrap()
+            .1
+            .is_empty());
     }
 
     #[test]

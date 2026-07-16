@@ -11,7 +11,7 @@ Git churn is visualized as a heat stripe on each box, so you can immediately spo
 ## Features
 
 - **Treemap layout** — entire codebase visible at once, zoom in to read code
-- **Syntax highlighting** — Rust, Python, C/C++, JavaScript, TypeScript, TSX, C#
+- **Syntax highlighting** — Rust, Python, C/C++, JavaScript, TypeScript, TSX, C#, GLSL, HLSL
 - **Fuzzy search** — find files (Ctrl+P) or symbols (Ctrl+T) instantly
 - **Git churn visualization** — heat stripes show commit frequency
 - **Keyboard navigation** — spatial arrow-key movement through the code map

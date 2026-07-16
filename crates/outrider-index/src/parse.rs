@@ -293,9 +293,9 @@ fn python_docstring(node: Node, src: &[u8]) -> Option<String> {
     let inner;
     let def = if node.kind() == "decorated_definition" {
         let mut cursor = node.walk();
-        inner = node.children(&mut cursor).find(|c| {
-            c.kind() == "function_definition" || c.kind() == "class_definition"
-        })?;
+        inner = node
+            .children(&mut cursor)
+            .find(|c| c.kind() == "function_definition" || c.kind() == "class_definition")?;
         inner
     } else {
         node
@@ -318,10 +318,7 @@ fn clean_docstring(raw: &str) -> Option<String> {
     let body = raw
         .strip_prefix("\"\"\"")
         .and_then(|s| s.strip_suffix("\"\"\""))
-        .or_else(|| {
-            raw.strip_prefix("'''")
-                .and_then(|s| s.strip_suffix("'''"))
-        })?;
+        .or_else(|| raw.strip_prefix("'''").and_then(|s| s.strip_suffix("'''")))?;
     let lines: Vec<&str> = body.lines().collect();
     if lines.is_empty() {
         return None;
@@ -662,6 +659,183 @@ pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     ))
 }
 
+/// Extract functions, structs, and named interface blocks from GLSL source.
+pub fn parse_glsl_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_glsl::LANGUAGE_GLSL.into())
+        .context("loading tree-sitter-glsl grammar")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter GLSL parse failed")?;
+    Ok(collect_shader_items(
+        tree.root_node(),
+        source,
+        ShaderLanguage::Glsl,
+    ))
+}
+
+/// Extract functions, structs, and constant buffers from HLSL source.
+pub fn parse_hlsl_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_hlsl::LANGUAGE_HLSL.into())
+        .context("loading tree-sitter-hlsl grammar")?;
+    let tree = parser
+        .parse(source, None)
+        .context("tree-sitter HLSL parse failed")?;
+    let mut items = collect_shader_items(tree.root_node(), source, ShaderLanguage::Hlsl);
+    items.extend(scan_hlsl_cbuffers(source));
+    items.sort_by_key(|item| item.byte_range.start);
+    Ok(items)
+}
+
+#[derive(Clone, Copy)]
+enum ShaderLanguage {
+    Glsl,
+    Hlsl,
+}
+
+fn collect_shader_items(node: Node, src: &[u8], language: ShaderLanguage) -> Vec<RawItem> {
+    let mut items = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let text = node_text(child, src);
+        let label = match child.kind() {
+            "function_definition" => Some("fn"),
+            "struct_specifier" => Some("struct"),
+            "cbuffer_specifier" if matches!(language, ShaderLanguage::Hlsl) => Some("cbuffer"),
+            "declaration"
+                if matches!(language, ShaderLanguage::Glsl)
+                    && text.contains('{')
+                    && ["uniform ", "buffer ", "in ", "out "]
+                        .iter()
+                        .any(|qualifier| text.contains(qualifier)) =>
+            {
+                Some("interface")
+            }
+            _ => None,
+        };
+        if let Some(label) = label {
+            if let Some(name) = shader_item_name(child, src, label) {
+                items.push(RawItem {
+                    kind: SymbolKind::Item {
+                        label: label.into(),
+                    },
+                    name,
+                    signature: item_signature(child, src),
+                    doc: item_doc(src, child.byte_range().start),
+                    byte_range: child.byte_range(),
+                    line_count: (child.end_position().row - child.start_position().row + 1) as u64,
+                    children: collect_shader_items(child, src, language),
+                });
+                continue;
+            }
+        }
+        items.extend(collect_shader_items(child, src, language));
+    }
+    items
+}
+
+fn shader_item_name(node: Node, src: &[u8], label: &str) -> Option<String> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(node_text(name, src));
+    }
+    if label == "interface" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "identifier")
+            .map(|name| node_text(name, src));
+    }
+    if label == "fn" {
+        let declarator = find_descendant(node, "function_declarator")?;
+        return find_descendant(declarator, "identifier").map(|name| node_text(name, src));
+    }
+    find_descendant(node, "identifier").map(|name| node_text(name, src))
+}
+
+fn find_descendant<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+        if let Some(found) = find_descendant(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn scan_hlsl_cbuffers(src: &[u8]) -> Vec<RawItem> {
+    let text = String::from_utf8_lossy(src);
+    let mut items = Vec::new();
+    let mut search = 0;
+    while let Some(relative) = text[search..].find("cbuffer") {
+        let start = search + relative;
+        let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after = start + "cbuffer".len();
+        let after_ok = text
+            .as_bytes()
+            .get(after)
+            .is_some_and(|byte| byte.is_ascii_whitespace());
+        if !before_ok || !after_ok {
+            search = after;
+            continue;
+        }
+        let name_start = after
+            + text[after..]
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(text.len() - after);
+        let name_end = name_start
+            + text[name_start..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(text.len() - name_start);
+        let Some(open_rel) = text[name_end..].find('{') else {
+            break;
+        };
+        let open = name_end + open_rel;
+        let mut depth = 0usize;
+        let mut end = text.len();
+        for (offset, byte) in text.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if name_start < name_end && end > open {
+            let range = start..end;
+            items.push(RawItem {
+                kind: SymbolKind::Item {
+                    label: "cbuffer".into(),
+                },
+                name: text[name_start..name_end].to_string(),
+                signature: text[range.clone()]
+                    .split('{')
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                doc: item_doc(src, start),
+                byte_range: range,
+                line_count: text[start..end].lines().count() as u64,
+                children: Vec::new(),
+            });
+        }
+        search = end.max(after);
+    }
+    items
+}
+
 /// Recursively walks a syntax tree, collecting nodes accepted by `kind_fn` into
 /// `RawItem`s; unrecognized nodes are transparent (children are still visited).
 fn collect_items(
@@ -806,7 +980,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_make_items,
-        parse_python_items, parse_rust_items, parse_ts_items,
+        parse_glsl_items, parse_hlsl_items, parse_python_items, parse_rust_items, parse_ts_items,
     };
     use crate::types::SymbolKind;
 
@@ -1146,10 +1320,7 @@ def f():
     pass
 "#;
         let items = parse_python_items(src).unwrap();
-        assert_eq!(
-            items[0].doc.as_deref(),
-            Some("Single-quoted docstring.")
-        );
+        assert_eq!(items[0].doc.as_deref(), Some("Single-quoted docstring."));
     }
 
     #[test]
@@ -1458,5 +1629,49 @@ void Foo::bar() {
         // Out-of-line Foo::bar
         assert_eq!(items[2].kind.label(), "fn");
         assert_eq!(items[2].name, "Foo::bar");
+    }
+
+    #[test]
+    fn glsl_extracts_structs_interfaces_functions_and_recovers() {
+        let src = br#"#version 450
+struct Light { vec3 position; };
+uniform Scene { mat4 view; } scene;
+out VertexData { vec3 normal; } vertex;
+void main() {}
+@broken
+void recover() {}
+"#;
+        let items = parse_glsl_items(src).unwrap();
+        let flat: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| (item.kind.label(), item.name.as_str()))
+            .collect();
+        assert!(flat.contains(&("struct", "Light")), "{flat:?}");
+        assert!(flat.contains(&("interface", "Scene")), "{flat:?}");
+        assert!(flat.contains(&("interface", "VertexData")), "{flat:?}");
+        assert!(flat.contains(&("fn", "main")), "{flat:?}");
+        assert!(flat.contains(&("fn", "recover")), "{flat:?}");
+        for item in &items {
+            assert!(!&src[item.byte_range.clone()].is_empty());
+        }
+    }
+
+    #[test]
+    fn hlsl_extracts_structs_cbuffers_functions_and_recovers() {
+        let src = br#"struct VSInput { float3 position : POSITION; };
+cbuffer Camera : register(b0) { float4x4 view; };
+float4 main(VSInput input) : SV_Target { return 1; }
+@broken
+float4 recover() : SV_Target { return 0; }
+"#;
+        let items = parse_hlsl_items(src).unwrap();
+        let flat: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| (item.kind.label(), item.name.as_str()))
+            .collect();
+        assert!(flat.contains(&("struct", "VSInput")), "{flat:?}");
+        assert!(flat.contains(&("cbuffer", "Camera")), "{flat:?}");
+        assert!(flat.contains(&("fn", "main")), "{flat:?}");
+        assert!(flat.contains(&("fn", "recover")), "{flat:?}");
     }
 }

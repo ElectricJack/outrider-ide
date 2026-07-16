@@ -14,7 +14,8 @@ use rayon::prelude::*;
 use crate::chunk::{strategy_for, CHUNK_MAX_LINES};
 use crate::parse::{
     parse_c_items, parse_cpp_items, parse_csharp_items, parse_js_items, parse_make_items,
-    parse_python_items, parse_rust_items, parse_ts_items, parse_tsx_items, RawItem,
+    parse_glsl_items, parse_hlsl_items, parse_python_items, parse_rust_items, parse_ts_items,
+    parse_tsx_items, RawItem,
 };
 use crate::scan::{build_indexed_tree, discover_files};
 use crate::types::{
@@ -395,6 +396,8 @@ fn parser_for(language: SourceLanguage) -> Option<ParserFn> {
         SourceLanguage::Tsx => Some(parse_tsx_items),
         SourceLanguage::CSharp => Some(parse_csharp_items),
         SourceLanguage::Make => Some(parse_make_items),
+        SourceLanguage::Glsl => Some(parse_glsl_items),
+        SourceLanguage::Hlsl => Some(parse_hlsl_items),
         SourceLanguage::Markdown | SourceLanguage::Toml => None,
     }
 }
@@ -805,5 +808,26 @@ mod tests {
 
         assert!(format!("{error:#}").contains("cancelled"));
         assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+}
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+
+    #[test]
+    fn shader_extensions_select_structural_parsers() {
+        for ext in [
+            "glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "hlsl", "fx", "fxh",
+        ] {
+            assert!(
+                parser_for(
+                    SourceLanguage::for_path(Path::new(&format!("shader.{ext}"))).unwrap()
+                )
+                .is_some(),
+                "missing parser for {ext}"
+            );
+        }
+        assert!(SourceLanguage::for_path(Path::new("shader.vs")).is_none());
+        assert!(parser_for(SourceLanguage::for_path(Path::new("shader.cs")).unwrap()).is_some());
     }
 }
