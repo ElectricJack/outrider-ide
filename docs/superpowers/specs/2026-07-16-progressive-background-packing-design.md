@@ -43,7 +43,7 @@ When packing reaches `N/N`, the exact final layout is installed, the overlay dis
 - packing: `nodes_packed / nodes_total`, starting at zero;
 - complete: terminal state, normally not rendered because the overlay is removed.
 
-The loader owns packing-stage atomics separate from `outrider_index::IndexProgress`. This avoids extending the indexing crate with layout-specific state. The worker sets the packing total and stores zero before it computes or publishes the draft, so polling can observe a real phase reset even if draft creation takes more than one UI frame.
+The loader owns packing-stage atomics separate from `outrider_index::IndexProgress`. This avoids extending the indexing crate with layout-specific state. An ordered `PackingStarted { total }` control event is queued before preview or completion; `ProjectLoader::poll` must expose it once as `Packing 0/N` before it may deliver later packing events. This guarantees a visible phase reset even when the worker advances before the next UI frame.
 
 The packing total is the number of symbol nodes in the immutable indexed tree. Progress is monotonic and counts each post-order node exactly once. Leaves advance progress even though their natural size is already known by the draft pass; containers advance progress after their final child arrangement has been committed.
 
@@ -53,13 +53,14 @@ The worker and UI exchange lifecycle events separately from replaceable layout s
 
 Lifecycle events are ordered and lossless:
 
+- `PackingStarted`: generation and exact node total;
 - `PreviewReady`: generation, immutable tree, complete draft layout, project metadata, cache namespace, warnings, and source fingerprints;
 - `Complete`: generation and exact final layout;
 - `Failed`: generation and error text.
 
 The worker retains the indexed tree for packing and sends one deep clone in `PreviewReady`. The clone happens on the worker thread, never the UI thread. This avoids a repository-wide conversion of tree ownership to `Arc<SymbolTree>` while still ensuring the tree is sent only once and project state is installed only once.
 
-Intermediate geometry uses a separate latest-only slot guarded by a short-lived mutex. Publishing overwrites the previous pending snapshot and never blocks. `ProjectLoader::poll` takes the newest available snapshot. A final event includes the final layout itself, so completion never depends on the UI first consuming a pending intermediate snapshot.
+Intermediate geometry uses a separate latest-only slot guarded by a short-lived mutex. Worker publication uses `try_lock`: contention or poisoning drops that intermediate snapshot rather than blocking or failing the load. `ProjectLoader::poll` takes the newest available snapshot. A final event includes the final layout itself, so completion never depends on the UI first consuming a pending intermediate snapshot. After preview delivery, a pending terminal event wins over the snapshot slot, clears it, and prevents any snapshot from being returned after terminal delivery.
 
 Every lifecycle event and snapshot carries the load generation. Starting another load cancels the current token, clears pending preview/snapshot state, and causes stale generations to be ignored. Packing checks cancellation between post-order nodes and before expensive folder arrangements and snapshot materialization.
 
@@ -77,6 +78,8 @@ The progressive engine maintains final local layout state for every node:
 - final child offsets once known;
 - whether the node has received its final arrangement;
 - deterministic post-order position.
+
+A top-down pass records the effective inherited semantic role for every node before bottom-up refinement. This preserves the existing behavior of weak ordinary folders nested under strong test, docs, generated, and other role contexts.
 
 The draft pass supplies the initial complete layout. The engine then walks nodes in deterministic post-order. When a node is finalized, all of its children already have final sizes, so it can use the same source-order shelf or semantic-zone skyline arrangement as `pack()`.
 
@@ -109,7 +112,7 @@ where
     E: FnMut(PackProgress);
 ```
 
-`max_snapshots` is clamped to the meaningful range for the tree and counts the draft and final snapshots. With a nonempty tree, the engine emits progress events for every value from zero through the node total. Only deterministic milestone events contain a layout snapshot.
+`max_snapshots` is clamped to an effective minimum of two and maximum of `total + 1`; the effective cap counts the required draft and final snapshots. With a nonempty tree, the engine emits progress events for every value from zero through the node total. Crossing a milestone makes a snapshot pending; the engine materializes it at the next geometry-changing container commit, while zero and the exact final total are unconditional snapshot endpoints.
 
 The existing `pack(tree, cfg) -> PackLayout` API remains available and uses the same final-arrangement helpers as the progressive engine. `pack()` does not pay for the draft pass. The progressive final result must compare exactly equal to `pack()`; there is one source of truth for role classification, ordering, skyline placement, shelf placement, and absolute coordinates.
 
@@ -131,7 +134,7 @@ If packing fails or panics after `PreviewReady`, the draft or latest valid inter
 
 Cancellation is cooperative. A superseded worker stops at checkpoints and may leave an obsolete snapshot in its local path, but generation checks prevent that snapshot or terminal event from mutating the active project.
 
-Mutex poisoning or disconnected worker channels become recoverable load errors. Snapshot-slot failure cannot invalidate an already published preview or final layout.
+Snapshot-slot contention or poisoning drops only an intermediate update. Disconnected lossless control channels become recoverable load errors. Neither condition can invalidate an already published preview or final layout.
 
 ## Automated testing
 
