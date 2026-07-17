@@ -441,40 +441,6 @@ impl Default for PreScanner {
     }
 }
 
-#[cfg(test)]
-fn load_project(
-    project_root: &Path,
-    settings: &Settings,
-    progress: &IndexProgress,
-    generation: u64,
-) -> Result<ProjectPreview, String> {
-    let project_namespace =
-        ProjectTextureNamespace::prepare(project_root).map_err(|error| error.to_string());
-    let disk_cache_bytes = settings.disk_cache_bytes(project_root);
-    let outcome = outrider_index::index_repo_with_progress_outcome_cancellable(
-        project_root,
-        &settings.filter_extensions,
-        &settings.filter_folders,
-        progress,
-        &|| false,
-    )
-    .map_err(|error| format!("{error:#}"))?;
-    let layout = outrider_layout::pack(
-        &outcome.tree,
-        &crate::world::pack_config(settings.node_padding),
-    );
-    Ok(ProjectPreview {
-        generation,
-        project_root: project_root.to_path_buf(),
-        tree: outcome.tree,
-        layout,
-        warnings: outcome.warnings,
-        source_fingerprints: outcome.source_fingerprints,
-        disk_cache_bytes,
-        project_namespace,
-    })
-}
-
 impl Drop for ProjectLoader {
     fn drop(&mut self) {
         if let Some(loading) = &self.loading {
@@ -606,10 +572,20 @@ fn count_nodes(node: &outrider_index::SymbolNode) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_project, ControlEvent, LayoutSnapshot, LoadPhase, LoaderPoll, LoadingState,
-        ProjectLoader, SnapshotMailbox, WorkerError,
+        ControlEvent, LayoutSnapshot, LoadPhase, LoaderPoll, LoadingState, ProjectLoader,
+        SnapshotMailbox, WorkerError,
     };
     use crate::settings::Settings;
+
+    #[test]
+    fn loader_has_only_the_staged_project_pipeline() {
+        let source = include_str!("project_loader.rs");
+
+        assert!(
+            !source.contains("\nfn load_project(\n"),
+            "a duplicate synchronous project-loading pipeline remains"
+        );
+    }
 
     #[test]
     fn newer_load_supersedes_older_result() {
@@ -625,11 +601,12 @@ mod tests {
     fn successful_indexed_preview_retains_project_metadata_and_layout() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let progress = outrider_index::IndexProgress::new();
+        let mut loader = ProjectLoader::new();
 
-        let preview = load_project(repo.path(), &Settings::default(), &progress, 7).unwrap();
+        let generation = loader.start(repo.path().to_path_buf(), Settings::default());
+        let preview = await_preview(&mut loader);
 
-        assert_eq!(preview.generation, 7);
+        assert_eq!(preview.generation, generation);
         assert_eq!(preview.project_root, repo.path());
         assert!(!preview.tree.root.children.is_empty());
         assert!(!preview.layout.rects.is_empty());
@@ -739,15 +716,52 @@ mod tests {
         LoadingState::for_test(generation, "project".into(), control, snapshots)
     }
 
+    fn await_preview(loader: &mut ProjectLoader) -> super::ProjectPreview {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "load timed out");
+            match loader.poll() {
+                LoaderPoll::Preview(preview) => return *preview,
+                LoaderPoll::Loading(_) => std::thread::yield_now(),
+                LoaderPoll::Failed { message, .. } => panic!("load failed: {message}"),
+                LoaderPoll::Idle | LoaderPoll::Snapshot { .. } | LoaderPoll::Complete { .. } => {}
+            }
+        }
+    }
+
     fn test_preview(generation: u64, width: f64) -> super::ProjectPreview {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let progress = outrider_index::IndexProgress::new();
-        let loaded =
-            load_project(repo.path(), &Settings::default(), &progress, generation).unwrap();
         super::ProjectPreview {
+            generation,
+            project_root: std::path::PathBuf::from("fixture-project"),
+            tree: test_tree(),
             layout: test_layout(width),
-            ..loaded
+            warnings: Vec::new(),
+            source_fingerprints: std::collections::BTreeMap::new(),
+            disk_cache_bytes: 0,
+            project_namespace: Err("fixture has no texture namespace".into()),
+        }
+    }
+
+    fn test_tree() -> outrider_index::SymbolTree {
+        use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
+
+        SymbolTree {
+            root: SymbolNode {
+                id: SymbolId {
+                    kind: SymbolKind::Folder,
+                    qualified_path: String::new(),
+                    ordinal: 0,
+                },
+                name: "fixture".into(),
+                byte_range: None,
+                signature: None,
+                doc: None,
+                measure: 1,
+                churn: 0.0,
+                churn_count: 0,
+                children: Vec::new(),
+            },
+            repo_root: std::path::PathBuf::from("fixture-project"),
         }
     }
 
@@ -834,16 +848,7 @@ mod tests {
 
     #[test]
     fn superseding_a_worker_cancels_progressive_packing() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let tree = load_project(
-            repo.path(),
-            &Settings::default(),
-            &outrider_index::IndexProgress::new(),
-            1,
-        )
-        .unwrap()
-        .tree;
+        let tree = test_tree();
         let (draft_tx, draft_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (exit_tx, exit_rx) = std::sync::mpsc::channel();
@@ -978,21 +983,6 @@ mod tests {
 
     #[test]
     fn background_load_prepares_same_namespace_for_canonical_aliases() {
-        fn await_preview(loader: &mut ProjectLoader) -> super::ProjectPreview {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                assert!(std::time::Instant::now() < deadline, "load timed out");
-                match loader.poll() {
-                    LoaderPoll::Preview(preview) => return *preview,
-                    LoaderPoll::Loading(_) => std::thread::yield_now(),
-                    LoaderPoll::Failed { message, .. } => panic!("load failed: {message}"),
-                    LoaderPoll::Idle
-                    | LoaderPoll::Snapshot { .. }
-                    | LoaderPoll::Complete { .. } => {}
-                }
-            }
-        }
-
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join("alias-segment")).unwrap();
         std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
