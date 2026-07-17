@@ -46,15 +46,183 @@ pub struct PackLayout {
     pub rects: BTreeMap<SymbolId, Rect>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LocalLayout {
+    pub(crate) size: (f64, f64),
+    pub(crate) children: BTreeMap<SymbolId, (f64, f64)>,
+}
+
+pub(crate) type ExactLayouts = BTreeMap<SymbolId, LocalLayout>;
+
 /// Pack the tree bottom-up (spec §3). Pure and deterministic; a
 /// container's internal layout depends only on its own children's sizes,
 /// so an edit repacks only its ancestor chain (hierarchical stability).
 pub fn pack(tree: &SymbolTree, cfg: &PackConfig) -> PackLayout {
     let profiles = build_profiles(&tree.root);
-    let mut rel = BTreeMap::new();
-    size(&tree.root, SemanticRole::Source, &profiles, cfg, &mut rel);
+    let layouts = build_exact_layouts(&tree.root, &profiles, cfg);
+    absolute_from_layouts(&tree.root, &layouts)
+}
+
+pub(crate) fn leaf_local_layout(node: &SymbolNode, cfg: &PackConfig) -> LocalLayout {
+    let h = cfg.header + (1.0 + node.measure as f64) * cfg.line_step + cfg.bottom_pad;
+    LocalLayout {
+        size: (cfg.page_w, h),
+        children: BTreeMap::new(),
+    }
+}
+
+pub(crate) fn build_exact_layouts(
+    root: &SymbolNode,
+    profiles: &RoleProfiles,
+    cfg: &PackConfig,
+) -> ExactLayouts {
+    fn build(
+        node: &SymbolNode,
+        inherited_role: SemanticRole,
+        profiles: &RoleProfiles,
+        cfg: &PackConfig,
+        layouts: &mut ExactLayouts,
+    ) {
+        let folder = matches!(node.id.kind, SymbolKind::Folder);
+        for child in &node.children {
+            let role = if folder {
+                effective_role(&child.id, inherited_role, profiles)
+            } else {
+                SemanticRole::Source
+            };
+            build(child, role, profiles, cfg, layouts);
+        }
+        let child_sizes = node
+            .children
+            .iter()
+            .map(|child| (child.id.clone(), layouts[&child.id].size))
+            .collect();
+        let layout = exact_local_layout(node, inherited_role, profiles, cfg, &child_sizes);
+        layouts.insert(node.id.clone(), layout);
+    }
+
+    let mut layouts = BTreeMap::new();
+    build(root, SemanticRole::Source, profiles, cfg, &mut layouts);
+    layouts
+}
+
+pub(crate) fn exact_local_layout(
+    node: &SymbolNode,
+    inherited_role: SemanticRole,
+    profiles: &RoleProfiles,
+    cfg: &PackConfig,
+    child_sizes: &BTreeMap<SymbolId, (f64, f64)>,
+) -> LocalLayout {
+    if node.children.is_empty() {
+        return leaf_local_layout(node, cfg);
+    }
+
+    let folder = matches!(node.id.kind, SymbolKind::Folder);
+    let measured: Vec<(&SymbolNode, (f64, f64), SemanticRole)> = node
+        .children
+        .iter()
+        .map(|child| {
+            let role = if folder {
+                effective_role(&child.id, inherited_role, profiles)
+            } else {
+                SemanticRole::Source
+            };
+            (child, child_sizes[&child.id], role)
+        })
+        .collect();
+
+    if folder {
+        let mut children: Vec<_> = measured
+            .into_iter()
+            .map(|(node, size, role)| FolderChild { node, size, role })
+            .collect();
+        let arrangement = arrange_folder(&mut children, cfg.gap, cfg.aspect);
+        let child_positions = arrangement
+            .positions
+            .into_iter()
+            .map(|(id, x, y)| (id, (cfg.gap + x, cfg.container_header + cfg.gap + y)))
+            .collect();
+        return LocalLayout {
+            size: (
+                arrangement.bounds.0 + 2.0 * cfg.gap,
+                cfg.container_header + arrangement.bounds.1 + 2.0 * cfg.gap,
+            ),
+            children: child_positions,
+        };
+    }
+
+    let mut order = measured;
+    let source_ordered = order.first().map(|(c, ..)| &c.id.kind) == Some(&SymbolKind::Chunk)
+        || (!matches!(node.id.kind, SymbolKind::Folder)
+            && file_ext(&node.id.qualified_path).is_some_and(is_source_ordered_ext));
+    if source_ordered {
+        order.sort_by(|(a, ..), (b, ..)| {
+            let ka = a.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
+            let kb = b.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
+            ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
+        });
+    } else {
+        order.sort_by(|(a, sa, _), (b, sb, _)| {
+            kind_rank(&a.id.kind)
+                .cmp(&kind_rank(&b.id.kind))
+                .then(sb.1.total_cmp(&sa.1))
+                .then(a.name.as_bytes().cmp(b.name.as_bytes()))
+                .then(a.id.ordinal.cmp(&b.id.ordinal))
+        });
+    }
+    let sizes: Vec<(f64, f64)> = order.iter().map(|(_, size, _)| *size).collect();
+    let target_h = choose_target_height(&sizes, cfg.gap, cfg.aspect);
+    let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut children = BTreeMap::new();
+    for &(child, (w, h), _) in &order {
+        if y > 0.0 && y + h > target_h {
+            x += col_w + cfg.gap;
+            y = 0.0;
+            col_w = 0.0;
+        }
+        children.insert(
+            child.id.clone(),
+            (cfg.gap + x, cfg.container_header + cfg.gap + y),
+        );
+        col_w = col_w.max(w);
+        content_h = content_h.max(y + h);
+        y += h + cfg.gap;
+    }
+    LocalLayout {
+        size: (
+            x + col_w + 2.0 * cfg.gap,
+            cfg.container_header + content_h + 2.0 * cfg.gap,
+        ),
+        children,
+    }
+}
+
+pub(crate) fn absolute_from_layouts(root: &SymbolNode, layouts: &ExactLayouts) -> PackLayout {
+    fn absolute(
+        node: &SymbolNode,
+        x: f64,
+        y: f64,
+        layouts: &ExactLayouts,
+        rects: &mut BTreeMap<SymbolId, Rect>,
+    ) {
+        let local = &layouts[&node.id];
+        rects.insert(
+            node.id.clone(),
+            Rect {
+                x,
+                y,
+                w: local.size.0,
+                h: local.size.1,
+            },
+        );
+        for child in &node.children {
+            let (rx, ry) = local.children[&child.id];
+            absolute(child, x + rx, y + ry, layouts, rects);
+        }
+    }
+
     let mut rects = BTreeMap::new();
-    absolute(&tree.root, 0.0, 0.0, &rel, &mut rects);
+    absolute(root, 0.0, 0.0, layouts, &mut rects);
     PackLayout { rects }
 }
 
@@ -195,122 +363,6 @@ fn choose_target_height(sizes: &[(f64, f64)], gap: f64, aspect: f64) -> f64 {
         }
     }
     best_height
-}
-
-/// Bottom-up size pass: returns (w, h) and records each node's position
-/// relative to its parent's origin in `rel` (x, y, w, h). The root's
-/// relative position stays (0, 0).
-fn size(
-    node: &SymbolNode,
-    inherited_role: SemanticRole,
-    profiles: &RoleProfiles,
-    cfg: &PackConfig,
-    rel: &mut BTreeMap<SymbolId, (f64, f64, f64, f64)>,
-) -> (f64, f64) {
-    if node.children.is_empty() {
-        let h = cfg.header + (1.0 + node.measure as f64) * cfg.line_step + cfg.bottom_pad;
-        rel.insert(node.id.clone(), (0.0, 0.0, cfg.page_w, h));
-        return (cfg.page_w, h);
-    }
-    let folder = matches!(node.id.kind, SymbolKind::Folder);
-    let measured: Vec<(&SymbolNode, (f64, f64), SemanticRole)> = node
-        .children
-        .iter()
-        .map(|child| {
-            let role = if folder {
-                effective_role(&child.id, inherited_role, profiles)
-            } else {
-                SemanticRole::Source
-            };
-            let dimensions = size(child, role, profiles, cfg, rel);
-            (child, dimensions, role)
-        })
-        .collect();
-
-    if folder {
-        let mut children: Vec<_> = measured
-            .into_iter()
-            .map(|(node, size, role)| FolderChild { node, size, role })
-            .collect();
-        let arrangement = arrange_folder(&mut children, cfg.gap, cfg.aspect);
-        for (id, x, y) in &arrangement.positions {
-            let entry = rel.get_mut(id).expect("child sized above");
-            entry.0 = cfg.gap + x;
-            entry.1 = cfg.container_header + cfg.gap + y;
-        }
-        let wh = (
-            arrangement.bounds.0 + 2.0 * cfg.gap,
-            cfg.container_header + arrangement.bounds.1 + 2.0 * cfg.gap,
-        );
-        rel.insert(node.id.clone(), (0.0, 0.0, wh.0, wh.1));
-        return wh;
-    }
-
-    // Re-derive the ordering invariant locally; never trust input Vec order.
-    let mut order = measured;
-    // Chunk children, and all descendants of source-ordered files (prose,
-    // declare-before-use C/C++), pack in source order: reorganizing them
-    // would break top-to-bottom reading.
-    let source_ordered = order.first().map(|(c, ..)| &c.id.kind) == Some(&SymbolKind::Chunk)
-        || (!matches!(node.id.kind, SymbolKind::Folder)
-            && file_ext(&node.id.qualified_path).is_some_and(is_source_ordered_ext));
-    if source_ordered {
-        order.sort_by(|(a, ..), (b, ..)| {
-            let ka = a.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
-            let kb = b.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
-            ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
-        });
-    } else {
-        // Kind groups (types → fns → classes → modules), tallest first within
-        // a group so greedy column fill becomes FFD; name then ordinal keep
-        // equal-height runs alphabetical and deterministic.
-        order.sort_by(|(a, sa, _), (b, sb, _)| {
-            kind_rank(&a.id.kind)
-                .cmp(&kind_rank(&b.id.kind))
-                .then(sb.1.total_cmp(&sa.1))
-                .then(a.name.as_bytes().cmp(b.name.as_bytes()))
-                .then(a.id.ordinal.cmp(&b.id.ordinal))
-        });
-    }
-    let sizes: Vec<(f64, f64)> = order.iter().map(|(_, size, _)| *size).collect();
-    let target_h = choose_target_height(&sizes, cfg.gap, cfg.aspect);
-    let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for &(child, (w, h), _) in &order {
-        if y > 0.0 && y + h > target_h {
-            x += col_w + cfg.gap;
-            y = 0.0;
-            col_w = 0.0;
-        }
-        let e = rel.get_mut(&child.id).expect("child sized above");
-        e.0 = cfg.gap + x;
-        e.1 = cfg.container_header + cfg.gap + y;
-        col_w = col_w.max(w);
-        content_h = content_h.max(y + h);
-        y += h + cfg.gap;
-    }
-    let wh = (
-        x + col_w + 2.0 * cfg.gap,
-        cfg.container_header + content_h + 2.0 * cfg.gap,
-    );
-    rel.insert(node.id.clone(), (0.0, 0.0, wh.0, wh.1));
-    wh
-}
-
-/// Top-down pass: converts relative positions from `size` into absolute
-/// world-space `Rect`s by accumulating parent offsets recursively.
-fn absolute(
-    node: &SymbolNode,
-    ox: f64,
-    oy: f64,
-    rel: &BTreeMap<SymbolId, (f64, f64, f64, f64)>,
-    out: &mut BTreeMap<SymbolId, Rect>,
-) {
-    let &(rx, ry, w, h) = &rel[&node.id];
-    let (x, y) = (ox + rx, oy + ry);
-    out.insert(node.id.clone(), Rect { x, y, w, h });
-    for c in &node.children {
-        absolute(c, x, y, rel, out);
-    }
 }
 
 #[cfg(test)]
