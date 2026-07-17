@@ -179,24 +179,7 @@ where
     let source_ordered = order.first().map(|(c, ..)| &c.id.kind) == Some(&SymbolKind::Chunk)
         || (!matches!(node.id.kind, SymbolKind::Folder)
             && file_ext(&node.id.qualified_path).is_some_and(is_source_ordered_ext));
-    if source_ordered {
-        order.sort_by(|(a, ..), (b, ..)| {
-            let ka = a.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
-            let kb = b.byte_range.as_ref().map(|r| r.start).unwrap_or(0);
-            ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
-        });
-    } else {
-        order.sort_by(|(a, sa, _), (b, sb, _)| {
-            kind_rank(&a.id.kind)
-                .cmp(&kind_rank(&b.id.kind))
-                .then(sb.1.total_cmp(&sa.1))
-                .then(a.name.as_bytes().cmp(b.name.as_bytes()))
-                .then(a.id.ordinal.cmp(&b.id.ordinal))
-        });
-    }
-    if is_cancelled() {
-        return Err(PackCancelled);
-    }
+    sort_non_folder_children_cancellable(&mut order, source_ordered, is_cancelled)?;
     let sizes: Vec<(f64, f64)> = order.iter().map(|(_, size, _)| *size).collect();
     let target_h = choose_target_height_cancellable(&sizes, cfg.gap, cfg.aspect, is_cancelled)?;
     let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -225,6 +208,42 @@ where
         ),
         children,
     })
+}
+
+fn sort_non_folder_children_cancellable<C>(
+    order: &mut [(&SymbolNode, (f64, f64), SemanticRole)],
+    source_ordered: bool,
+    is_cancelled: &C,
+) -> Result<(), PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
+    let cancelled_during_sort = Cell::new(false);
+    order.sort_by(|(a, sa, _), (b, sb, _)| {
+        if cancelled_during_sort.get() || is_cancelled() {
+            cancelled_during_sort.set(true);
+            return std::cmp::Ordering::Equal;
+        }
+        if source_ordered {
+            let ka = a.byte_range.as_ref().map(|range| range.start).unwrap_or(0);
+            let kb = b.byte_range.as_ref().map(|range| range.start).unwrap_or(0);
+            ka.cmp(&kb).then(a.id.ordinal.cmp(&b.id.ordinal))
+        } else {
+            kind_rank(&a.id.kind)
+                .cmp(&kind_rank(&b.id.kind))
+                .then(sb.1.total_cmp(&sa.1))
+                .then(a.name.as_bytes().cmp(b.name.as_bytes()))
+                .then(a.id.ordinal.cmp(&b.id.ordinal))
+        }
+    });
+    if cancelled_during_sort.get() || is_cancelled() {
+        Err(PackCancelled)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn absolute_from_layouts(root: &SymbolNode, layouts: &ExactLayouts) -> PackLayout {
@@ -948,6 +967,33 @@ mod tests {
         let first = choose_target_height(&sizes, 8.0, 1.6);
         let second = choose_target_height(&sizes, 8.0, 1.6);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cancellation_pulse_inside_non_folder_ordering_is_observed() {
+        let nodes: Vec<_> = (0..512)
+            .map(|index| {
+                n(
+                    SymbolKind::Item { label: "fn".into() },
+                    &format!("file.rs::item_{index}"),
+                    &format!("item_{index}"),
+                    index,
+                    vec![],
+                )
+            })
+            .collect();
+        let mut order: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node, (640.0, index as f64), SemanticRole::Source))
+            .collect();
+        let calls = Cell::new(0usize);
+        let result = sort_non_folder_children_cancellable(&mut order, false, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == 20
+        });
+        assert_eq!(result, Err(PackCancelled));
+        assert_eq!(calls.get(), 20);
     }
 
     #[test]

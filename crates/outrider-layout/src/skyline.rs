@@ -151,7 +151,7 @@ where
         }
         let (x, y) = best.expect("candidate width is clamped to the widest padded rectangle");
 
-        raise_skyline(&mut skyline, x, padded_w, y + padded_h);
+        raise_skyline_cancellable(&mut skyline, x, padded_w, y + padded_h, is_cancelled)?;
         positions.push((x, y));
         used_w = used_w.max(x + width);
         used_h = used_h.max(y + height);
@@ -162,11 +162,32 @@ where
     })
 }
 
+#[allow(dead_code)] // Non-cancellable compatibility wrapper used by skyline tests.
 fn raise_skyline(skyline: &mut Vec<Segment>, x: f64, width: f64, height: f64) {
+    raise_skyline_cancellable(skyline, x, width, height, &|| false)
+        .expect("never-cancel skyline raise")
+}
+
+fn raise_skyline_cancellable<C>(
+    skyline: &mut Vec<Segment>,
+    x: f64,
+    width: f64,
+    height: f64,
+    is_cancelled: &C,
+) -> Result<(), PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     let end = x + width;
     let mut next = Vec::with_capacity(skyline.len() + 2);
     let mut inserted = false;
     for segment in skyline.iter().copied() {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
         if segment.end() <= x {
             next.push(segment);
             continue;
@@ -204,6 +225,9 @@ fn raise_skyline(skyline: &mut Vec<Segment>, x: f64, width: f64, height: f64) {
 
     let mut merged: Vec<Segment> = Vec::with_capacity(next.len());
     for segment in next {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
         if let Some(last) = merged.last_mut() {
             if last.end() == segment.x && last.height == segment.height {
                 last.width += segment.width;
@@ -212,7 +236,11 @@ fn raise_skyline(skyline: &mut Vec<Segment>, x: f64, width: f64, height: f64) {
         }
         merged.push(segment);
     }
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     *skyline = merged;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -275,6 +303,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn cancellation_pulse_inside_raise_skyline_leaves_input_uncommitted() {
+        let mut skyline: Vec<_> = (0..512)
+            .map(|index| Segment {
+                x: index as f64,
+                width: 1.0,
+                height: (index % 7) as f64,
+            })
+            .collect();
+        let original = skyline.clone();
+        let calls = std::cell::Cell::new(0usize);
+        let result = raise_skyline_cancellable(&mut skyline, 64.0, 320.0, 20.0, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == 20
+        });
+        assert_eq!(result, Err(PackCancelled));
+        assert_eq!(calls.get(), 20);
+        assert_eq!(skyline, original);
     }
 
     #[test]

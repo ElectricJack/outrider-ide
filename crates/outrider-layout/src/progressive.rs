@@ -161,18 +161,38 @@ fn snapshot_milestones(total: usize, max_snapshots: usize) -> Vec<usize> {
     milestones
 }
 
+#[allow(dead_code)] // Non-cancellable compatibility wrapper for exact draft behavior.
 fn draft_local_layout(
     node: &SymbolNode,
     child_sizes: &BTreeMap<SymbolId, (f64, f64)>,
     cfg: &PackConfig,
 ) -> LocalLayout {
+    draft_local_layout_cancellable(node, child_sizes, cfg, &|| false)
+        .expect("never-cancel draft local layout")
+}
+
+fn draft_local_layout_cancellable<C>(
+    node: &SymbolNode,
+    child_sizes: &BTreeMap<SymbolId, (f64, f64)>,
+    cfg: &PackConfig,
+    is_cancelled: &C,
+) -> Result<LocalLayout, PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     if node.children.is_empty() {
-        return leaf_local_layout(node, cfg);
+        return Ok(leaf_local_layout(node, cfg));
     }
     let mut children = BTreeMap::new();
     let mut y = 0.0_f64;
     let mut width = 0.0_f64;
     for child in &node.children {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
         let (child_width, child_height) = child_sizes[&child.id];
         children.insert(
             child.id.clone(),
@@ -181,10 +201,13 @@ fn draft_local_layout(
         width = width.max(child_width);
         y += child_height + cfg.gap;
     }
-    LocalLayout {
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
+    Ok(LocalLayout {
         size: (width + 2.0 * cfg.gap, cfg.container_header + cfg.gap + y),
         children,
-    }
+    })
 }
 
 fn build_draft_layouts(
@@ -211,7 +234,7 @@ fn build_draft_layouts(
             }
             child_sizes.insert(child.id.clone(), layouts[&child.id].size);
         }
-        let local = draft_local_layout(node, &child_sizes, cfg);
+        let local = draft_local_layout_cancellable(node, &child_sizes, cfg, is_cancelled)?;
         if is_cancelled() {
             return Err(PackCancelled);
         }
@@ -253,7 +276,7 @@ fn materialize_hybrid(
                 }
                 child_sizes.insert(child.id.clone(), layouts[&child.id].size);
             }
-            draft_local_layout(node, &child_sizes, cfg)
+            draft_local_layout_cancellable(node, &child_sizes, cfg, is_cancelled)?
         };
         if is_cancelled() {
             return Err(PackCancelled);
@@ -318,8 +341,11 @@ mod tests {
 
     use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
-    use super::snapshot_milestones;
+    use super::{build_draft_layouts, materialize_hybrid, snapshot_milestones};
+    use crate::pack::ExactLayouts;
     use crate::{pack, pack_progressive, PackCancelled, PackConfig, PackLayout};
+
+    const GEOMETRY_EPSILON: f64 = 1e-9;
 
     fn cfg() -> PackConfig {
         PackConfig {
@@ -388,6 +414,22 @@ mod tests {
             assert!(rect.x + rect.w <= parent.x + parent.w - cfg.gap + f64::EPSILON);
             assert!(rect.y + rect.h <= parent.y + parent.h - cfg.gap + f64::EPSILON);
             assert_complete_valid_geometry(child, layout, cfg);
+        }
+        for (index, left) in node.children.iter().enumerate() {
+            let left_rect = layout.rects[&left.id];
+            for right in node.children.iter().skip(index + 1) {
+                let right_rect = layout.rects[&right.id];
+                let separated = left_rect.x + left_rect.w + cfg.gap
+                    <= right_rect.x + GEOMETRY_EPSILON
+                    || right_rect.x + right_rect.w + cfg.gap <= left_rect.x + GEOMETRY_EPSILON
+                    || left_rect.y + left_rect.h + cfg.gap <= right_rect.y + GEOMETRY_EPSILON
+                    || right_rect.y + right_rect.h + cfg.gap <= left_rect.y + GEOMETRY_EPSILON;
+                assert!(
+                    separated,
+                    "{} overlaps {} inside {}",
+                    left.id.qualified_path, right.id.qualified_path, node.id.qualified_path
+                );
+            }
         }
     }
 
@@ -483,6 +525,23 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "overlaps")]
+    fn snapshot_validator_rejects_siblings_without_configured_gap() {
+        let fixture = tree(node(
+            SymbolKind::Folder,
+            "root",
+            0,
+            vec![leaf("root/left.rs", 0), leaf("root/right.rs", 1)],
+        ));
+        let mut layout = pack(&fixture, &cfg());
+        let left = layout.rects[&fixture.root.children[0].id];
+        layout
+            .rects
+            .insert(fixture.root.children[1].id.clone(), left);
+        assert_complete_valid_geometry(&fixture.root, &layout, &cfg());
+    }
+
+    #[test]
     fn one_node_and_deep_trees_are_exact() {
         assert_progressive_contract(&tree(leaf("only.rs", 0)), 0);
         let mut deep = leaf("root/a/b/c/end.rs", 0);
@@ -530,21 +589,103 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_pulse_inside_initial_draft_child_loop_is_observed() {
+        let fixture = tree(node(
+            SymbolKind::Folder,
+            "root",
+            0,
+            (0..512)
+                .map(|i| leaf(&format!("root/file_{i}.rs"), i))
+                .collect(),
+        ));
+        let calls = Cell::new(0usize);
+        let result = build_draft_layouts(&fixture.root, &cfg(), &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == 2_100
+        });
+        assert!(
+            matches!(result, Err(PackCancelled)),
+            "checks: {}",
+            calls.get()
+        );
+        assert_eq!(calls.get(), 2_100);
+    }
+
+    #[test]
+    fn initial_draft_inner_cancellation_emits_no_progress() {
+        let fixture = tree(node(
+            SymbolKind::Folder,
+            "root",
+            0,
+            (0..512)
+                .map(|i| leaf(&format!("root/file_{i}.rs"), i))
+                .collect(),
+        ));
+        let calls = Cell::new(0usize);
+        let mut events = Vec::new();
+        let result = pack_progressive(
+            &fixture,
+            &cfg(),
+            30,
+            || {
+                calls.set(calls.get() + 1);
+                calls.get() == 2_300
+            },
+            |event| events.push(event),
+        );
+        assert_eq!(result, Err(PackCancelled));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn cancellation_pulse_inside_hybrid_draft_child_loop_is_observed() {
+        let fixture = tree(node(
+            SymbolKind::Folder,
+            "root",
+            0,
+            (0..512)
+                .map(|i| leaf(&format!("root/file_{i}.rs"), i))
+                .collect(),
+        ));
+        let calls = Cell::new(0usize);
+        let result = materialize_hybrid(&fixture.root, &ExactLayouts::new(), &cfg(), &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == 2_100
+        });
+        assert!(
+            matches!(result, Err(PackCancelled)),
+            "checks: {}",
+            calls.get()
+        );
+        assert_eq!(calls.get(), 2_100);
+    }
+
+    #[test]
     fn cancellation_after_selected_progress_emits_nothing_later() {
         let completed = Cell::new(0usize);
-        let mut seen = Vec::new();
+        let fixture = varied_tree();
+        let mut events = Vec::new();
         let result = pack_progressive(
-            &varied_tree(),
+            &fixture,
             &cfg(),
             30,
             || completed.get() >= 4,
             |event| {
                 completed.set(event.completed);
-                seen.push(event.completed);
+                events.push(event);
             },
         );
         assert_eq!(result, Err(PackCancelled));
-        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.completed)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        for snapshot in events.iter().filter_map(|event| event.snapshot.as_ref()) {
+            assert_complete_valid_geometry(&fixture.root, snapshot, &cfg());
+        }
     }
 
     #[test]
