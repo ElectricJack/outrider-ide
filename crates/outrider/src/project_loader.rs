@@ -433,6 +433,10 @@ impl PreScanner {
     pub fn is_scanning(&self) -> bool {
         self.result.is_some()
     }
+
+    pub fn cancel(&mut self) {
+        self.result = None;
+    }
 }
 
 impl Default for PreScanner {

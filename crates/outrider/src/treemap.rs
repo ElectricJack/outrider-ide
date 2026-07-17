@@ -603,8 +603,10 @@ impl PackingGeometryState<'_> {
     }
 
     fn fail_after_preview(&mut self) {
+        if let Some(target) = self.target.take() {
+            *self.layout = target;
+        }
         *self.transition = None;
-        *self.target = None;
         *self.progress = None;
         self.invalidate();
     }
@@ -612,6 +614,15 @@ impl PackingGeometryState<'_> {
 
 fn map_interaction_enabled_for(loader: &ProjectLoader) -> bool {
     !loader.is_loading()
+}
+
+fn project_setup_available_for(has_setup: bool, loader: &ProjectLoader) -> bool {
+    has_setup && !loader.is_loading()
+}
+
+fn clear_project_setup_before_load<T>(project_setup: &mut Option<T>, pre_scanner: &mut PreScanner) {
+    *project_setup = None;
+    pre_scanner.cancel();
 }
 
 struct RenameState {
@@ -2739,6 +2750,7 @@ impl TreemapView {
     /// Spawn a background thread to index `folder` and compute its layout.
     fn start_loading(&mut self, folder: std::path::PathBuf) {
         self.loader.start(folder, self.settings.clone());
+        clear_project_setup_before_load(&mut self.project_setup, &mut self.pre_scanner);
         self.layout_transition = None;
         self.packing_target_layout = None;
         self.drag_last = None;
@@ -2821,6 +2833,10 @@ impl TreemapView {
     }
 
     fn poll_pre_scan(&mut self) -> bool {
+        if self.loader.is_loading() {
+            self.pre_scanner.cancel();
+            return false;
+        }
         match self.pre_scanner.poll() {
             PreScanPoll::Idle | PreScanPoll::Scanning => self.pre_scanner.is_scanning(),
             PreScanPoll::Ready(result) => match result {
@@ -2842,6 +2858,9 @@ impl TreemapView {
     }
 
     fn confirm_project_setup(&mut self) {
+        if !project_setup_available_for(self.project_setup.is_some(), &self.loader) {
+            return;
+        }
         if let Some(draft) = self.project_setup.take() {
             let ps = draft.to_project_settings();
             if let Err(e) = ps.save(&self.tree.repo_root) {
@@ -3982,8 +4001,10 @@ impl Render for TreemapView {
 
         let (vw, vh) = Self::map_viewport(window);
         let is_loading = self.loader.is_loading();
+        let project_setup_available =
+            project_setup_available_for(self.project_setup.is_some(), &self.loader);
 
-        let skip_treemap = self.project_setup.is_some();
+        let skip_treemap = project_setup_available;
         let (items, doc_panel, cg_scrim) = if skip_treemap {
             (Vec::new(), None, false)
         } else {
@@ -4036,7 +4057,7 @@ impl Render for TreemapView {
         let has_overlays = self.palette.is_open()
             || self.settings_draft.is_some()
             || self.show_welcome
-            || self.project_setup.is_some();
+            || project_setup_available;
         let toolbar_overlay = (!has_overlays && self.map_interaction_enabled()).then(|| {
             let show_churn = self.settings.show_churn;
             div().absolute().top(px(8.0)).right(px(8.0)).child(
@@ -4065,22 +4086,22 @@ impl Render for TreemapView {
         let rename_overlay = self.render_rename(vw, cx);
 
         // Build the project setup overlay.
-        let project_setup_overlay = self
-            .project_setup
-            .is_some()
-            .then(|| self.render_project_setup(vw, vh, cx));
+        let project_setup_overlay =
+            project_setup_available.then(|| self.render_project_setup(vw, vh, cx));
 
         // Build the pre-scan loading spinner.
-        let pre_scan_overlay = (self.pre_scanner.is_scanning() && self.project_setup.is_none())
-            .then(|| {
-                let folder_name = self
-                    .tree
-                    .repo_root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "project".into());
-                crate::overlays::pre_scan_loading_element(vw, &folder_name)
-            });
+        let pre_scan_overlay = (!is_loading
+            && self.pre_scanner.is_scanning()
+            && self.project_setup.is_none())
+        .then(|| {
+            let folder_name = self
+                .tree
+                .repo_root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "project".into());
+            crate::overlays::pre_scan_loading_element(vw, &folder_name)
+        });
 
         // Build the loading overlay if indexing in background.
         let loading_overlay = self
@@ -4670,16 +4691,20 @@ mod tests {
 
     #[test]
     fn packing_failure_keeps_complete_geometry_and_clears_packing_state() {
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
-        let retained = packing_layout(42.0);
-        let mut layout = retained.clone();
-        let mut transition = Some(crate::layout_transition::LayoutTransition::new(
-            layout.clone(),
-            packing_layout(100.0),
-            Instant::now(),
-        ));
-        let mut packing_target = Some(packing_layout(100.0));
+        let now = Instant::now();
+        let initial = packing_layout(0.0);
+        let retained = packing_layout(100.0);
+        let transition =
+            crate::layout_transition::LayoutTransition::new(initial, retained.clone(), now);
+        let mut layout = transition.sample(now + Duration::from_millis(80));
+        assert_ne!(
+            layout, retained,
+            "fixture must fail from an in-flight sample"
+        );
+        let mut transition = Some(transition);
+        let mut packing_target = Some(retained.clone());
         let mut camera = None;
         let mut neighbors = None;
         let mut hover = None;
@@ -4705,6 +4730,49 @@ mod tests {
         assert!(transition.is_none());
         assert!(packing_target.is_none());
         assert!(progress.is_none());
+    }
+
+    #[test]
+    fn beginning_a_load_discards_project_setup_and_invalidates_pre_scan() {
+        let project = tempfile::tempdir().unwrap();
+        let mut pre_scanner = crate::project_loader::PreScanner::new();
+        pre_scanner.start(project.path().to_path_buf());
+        let mut project_setup = Some("draft");
+
+        super::clear_project_setup_before_load(&mut project_setup, &mut pre_scanner);
+
+        assert!(project_setup.is_none());
+        assert!(!pre_scanner.is_scanning());
+        assert!(matches!(
+            pre_scanner.poll(),
+            crate::project_loader::PreScanPoll::Idle
+        ));
+    }
+
+    #[test]
+    fn project_setup_is_hidden_until_the_real_loader_reaches_terminal_state() {
+        use std::time::{Duration, Instant};
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let mut loader = crate::project_loader::ProjectLoader::new();
+        loader.start(
+            project.path().to_path_buf(),
+            crate::settings::Settings::default(),
+        );
+
+        assert!(!super::project_setup_available_for(true, &loader));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match loader.poll() {
+                crate::project_loader::LoaderPoll::Complete { .. }
+                | crate::project_loader::LoaderPoll::Failed { .. } => break,
+                _ if Instant::now() < deadline => std::thread::yield_now(),
+                _ => panic!("loader did not reach a terminal state"),
+            }
+        }
+        assert!(super::project_setup_available_for(true, &loader));
+        assert!(!super::project_setup_available_for(false, &loader));
     }
 
     #[test]
