@@ -978,6 +978,12 @@ fn container_header_layout(
     }
 }
 
+fn descendant_paint_clip(y: f64, h: f64, stack_bottom: f64) -> Option<(f64, f64)> {
+    let clip_y = y.max(stack_bottom);
+    let bottom = y + h;
+    (clip_y < bottom).then_some((clip_y, bottom - clip_y))
+}
+
 /// Predicted height of the pinned ancestor-header stack above `focus` under
 /// camera `cam`, mirroring paint_items' stacking: each named ancestor's
 /// header pins at max(its screen top clamped to the viewport, the previous
@@ -1422,6 +1428,10 @@ impl TreemapView {
                     break;
                 }
             }
+            let ancestor_stack_bottom = header_stack
+                .last()
+                .map(|&(_, bottom)| bottom)
+                .unwrap_or(item.px.y);
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
             let is_focused = item.node.id == focus_id;
             let box_kind = theme::node_box_kind(is_leaf, &item.node.id.kind);
@@ -1439,12 +1449,11 @@ impl TreemapView {
             let mut expanded_w = 0.0f32;
             match item.draw {
                 Draw::Container(rung) => {
-                    let stack_bottom = header_stack.last().map(|&(_, b)| b).unwrap_or(item.px.y);
                     if let Some(header) = container_header_layout(
                         rung,
                         item.px.y,
                         item.px.h,
-                        stack_bottom,
+                        ancestor_stack_bottom,
                         camera.zoom,
                     ) {
                         name = Self::pinned_name(
@@ -1577,36 +1586,37 @@ impl TreemapView {
                 }
             }
             let is_hovered = self.hover_id.as_ref() == Some(&item.node.id);
+            let paint_w = if is_focused && is_leaf && expanded_w > 0.0 {
+                expanded_w
+            } else {
+                item.px.w as f32
+            };
+            let paint_h = if is_focused && is_leaf && expanded_w > 0.0 {
+                (item.full_h + focused_extra_h) as f32
+            } else {
+                item.px.h as f32
+            };
+            let Some((clip_y, clip_h)) =
+                descendant_paint_clip(item.px.y, f64::from(paint_h), ancestor_stack_bottom)
+            else {
+                continue;
+            };
             if item.node.doc.is_some() && (is_hovered || (is_focused && panel_doc.is_none())) {
                 panel_doc = Some((
                     item.node.doc.clone().unwrap(),
                     item.px.x as f32,
                     item.px.y as f32,
-                    if expanded_w > 0.0 {
-                        expanded_w
-                    } else {
-                        item.px.w as f32
-                    },
-                    if expanded_w > 0.0 {
-                        (item.full_h + focused_extra_h) as f32
-                    } else {
-                        item.px.h as f32
-                    },
+                    paint_w,
+                    paint_h,
                 ));
             }
             out.push(PaintItem {
                 x: item.px.x as f32,
                 y: item.px.y as f32,
-                w: if is_focused && is_leaf && expanded_w > 0.0 {
-                    expanded_w
-                } else {
-                    item.px.w as f32
-                },
-                h: if is_focused && is_leaf && expanded_w > 0.0 {
-                    (item.full_h + focused_extra_h) as f32
-                } else {
-                    item.px.h as f32
-                },
+                w: paint_w,
+                h: paint_h,
+                clip_y: clip_y as f32,
+                clip_h: clip_h as f32,
                 fill,
                 border: theme::border_for(fill),
                 stripe: (self.settings.show_churn && item.node.churn > 0.0)
@@ -4044,6 +4054,12 @@ impl Render for TreemapView {
                             underline: None,
                             strikethrough: None,
                         };
+                        let item_content_mask = |item: &PaintItem| ContentMask {
+                            bounds: Bounds::new(
+                                point(origin.x + px(item.x), origin.y + px(item.clip_y)),
+                                size(px(item.w), px(item.clip_h)),
+                            ),
+                        };
                         let paint_surface = |item: &PaintItem, window: &mut Window| {
                             let b = Bounds::new(
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
@@ -4175,7 +4191,9 @@ impl Render for TreemapView {
                         // Pass 1: quads, stripes, texture quads (back to front).
                         for item in &items {
                             if !item.deferred_overlay {
-                                paint_surface(item, window);
+                                window.with_content_mask(Some(item_content_mask(item)), |window| {
+                                    paint_surface(item, window)
+                                });
                             }
                         }
                         // Pass 2a: leaf / non-header text (rendered under
@@ -4184,7 +4202,9 @@ impl Render for TreemapView {
                             if item.header_bg_h > 0.0 || item.deferred_overlay {
                                 continue;
                             }
-                            paint_text(item, window, _cx);
+                            window.with_content_mask(Some(item_content_mask(item)), |window| {
+                                paint_text(item, window, _cx)
+                            });
                         }
                         // Pass 2b: headers, background + text interleaved per
                         // item in DFS order, so a later (right/below) header's
@@ -4250,20 +4270,27 @@ impl Render for TreemapView {
                         if !cg_scrim {
                             for item in &items {
                                 if item.neighbor {
-                                    paint_ring(item, window);
+                                    window.with_content_mask(
+                                        Some(item_content_mask(item)),
+                                        |window| paint_ring(item, window),
+                                    );
                                 }
                             }
                         }
                         // Pass 2d: selected leaf surface and text above every
                         // regular box, texture, body row, header, and neighbor.
                         if let Some(item) = items.iter().find(|item| item.deferred_overlay) {
-                            paint_surface(item, window);
-                            paint_text(item, window, _cx);
+                            window.with_content_mask(Some(item_content_mask(item)), |window| {
+                                paint_surface(item, window);
+                                paint_text(item, window, _cx);
+                            });
                         }
                         // Pass 3: only the selected focus ring paints above it.
                         for item in &items {
                             if ring_paints_after_leaf_overlay(item.focused, item.neighbor) {
-                                paint_ring(item, window);
+                                window.with_content_mask(Some(item_content_mask(item)), |window| {
+                                    paint_ring(item, window)
+                                });
                             }
                         }
                         // Pass 4: focused-leaf doc panel (floats to the right).
@@ -4420,9 +4447,9 @@ mod tests {
 
     use super::{
         call_graph_column_lefts, container_body, container_children_have_images,
-        container_header_bg_h, container_header_layout, container_header_px, focused_width,
-        header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body, leaf_texture_is_visible,
-        max_line_chars, BODY_PAD, HEADER, LINE_STEP,
+        container_header_bg_h, container_header_layout, container_header_px, descendant_paint_clip,
+        focused_width, header_bg_paint_h, header_paint_y, leaf_tex_rect, leaf_text_body,
+        leaf_texture_is_visible, max_line_chars, BODY_PAD, HEADER, LINE_STEP,
     };
     use crate::buffers::BufferManager;
     use crate::paint_model::{
@@ -4964,6 +4991,34 @@ mod tests {
         assert!(container_header_layout(Rung::Dot, 0.0, 100.0, 0.0, 1.0).is_none());
         assert!(container_header_layout(Rung::Label, 0.0, 13.99, 0.0, 1.0).is_none());
         assert!(container_header_layout(Rung::Label, 0.0, 14.0, 0.0, 1.0).is_some());
+    }
+
+    #[test]
+    fn descendant_paint_clip_starts_below_ancestor_headers() {
+        assert_eq!(
+            descendant_paint_clip(100.0, 80.0, 140.0),
+            Some((140.0, 40.0))
+        );
+        assert_eq!(
+            descendant_paint_clip(150.0, 30.0, 140.0),
+            Some((150.0, 30.0))
+        );
+    }
+
+    #[test]
+    fn descendant_paint_clip_omits_nodes_hidden_by_ancestor_headers() {
+        assert_eq!(descendant_paint_clip(100.0, 40.0, 140.0), None);
+        assert_eq!(descendant_paint_clip(100.0, 20.0, 141.0), None);
+    }
+
+    #[test]
+    fn descendant_paint_clip_uses_the_full_nested_header_stack() {
+        let root_bottom = 100.0 + HEADER;
+        let nested_bottom = root_bottom + HEADER;
+        assert_eq!(
+            descendant_paint_clip(100.0, 100.0, nested_bottom),
+            Some((nested_bottom, 100.0 - 2.0 * HEADER)),
+        );
     }
 
     #[test]

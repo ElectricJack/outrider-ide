@@ -60,7 +60,7 @@ fn descendant_paint_clip_uses_the_full_nested_header_stack() {
 
 - [ ] **Step 2: Run the focused tests and confirm RED**
 
-Run: `cargo test -p outrider descendant_paint_clip --lib`
+Run: `cargo test -p outrider --bin outrider descendant_paint_clip`
 
 Expected: compilation fails because `descendant_paint_clip` does not exist.
 
@@ -78,7 +78,7 @@ fn descendant_paint_clip(y: f64, h: f64, stack_bottom: f64) -> Option<(f64, f64)
 
 - [ ] **Step 4: Run the focused tests and confirm GREEN**
 
-Run: `cargo test -p outrider descendant_paint_clip --lib`
+Run: `cargo test -p outrider --bin outrider descendant_paint_clip`
 
 Expected: all three clipping tests pass.
 
@@ -110,7 +110,7 @@ Wrap node surface painting, non-header text painting, texture painting, and focu
 
 - [ ] **Step 7: Run unit tests and formatting checks**
 
-Run: `cargo test -p outrider --lib`
+Run: `cargo test -p outrider --bin outrider`
 
 Expected: all `outrider` unit tests pass.
 

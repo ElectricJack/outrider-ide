@@ -43,6 +43,8 @@ pub(crate) struct PaintItem {
     pub(crate) y: f32,
     pub(crate) w: f32,
     pub(crate) h: f32,
+    pub(crate) clip_y: f32,
+    pub(crate) clip_h: f32,
     pub(crate) fill: u32,
     pub(crate) border: u32,
     pub(crate) stripe: Option<u32>,
