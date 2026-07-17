@@ -4,6 +4,7 @@
 //! (quads, text runs, and baked texture quads) via a static canvas closure.
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, BorderStyle,
@@ -35,6 +36,7 @@ use crate::camera::{self, Camera, CameraTween};
 use crate::content::{self, FONT_PX, HEADER, LINE_STEP};
 use crate::focus::{self, Focus, TreeIndex};
 use crate::interaction::InteractionAction;
+use crate::layout_transition::LayoutTransition;
 use crate::navigation::NavigationHistory;
 use crate::overlays::{ContextMenu, Notification, Notifications};
 use crate::paint_model::{
@@ -508,6 +510,8 @@ fn parse_gibibytes(input: &str) -> Result<u64, String> {
 pub struct TreemapView {
     tree: SymbolTree,
     layout: PackLayout,
+    layout_transition: Option<LayoutTransition>,
+    packing_target_layout: Option<PackLayout>,
     /// None until the first render supplies a viewport; then Home-framed.
     camera: Option<Camera>,
     home_zoom: f64,
@@ -558,6 +562,56 @@ pub struct TreemapView {
     pre_scanner: PreScanner,
     /// Working copy of the project setup screen while open.
     project_setup: Option<ProjectSetupDraft>,
+}
+
+struct PackingGeometryState<'a> {
+    layout: &'a mut PackLayout,
+    transition: &'a mut Option<LayoutTransition>,
+    target: &'a mut Option<PackLayout>,
+    camera: &'a mut Option<Camera>,
+    neighbors: &'a mut Option<(SymbolId, [Option<SymbolId>; 4])>,
+    hover: &'a mut Option<SymbolId>,
+    progress: &'a mut Option<LoadProgress>,
+}
+
+impl PackingGeometryState<'_> {
+    fn invalidate(&mut self) {
+        *self.camera = None;
+        *self.neighbors = None;
+        *self.hover = None;
+    }
+
+    fn apply_snapshot(&mut self, target: PackLayout, now: Instant) {
+        let transition = if let Some(transition) = self.transition.take() {
+            let retargeted = transition.retarget(target.clone(), now);
+            *self.layout = retargeted.sample(now);
+            retargeted
+        } else {
+            LayoutTransition::new(self.layout.clone(), target.clone(), now)
+        };
+        *self.transition = Some(transition);
+        *self.target = Some(target);
+        self.invalidate();
+    }
+
+    fn finish(&mut self, final_layout: PackLayout) {
+        *self.layout = final_layout;
+        *self.transition = None;
+        *self.target = None;
+        *self.progress = None;
+        self.invalidate();
+    }
+
+    fn fail_after_preview(&mut self) {
+        *self.transition = None;
+        *self.target = None;
+        *self.progress = None;
+        self.invalidate();
+    }
+}
+
+fn map_interaction_enabled_for(loader: &ProjectLoader) -> bool {
+    !loader.is_loading()
 }
 
 struct RenameState {
@@ -1163,6 +1217,8 @@ impl TreemapView {
         Self {
             tree,
             layout,
+            layout_transition: None,
+            packing_target_layout: None,
             camera: None,
             home_zoom: 1.0,
             drag_last: None,
@@ -1896,7 +1952,7 @@ impl TreemapView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.call_graph.is_some() {
+        if !self.map_interaction_enabled() || self.call_graph.is_some() {
             return;
         }
         let Some(cam) = self.camera else { return };
@@ -1919,7 +1975,7 @@ impl TreemapView {
     }
 
     fn on_left_release(&mut self, e: &gpui::MouseUpEvent, window: &Window, cx: &mut Context<Self>) {
-        if self.call_graph.is_some() {
+        if !self.map_interaction_enabled() || self.call_graph.is_some() {
             return;
         }
         self.drag_last = None;
@@ -1958,7 +2014,7 @@ impl TreemapView {
     }
 
     fn on_mouse_move(&mut self, e: &gpui::MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
-        if self.call_graph.is_some() {
+        if !self.map_interaction_enabled() || self.call_graph.is_some() {
             return;
         }
         if e.pressed_button == Some(gpui::MouseButton::Left) {
@@ -1991,7 +2047,7 @@ impl TreemapView {
     }
 
     fn on_scroll(&mut self, e: &gpui::ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
-        if self.call_graph.is_some() {
+        if !self.map_interaction_enabled() || self.call_graph.is_some() {
             return;
         }
         self.cancel_tween();
@@ -2018,6 +2074,9 @@ impl TreemapView {
     }
 
     fn on_key_down(&mut self, e: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.map_interaction_enabled() {
+            return;
+        }
         if self.context_menu.is_some() && e.keystroke.key.as_str() == "escape" {
             self.context_menu = None;
             cx.notify();
@@ -2680,6 +2739,12 @@ impl TreemapView {
     /// Spawn a background thread to index `folder` and compute its layout.
     fn start_loading(&mut self, folder: std::path::PathBuf) {
         self.loader.start(folder, self.settings.clone());
+        self.layout_transition = None;
+        self.packing_target_layout = None;
+        self.drag_last = None;
+        self.press_origin = None;
+        self.tween = None;
+        self.hover_id = None;
         self.palette.close();
         self.show_welcome = false;
         self.settings_draft = None;
@@ -2692,6 +2757,37 @@ impl TreemapView {
         self.load_progress = None;
     }
 
+    fn packing_geometry(&mut self) -> PackingGeometryState<'_> {
+        PackingGeometryState {
+            layout: &mut self.layout,
+            transition: &mut self.layout_transition,
+            target: &mut self.packing_target_layout,
+            camera: &mut self.camera,
+            neighbors: &mut self.neighbors,
+            hover: &mut self.hover_id,
+            progress: &mut self.load_progress,
+        }
+    }
+
+    fn advance_layout_transition(&mut self, now: Instant) -> bool {
+        let Some(transition) = self.layout_transition.take() else {
+            return false;
+        };
+        self.layout = transition.sample(now);
+        let complete = transition.is_complete(now);
+        if !complete {
+            self.layout_transition = Some(transition);
+        }
+        self.camera = None;
+        self.neighbors = None;
+        self.hover_id = None;
+        true
+    }
+
+    fn map_interaction_enabled(&self) -> bool {
+        map_interaction_enabled_for(&self.loader)
+    }
+
     /// Check if background indexing completed; if so, apply the result.
     fn poll_loading(&mut self) -> bool {
         match self.loader.poll() {
@@ -2701,12 +2797,26 @@ impl TreemapView {
                 self.load_progress = Some(progress);
                 changed
             }
-            // Task 4 owns installing previews, applying geometry-only snapshots,
-            // and finalizing or recovering from terminal loader events.
-            LoaderPoll::Preview(_)
-            | LoaderPoll::Snapshot { .. }
-            | LoaderPoll::Complete { .. }
-            | LoaderPoll::Failed { .. } => true,
+            LoaderPoll::Preview(preview) => {
+                self.install_project_preview(*preview);
+                true
+            }
+            LoaderPoll::Snapshot { generation, layout } => {
+                self.apply_packing_snapshot(generation, layout, Instant::now());
+                true
+            }
+            LoaderPoll::Complete { generation, layout } => {
+                self.finish_packing(generation, layout);
+                true
+            }
+            LoaderPoll::Failed {
+                generation,
+                message,
+                preview_delivered,
+            } => {
+                self.fail_packing(generation, message, preview_delivered);
+                true
+            }
         }
     }
 
@@ -2742,8 +2852,7 @@ impl TreemapView {
         }
     }
 
-    #[allow(dead_code)]
-    fn install_project(&mut self, project: ProjectPreview) {
+    fn install_project_preview(&mut self, project: ProjectPreview) {
         let ProjectPreview {
             generation,
             project_root,
@@ -2767,6 +2876,8 @@ impl TreemapView {
         self.palette = palette::Palette::new();
         self.tree = tree;
         self.layout = layout;
+        self.layout_transition = None;
+        self.packing_target_layout = Some(self.layout.clone());
         self.textures = Some(TextureCache::new_prepared(
             project_namespace,
             source_fingerprints,
@@ -2779,9 +2890,40 @@ impl TreemapView {
         }
     }
 
+    fn apply_packing_snapshot(&mut self, generation: u64, layout: PackLayout, now: Instant) {
+        if !self.loader.accepts(generation) {
+            return;
+        }
+        self.packing_geometry().apply_snapshot(layout, now);
+    }
+
+    fn finish_packing(&mut self, generation: u64, layout: PackLayout) {
+        if !self.loader.accepts(generation) {
+            return;
+        }
+        self.packing_geometry().finish(layout);
+    }
+
+    fn fail_packing(&mut self, generation: u64, message: String, preview_delivered: bool) {
+        if !self.loader.accepts(generation) {
+            return;
+        }
+        if preview_delivered {
+            self.packing_geometry().fail_after_preview();
+        } else {
+            self.layout_transition = None;
+            self.packing_target_layout = None;
+            self.load_progress = None;
+        }
+        self.notifications.push(Notification::warning(message));
+    }
+
     /// Build the right-click context menu popup positioned at the click site.
     /// Returns None if no context menu is open.
     fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.map_interaction_enabled() {
+            return None;
+        }
         let menu = self.context_menu.as_ref()?;
         let x = f32::from(menu.position.x);
         let y = f32::from(menu.position.y);
@@ -2913,27 +3055,33 @@ impl TreemapView {
             }));
 
         let popup = self.file_menu_open.then(|| {
-            crate::overlays::context_menu_shell(8.0, 42.0)
-                .child(
-                    crate::overlays::context_menu_row("file-menu-open", "Open Folder...").on_click(
-                        cx.listener(|this, _event, window, cx| {
-                            this.file_menu_open = false;
-                            this.focus_handle.dispatch_action(&OpenFolder, window, cx);
-                        }),
-                    ),
-                )
-                .child(crate::overlays::context_menu_separator())
-                .child(
-                    crate::overlays::context_menu_row(
-                        "file-menu-clear-cache",
-                        "Clear Project Disk Cache",
-                    )
-                    .on_click(cx.listener(|this, _event, window, cx| {
+            let popup = crate::overlays::context_menu_shell(8.0, 42.0).child(
+                crate::overlays::context_menu_row("file-menu-open", "Open Folder...").on_click(
+                    cx.listener(|this, _event, window, cx| {
                         this.file_menu_open = false;
-                        this.focus_handle
-                            .dispatch_action(&ClearDiskCache, window, cx);
-                    })),
-                )
+                        this.focus_handle.dispatch_action(&OpenFolder, window, cx);
+                    }),
+                ),
+            );
+            if self.map_interaction_enabled() {
+                popup
+                    .child(crate::overlays::context_menu_separator())
+                    .child(
+                        crate::overlays::context_menu_row(
+                            "file-menu-clear-cache",
+                            "Clear Project Disk Cache",
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.file_menu_open = false;
+                                this.focus_handle
+                                    .dispatch_action(&ClearDiskCache, window, cx);
+                            },
+                        )),
+                    )
+            } else {
+                popup
+            }
         });
 
         Some(
@@ -3312,6 +3460,9 @@ impl TreemapView {
     }
 
     fn render_delete_confirm(&self, map_w: f64, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.map_interaction_enabled() {
+            return None;
+        }
         let path = self.delete_confirm.as_ref()?;
         let display_name = path
             .file_name()
@@ -3363,6 +3514,9 @@ impl TreemapView {
     }
 
     fn render_rename(&self, map_w: f64, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.map_interaction_enabled() {
+            return None;
+        }
         let state = self.rename_state.as_ref()?;
         let rename_path = state.path.clone();
         let new_name = state.input.clone();
@@ -3818,7 +3972,8 @@ impl Render for TreemapView {
             self.focus_handle.focus(window, cx);
         }
 
-        let mut needs_notify = self.poll_loading();
+        let mut needs_notify = self.advance_layout_transition(Instant::now());
+        needs_notify |= self.poll_loading();
         needs_notify |= self.poll_call_graph(window);
         needs_notify |= self.poll_pre_scan();
         if needs_notify {
@@ -3882,7 +4037,7 @@ impl Render for TreemapView {
             || self.settings_draft.is_some()
             || self.show_welcome
             || self.project_setup.is_some();
-        let toolbar_overlay = (!has_overlays).then(|| {
+        let toolbar_overlay = (!has_overlays && self.map_interaction_enabled()).then(|| {
             let show_churn = self.settings.show_churn;
             div().absolute().top(px(8.0)).right(px(8.0)).child(
                 crate::overlays::toolbar_toggle("churn-toggle", "Git Churn", show_churn).on_click(
@@ -3965,6 +4120,9 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearDiskCache, _w, cx| {
+                if !this.map_interaction_enabled() {
+                    return;
+                }
                 if let Some(textures) = this.textures.as_mut() {
                     textures.request_clear_disk_cache();
                     this.bake_pending = true;
@@ -3972,6 +4130,9 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSettings, _w, cx| {
+                if !this.map_interaction_enabled() {
+                    return;
+                }
                 if this.settings_draft.is_some() {
                     this.settings_draft = None;
                 } else {
@@ -3986,6 +4147,9 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleProjectSettings, _w, cx| {
+                if !this.map_interaction_enabled() {
+                    return;
+                }
                 if this.project_setup.is_some() {
                     this.project_setup = None;
                 } else {
@@ -3998,25 +4162,34 @@ impl Render for TreemapView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenFilePalette, _w, cx| {
+                if !this.map_interaction_enabled() {
+                    return;
+                }
                 this.palette.open(palette::PaletteMode::File, &this.tree);
                 this.settings_draft = None;
                 this.context_menu = None;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSymbolPalette, _w, cx| {
+                if !this.map_interaction_enabled() {
+                    return;
+                }
                 this.palette.open(palette::PaletteMode::Symbol, &this.tree);
                 this.settings_draft = None;
                 this.context_menu = None;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &RevealInFileManager, _w, _cx| {
+                if !this.map_interaction_enabled() {
+                    return;
+                }
                 let path = resolve_fs_path(&this.focus.current, &this.tree.repo_root);
                 open_in_file_manager(&path);
             }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, e: &gpui::MouseDownEvent, _w, _cx| {
-                    if this.call_graph.is_some() {
+                    if !this.map_interaction_enabled() || this.call_graph.is_some() {
                         return;
                     }
                     this.drag_last = Some(e.position);
@@ -4339,12 +4512,12 @@ impl Render for TreemapView {
             .children(palette_overlay)
             .children(settings_overlay)
             .children(welcome_overlay)
-            .children(file_menu_overlay)
             .children(context_menu_overlay)
             .children(call_graph_overlay)
             .children(delete_overlay)
             .children(rename_overlay)
             .children(loading_overlay)
+            .children(file_menu_overlay)
             .children(pre_scan_overlay)
             .children(project_setup_overlay)
             .children(notification_overlay);
@@ -4355,7 +4528,209 @@ impl Render for TreemapView {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use outrider_index::{SymbolId, SymbolKind, SymbolNode};
+    use outrider_layout::{PackLayout, Rect};
+
     use super::{parse_gibibytes, SettingsDraft};
+    use crate::camera::Camera;
+
+    fn packing_layout(x: f64) -> PackLayout {
+        let id = SymbolId {
+            kind: SymbolKind::File,
+            qualified_path: "src/main.rs".into(),
+            ordinal: 0,
+        };
+        PackLayout {
+            rects: BTreeMap::from([(
+                id,
+                Rect {
+                    x,
+                    y: 0.0,
+                    w: 10.0,
+                    h: 20.0,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn packing_snapshot_only_retargets_geometry_and_invalidates_derived_state() {
+        use std::time::Instant;
+
+        let mut layout = packing_layout(0.0);
+        let target = packing_layout(100.0);
+        let mut transition = None;
+        let mut packing_target = None;
+        let mut camera = Some(Camera {
+            center_x: 1.0,
+            center_y: 2.0,
+            zoom: 3.0,
+        });
+        let id = layout.rects.keys().next().unwrap().clone();
+        let mut neighbors = Some((id.clone(), [None, None, None, None]));
+        let mut hover = Some(id);
+        let mut progress = None;
+
+        super::PackingGeometryState {
+            layout: &mut layout,
+            transition: &mut transition,
+            target: &mut packing_target,
+            camera: &mut camera,
+            neighbors: &mut neighbors,
+            hover: &mut hover,
+            progress: &mut progress,
+        }
+        .apply_snapshot(target.clone(), Instant::now());
+
+        assert_eq!(packing_target, Some(target));
+        assert!(transition.is_some());
+        assert!(camera.is_none());
+        assert!(neighbors.is_none());
+        assert!(hover.is_none());
+    }
+
+    #[test]
+    fn packing_finalization_installs_exact_geometry_and_clears_progress() {
+        use std::time::Instant;
+
+        let mut layout = packing_layout(0.0);
+        let final_layout = packing_layout(321.0);
+        let mut transition = Some(crate::layout_transition::LayoutTransition::new(
+            layout.clone(),
+            packing_layout(100.0),
+            Instant::now(),
+        ));
+        let mut packing_target = Some(packing_layout(100.0));
+        let mut camera = None;
+        let mut neighbors = None;
+        let mut hover = None;
+        let mut progress = Some(crate::project_loader::LoadProgress {
+            folder_name: "project".into(),
+            phase: crate::project_loader::LoadPhase::Packing,
+            completed: 1,
+            total: 2,
+        });
+
+        super::PackingGeometryState {
+            layout: &mut layout,
+            transition: &mut transition,
+            target: &mut packing_target,
+            camera: &mut camera,
+            neighbors: &mut neighbors,
+            hover: &mut hover,
+            progress: &mut progress,
+        }
+        .finish(final_layout.clone());
+
+        assert_eq!(layout, final_layout);
+        assert!(transition.is_none());
+        assert!(packing_target.is_none());
+        assert!(progress.is_none());
+    }
+
+    #[test]
+    fn packing_snapshot_retargets_from_the_exact_current_sample() {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut layout = packing_layout(0.0);
+        let first_target = packing_layout(100.0);
+        let expected = crate::layout_transition::LayoutTransition::new(
+            layout.clone(),
+            first_target.clone(),
+            now,
+        )
+        .sample(now + Duration::from_millis(80));
+        let mut transition = Some(crate::layout_transition::LayoutTransition::new(
+            layout.clone(),
+            first_target,
+            now,
+        ));
+        let mut packing_target = Some(packing_layout(100.0));
+        let mut camera = None;
+        let mut neighbors = None;
+        let mut hover = None;
+        let mut progress = None;
+
+        super::PackingGeometryState {
+            layout: &mut layout,
+            transition: &mut transition,
+            target: &mut packing_target,
+            camera: &mut camera,
+            neighbors: &mut neighbors,
+            hover: &mut hover,
+            progress: &mut progress,
+        }
+        .apply_snapshot(packing_layout(200.0), now + Duration::from_millis(80));
+
+        assert_eq!(layout, expected);
+    }
+
+    #[test]
+    fn packing_failure_keeps_complete_geometry_and_clears_packing_state() {
+        use std::time::Instant;
+
+        let retained = packing_layout(42.0);
+        let mut layout = retained.clone();
+        let mut transition = Some(crate::layout_transition::LayoutTransition::new(
+            layout.clone(),
+            packing_layout(100.0),
+            Instant::now(),
+        ));
+        let mut packing_target = Some(packing_layout(100.0));
+        let mut camera = None;
+        let mut neighbors = None;
+        let mut hover = None;
+        let mut progress = Some(crate::project_loader::LoadProgress {
+            folder_name: "project".into(),
+            phase: crate::project_loader::LoadPhase::Packing,
+            completed: 1,
+            total: 2,
+        });
+
+        super::PackingGeometryState {
+            layout: &mut layout,
+            transition: &mut transition,
+            target: &mut packing_target,
+            camera: &mut camera,
+            neighbors: &mut neighbors,
+            hover: &mut hover,
+            progress: &mut progress,
+        }
+        .fail_after_preview();
+
+        assert_eq!(layout, retained);
+        assert!(transition.is_none());
+        assert!(packing_target.is_none());
+        assert!(progress.is_none());
+    }
+
+    #[test]
+    fn packing_interaction_gate_tracks_the_real_loader_lifecycle() {
+        use std::time::{Duration, Instant};
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let mut loader = crate::project_loader::ProjectLoader::new();
+        loader.start(
+            project.path().to_path_buf(),
+            crate::settings::Settings::default(),
+        );
+
+        assert!(!super::map_interaction_enabled_for(&loader));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match loader.poll() {
+                crate::project_loader::LoaderPoll::Complete { .. }
+                | crate::project_loader::LoaderPoll::Failed { .. } => break,
+                _ if Instant::now() < deadline => std::thread::yield_now(),
+                _ => panic!("loader did not reach a terminal state"),
+            }
+        }
+        assert!(super::map_interaction_enabled_for(&loader));
+    }
 
     #[test]
     fn loading_shell_texture_cache_is_lazy() {
@@ -4433,10 +4808,6 @@ mod tests {
 
         assert!(!settings.show_welcome);
     }
-
-    use std::collections::BTreeMap;
-
-    use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
     use super::{
         call_graph_column_lefts, container_body, container_children_have_images,
@@ -4899,10 +5270,8 @@ mod tests {
     }
 
     use super::{inset_top, leaf_text_zoom_floor, pinned_stack_h};
-    use crate::camera::Camera;
     use crate::focus::TreeIndex;
     use outrider_index::SymbolTree;
-    use outrider_layout::{PackLayout, Rect};
 
     #[test]
     fn container_header_is_always_one_line() {

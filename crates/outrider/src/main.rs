@@ -7,6 +7,7 @@ mod camera;
 mod content;
 mod focus;
 mod interaction;
+mod layout_transition;
 mod navigation;
 mod overlays;
 mod paint_model;
