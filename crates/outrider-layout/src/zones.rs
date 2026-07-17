@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use outrider_index::{SymbolId, SymbolKind, SymbolNode};
 
+use crate::progressive::PackCancelled;
+
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SemanticRole {
@@ -215,24 +217,44 @@ impl RoleCounts {
 }
 
 pub(crate) fn build_profiles(root: &SymbolNode) -> RoleProfiles {
-    let mut profiles = BTreeMap::new();
-    collect_profiles(root, &mut profiles);
-    profiles
+    build_profiles_cancellable(root, &|| false).expect("never-cancel profile build")
 }
 
-fn collect_profiles(node: &SymbolNode, profiles: &mut RoleProfiles) -> RoleCounts {
+pub(crate) fn build_profiles_cancellable<C>(
+    root: &SymbolNode,
+    is_cancelled: &C,
+) -> Result<RoleProfiles, PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    let mut profiles = BTreeMap::new();
+    collect_profiles(root, &mut profiles, is_cancelled)?;
+    Ok(profiles)
+}
+
+fn collect_profiles<C>(
+    node: &SymbolNode,
+    profiles: &mut RoleProfiles,
+    is_cancelled: &C,
+) -> Result<RoleCounts, PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     match &node.id.kind {
         SymbolKind::File => {
             let profile = classify_file(&node.name);
             profiles.insert(node.id.clone(), profile);
             let mut counts = RoleCounts::default();
             counts.files[profile.role as usize] = 1;
-            counts
+            Ok(counts)
         }
         SymbolKind::Folder => {
             let mut counts = RoleCounts::default();
             for child in &node.children {
-                counts.add(&collect_profiles(child, profiles));
+                counts.add(&collect_profiles(child, profiles, is_cancelled)?);
             }
             let profile = explicit_folder_role(&node.name)
                 .map(|role| RoleProfile { role, strong: true })
@@ -246,7 +268,7 @@ fn collect_profiles(node: &SymbolNode, profiles: &mut RoleProfiles) -> RoleCount
                     strong: false,
                 });
             profiles.insert(node.id.clone(), profile);
-            counts
+            Ok(counts)
         }
         _ => {
             profiles.insert(
@@ -256,7 +278,7 @@ fn collect_profiles(node: &SymbolNode, profiles: &mut RoleProfiles) -> RoleCount
                     strong: false,
                 },
             );
-            RoleCounts::default()
+            Ok(RoleCounts::default())
         }
     }
 }

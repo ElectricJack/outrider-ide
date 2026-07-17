@@ -2,11 +2,13 @@
 //! Real folders skyline-pack semantic role blocks; other containers retain
 //! kind/height or source-ordered shelf placement. Layout stays deterministic.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
-use crate::skyline::{skyline_pack, SkylineLayout};
+use crate::progressive::PackCancelled;
+use crate::skyline::{skyline_pack_cancellable, SkylineLayout};
 use crate::zones::{build_profiles, effective_role, RoleProfiles, SemanticRole};
 
 /// An absolute world rectangle. World units are natural pixels: a leaf
@@ -113,42 +115,64 @@ pub(crate) fn exact_local_layout(
     cfg: &PackConfig,
     child_sizes: &BTreeMap<SymbolId, (f64, f64)>,
 ) -> LocalLayout {
+    exact_local_layout_cancellable(node, inherited_role, profiles, cfg, child_sizes, &|| false)
+        .expect("never-cancel exact local layout")
+}
+
+pub(crate) fn exact_local_layout_cancellable<C>(
+    node: &SymbolNode,
+    inherited_role: SemanticRole,
+    profiles: &RoleProfiles,
+    cfg: &PackConfig,
+    child_sizes: &BTreeMap<SymbolId, (f64, f64)>,
+    is_cancelled: &C,
+) -> Result<LocalLayout, PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     if node.children.is_empty() {
-        return leaf_local_layout(node, cfg);
+        return Ok(leaf_local_layout(node, cfg));
     }
 
     let folder = matches!(node.id.kind, SymbolKind::Folder);
-    let measured: Vec<(&SymbolNode, (f64, f64), SemanticRole)> = node
-        .children
-        .iter()
-        .map(|child| {
-            let role = if folder {
-                effective_role(&child.id, inherited_role, profiles)
-            } else {
-                SemanticRole::Source
-            };
-            (child, child_sizes[&child.id], role)
-        })
-        .collect();
+    let mut measured = Vec::with_capacity(node.children.len());
+    for child in &node.children {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
+        let role = if folder {
+            effective_role(&child.id, inherited_role, profiles)
+        } else {
+            SemanticRole::Source
+        };
+        measured.push((child, child_sizes[&child.id], role));
+    }
 
     if folder {
         let mut children: Vec<_> = measured
             .into_iter()
             .map(|(node, size, role)| FolderChild { node, size, role })
             .collect();
-        let arrangement = arrange_folder(&mut children, cfg.gap, cfg.aspect);
+        let arrangement =
+            arrange_folder_cancellable(&mut children, cfg.gap, cfg.aspect, is_cancelled)?;
         let child_positions = arrangement
             .positions
             .into_iter()
             .map(|(id, x, y)| (id, (cfg.gap + x, cfg.container_header + cfg.gap + y)))
             .collect();
-        return LocalLayout {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
+        return Ok(LocalLayout {
             size: (
                 arrangement.bounds.0 + 2.0 * cfg.gap,
                 cfg.container_header + arrangement.bounds.1 + 2.0 * cfg.gap,
             ),
             children: child_positions,
-        };
+        });
     }
 
     let mut order = measured;
@@ -170,11 +194,17 @@ pub(crate) fn exact_local_layout(
                 .then(a.id.ordinal.cmp(&b.id.ordinal))
         });
     }
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     let sizes: Vec<(f64, f64)> = order.iter().map(|(_, size, _)| *size).collect();
-    let target_h = choose_target_height(&sizes, cfg.gap, cfg.aspect);
+    let target_h = choose_target_height_cancellable(&sizes, cfg.gap, cfg.aspect, is_cancelled)?;
     let (mut x, mut y, mut col_w, mut content_h) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut children = BTreeMap::new();
     for &(child, (w, h), _) in &order {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
         if y > 0.0 && y + h > target_h {
             x += col_w + cfg.gap;
             y = 0.0;
@@ -188,13 +218,13 @@ pub(crate) fn exact_local_layout(
         content_h = content_h.max(y + h);
         y += h + cfg.gap;
     }
-    LocalLayout {
+    Ok(LocalLayout {
         size: (
             x + col_w + 2.0 * cfg.gap,
             cfg.container_header + content_h + 2.0 * cfg.gap,
         ),
         children,
-    }
+    })
 }
 
 pub(crate) fn absolute_from_layouts(root: &SymbolNode, layouts: &ExactLayouts) -> PackLayout {
@@ -279,14 +309,33 @@ struct FolderArrangement {
     bounds: (f64, f64),
 }
 
-fn arrange_folder(children: &mut [FolderChild<'_>], gap: f64, aspect: f64) -> FolderArrangement {
+fn arrange_folder_cancellable<C>(
+    children: &mut [FolderChild<'_>],
+    gap: f64,
+    aspect: f64,
+    is_cancelled: &C,
+) -> Result<FolderArrangement, PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
+    let cancelled_during_sort = Cell::new(false);
     children.sort_by(|a, b| {
+        if cancelled_during_sort.get() || is_cancelled() {
+            cancelled_during_sort.set(true);
+            return std::cmp::Ordering::Equal;
+        }
         a.role
             .cmp(&b.role)
             .then(b.size.1.total_cmp(&a.size.1))
             .then(a.node.name.as_bytes().cmp(b.node.name.as_bytes()))
             .then(a.node.id.ordinal.cmp(&b.node.id.ordinal))
     });
+    if cancelled_during_sort.get() || is_cancelled() {
+        return Err(PackCancelled);
+    }
 
     let mut groups: Vec<(SemanticRole, Vec<&FolderChild<'_>>, SkylineLayout)> = Vec::new();
     for role in [
@@ -297,28 +346,38 @@ fn arrange_folder(children: &mut [FolderChild<'_>], gap: f64, aspect: f64) -> Fo
         SemanticRole::Docs,
         SemanticRole::Generated,
     ] {
-        let members: Vec<_> = children.iter().filter(|child| child.role == role).collect();
+        let mut members = Vec::new();
+        for child in children.iter().filter(|child| child.role == role) {
+            if is_cancelled() {
+                return Err(PackCancelled);
+            }
+            members.push(child);
+        }
         if !members.is_empty() {
             let sizes: Vec<_> = members.iter().map(|child| child.size).collect();
-            let layout = skyline_pack(&sizes, gap, aspect);
+            let layout = skyline_pack_cancellable(&sizes, gap, aspect, is_cancelled)?;
             groups.push((role, members, layout));
         }
     }
 
     let block_sizes: Vec<_> = groups.iter().map(|(_, _, layout)| layout.bounds).collect();
-    let blocks = skyline_pack(&block_sizes, gap, aspect);
+    let blocks = skyline_pack_cancellable(&block_sizes, gap, aspect, is_cancelled)?;
     let mut positions = Vec::with_capacity(children.len());
     for ((_, members, layout), (block_x, block_y)) in groups.iter().zip(blocks.positions) {
         for ((child_x, child_y), child) in layout.positions.iter().zip(members) {
+            if is_cancelled() {
+                return Err(PackCancelled);
+            }
             positions.push((child.node.id.clone(), block_x + child_x, block_y + child_y));
         }
     }
-    FolderArrangement {
+    Ok(FolderArrangement {
         positions,
         bounds: blocks.bounds,
-    }
+    })
 }
 
+#[allow(dead_code)] // Non-cancellable compatibility wrapper used by focused unit tests.
 fn shelf_bounds(sizes: &[(f64, f64)], gap: f64, target_h: f64) -> (f64, f64) {
     let (mut x, mut y, mut col_w, mut content_h) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
     for &(w, h) in sizes {
@@ -339,30 +398,82 @@ fn aspect_envelope_area((w, h): (f64, f64), aspect: f64) -> f64 {
     envelope_w * (envelope_w / aspect)
 }
 
+#[allow(dead_code)] // Non-cancellable compatibility wrapper used by focused unit tests.
 fn choose_target_height(sizes: &[(f64, f64)], gap: f64, aspect: f64) -> f64 {
+    choose_target_height_cancellable(sizes, gap, aspect, &|| false)
+        .expect("never-cancel target-height selection")
+}
+
+fn choose_target_height_cancellable<C>(
+    sizes: &[(f64, f64)],
+    gap: f64,
+    aspect: f64,
+    is_cancelled: &C,
+) -> Result<f64, PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     if let [(_, height)] = sizes {
-        return *height;
+        return Ok(*height);
     }
     let area: f64 = sizes.iter().map(|&(w, h)| w * h).sum();
     let tallest = sizes.iter().map(|&(_, h)| h).fold(0.0, f64::max);
     let baseline = tallest.max((area / aspect).sqrt());
     let mut best_height = baseline;
-    let mut best_score = aspect_envelope_area(shelf_bounds(sizes, gap, baseline), aspect);
+    let mut best_score = aspect_envelope_area(
+        shelf_bounds_cancellable(sizes, gap, baseline, is_cancelled)?,
+        aspect,
+    );
     let mut previous: Option<f64> = None;
 
     for factor in TARGET_HEIGHT_FACTORS {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
         let candidate = tallest.max(baseline * factor);
         if previous == Some(candidate) {
             continue;
         }
         previous = Some(candidate);
-        let score = aspect_envelope_area(shelf_bounds(sizes, gap, candidate), aspect);
+        let score = aspect_envelope_area(
+            shelf_bounds_cancellable(sizes, gap, candidate, is_cancelled)?,
+            aspect,
+        );
         if score.total_cmp(&best_score).is_lt() {
             best_height = candidate;
             best_score = score;
         }
     }
-    best_height
+    Ok(best_height)
+}
+
+fn shelf_bounds_cancellable<C>(
+    sizes: &[(f64, f64)],
+    gap: f64,
+    target_h: f64,
+    is_cancelled: &C,
+) -> Result<(f64, f64), PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    let (mut x, mut y, mut col_w, mut content_h) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    for &(w, h) in sizes {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
+        if y > 0.0 && y + h > target_h {
+            x += col_w + gap;
+            y = 0.0;
+            col_w = 0.0;
+        }
+        col_w = col_w.max(w);
+        content_h = content_h.max(y + h);
+        y += h + gap;
+    }
+    Ok((x + col_w, content_h))
 }
 
 #[cfg(test)]

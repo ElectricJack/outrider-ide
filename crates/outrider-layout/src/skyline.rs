@@ -1,3 +1,5 @@
+use crate::progressive::PackCancelled;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SkylineLayout {
     pub positions: Vec<(f64, f64)>,
@@ -19,40 +21,63 @@ impl Segment {
 
 const WIDTH_FACTORS: [f64; 9] = [0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.5, 2.0, 3.0];
 
+#[allow(dead_code)] // Non-cancellable compatibility wrapper used by pack tests.
 pub(crate) fn skyline_pack(sizes: &[(f64, f64)], gap: f64, aspect: f64) -> SkylineLayout {
+    skyline_pack_cancellable(sizes, gap, aspect, &|| false).expect("never-cancel skyline pack")
+}
+
+pub(crate) fn skyline_pack_cancellable<C>(
+    sizes: &[(f64, f64)],
+    gap: f64,
+    aspect: f64,
+    is_cancelled: &C,
+) -> Result<SkylineLayout, PackCancelled>
+where
+    C: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(PackCancelled);
+    }
     if sizes.len() <= 1 {
-        return SkylineLayout {
+        return Ok(SkylineLayout {
             positions: sizes.iter().map(|_| (0.0, 0.0)).collect(),
             bounds: sizes.first().copied().unwrap_or((0.0, 0.0)),
-        };
+        });
     }
-    let widest = sizes
-        .iter()
-        .map(|(width, _)| width + gap)
-        .fold(0.0, f64::max);
-    let padded_area: f64 = sizes
-        .iter()
-        .map(|(width, height)| (width + gap) * (height + gap))
-        .sum();
+    let mut widest = 0.0_f64;
+    let mut padded_area = 0.0_f64;
+    for &(width, height) in sizes {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
+        widest = widest.max(width + gap);
+        padded_area += (width + gap) * (height + gap);
+    }
     let baseline = widest.max((padded_area * aspect).sqrt());
     let mut widths = vec![baseline];
     for factor in WIDTH_FACTORS {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
         let candidate = widest.max(baseline * factor);
         if !widths.contains(&candidate) {
             widths.push(candidate);
         }
     }
-    let mut best = pack_at_width(sizes, gap, widths[0]);
+    let mut best = pack_at_width_cancellable(sizes, gap, widths[0], is_cancelled)?;
     let mut best_score = aspect_envelope_area(best.bounds, aspect);
     for width in widths.into_iter().skip(1) {
-        let candidate = pack_at_width(sizes, gap, width);
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
+        let candidate = pack_at_width_cancellable(sizes, gap, width, is_cancelled)?;
         let score = aspect_envelope_area(candidate.bounds, aspect);
         if score.total_cmp(&best_score).is_lt() {
             best = candidate;
             best_score = score;
         }
     }
-    best
+    Ok(best)
 }
 
 fn aspect_envelope_area((width, height): (f64, f64), aspect: f64) -> f64 {
@@ -60,12 +85,26 @@ fn aspect_envelope_area((width, height): (f64, f64), aspect: f64) -> f64 {
     envelope_width * (envelope_width / aspect)
 }
 
+#[allow(dead_code)] // Non-cancellable compatibility wrapper used by skyline tests.
 fn pack_at_width(sizes: &[(f64, f64)], gap: f64, bin_width: f64) -> SkylineLayout {
+    pack_at_width_cancellable(sizes, gap, bin_width, &|| false)
+        .expect("never-cancel fixed-width skyline pack")
+}
+
+fn pack_at_width_cancellable<C>(
+    sizes: &[(f64, f64)],
+    gap: f64,
+    bin_width: f64,
+    is_cancelled: &C,
+) -> Result<SkylineLayout, PackCancelled>
+where
+    C: Fn() -> bool,
+{
     if sizes.is_empty() {
-        return SkylineLayout {
+        return Ok(SkylineLayout {
             positions: vec![],
             bounds: (0.0, 0.0),
-        };
+        });
     }
     let mut skyline = vec![Segment {
         x: 0.0,
@@ -76,37 +115,51 @@ fn pack_at_width(sizes: &[(f64, f64)], gap: f64, bin_width: f64) -> SkylineLayou
     let (mut used_w, mut used_h) = (0.0_f64, 0.0_f64);
 
     for &(width, height) in sizes {
+        if is_cancelled() {
+            return Err(PackCancelled);
+        }
         let padded_w = width + gap;
         let padded_h = height + gap;
-        let (x, y) = skyline
-            .iter()
-            .map(|segment| segment.x)
-            .filter(|x| *x + padded_w <= bin_width)
-            .map(|x| {
-                let y = skyline
-                    .iter()
-                    .filter(|segment| segment.x < x + padded_w && segment.end() > x)
-                    .map(|segment| segment.height)
-                    .fold(0.0, f64::max);
-                (x, y)
-            })
-            .min_by(|a, b| {
-                (a.1 + padded_h)
-                    .total_cmp(&(b.1 + padded_h))
-                    .then(a.1.total_cmp(&b.1))
-                    .then(a.0.total_cmp(&b.0))
-            })
-            .expect("candidate width is clamped to the widest padded rectangle");
+        let mut best: Option<(f64, f64)> = None;
+        for segment in &skyline {
+            if is_cancelled() {
+                return Err(PackCancelled);
+            }
+            let x = segment.x;
+            if x + padded_w > bin_width {
+                continue;
+            }
+            let mut y = 0.0_f64;
+            for covered in &skyline {
+                if is_cancelled() {
+                    return Err(PackCancelled);
+                }
+                if covered.x < x + padded_w && covered.end() > x {
+                    y = y.max(covered.height);
+                }
+            }
+            let candidate = (x, y);
+            if best.is_none_or(|current| {
+                (candidate.1 + padded_h)
+                    .total_cmp(&(current.1 + padded_h))
+                    .then(candidate.1.total_cmp(&current.1))
+                    .then(candidate.0.total_cmp(&current.0))
+                    .is_lt()
+            }) {
+                best = Some(candidate);
+            }
+        }
+        let (x, y) = best.expect("candidate width is clamped to the widest padded rectangle");
 
         raise_skyline(&mut skyline, x, padded_w, y + padded_h);
         positions.push((x, y));
         used_w = used_w.max(x + width);
         used_h = used_h.max(y + height);
     }
-    SkylineLayout {
+    Ok(SkylineLayout {
         positions,
         bounds: (used_w, used_h),
-    }
+    })
 }
 
 fn raise_skyline(skyline: &mut Vec<Segment>, x: f64, width: f64, height: f64) {
