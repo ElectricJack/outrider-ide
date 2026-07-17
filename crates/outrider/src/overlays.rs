@@ -1,7 +1,7 @@
 use gpui::{div, prelude::*, px, rgb, rgba, transparent_black, ElementId, Pixels};
 use outrider_index::SymbolId;
 
-use crate::project_loader::LoadProgress;
+use crate::project_loader::{LoadPhase, LoadProgress};
 use crate::theme;
 
 pub(crate) struct ContextMenu {
@@ -78,19 +78,7 @@ pub(crate) fn notification_element(notification: &Notification) -> gpui::Statefu
 }
 
 pub(crate) fn loading_element(state: &LoadProgress, viewport_width: f64) -> gpui::Div {
-    let (status_text, fraction) = match state.phase {
-        0 => ("Scanning files…".to_string(), 0.0_f32),
-        1 if state.files_total > 0 => (
-            format!(
-                "Parsing {}/{} files…",
-                state.files_parsed, state.files_total
-            ),
-            state.files_parsed as f32 / state.files_total as f32,
-        ),
-        1 => ("Parsing…".to_string(), 0.0),
-        2 => ("Building symbol tree…".to_string(), 1.0),
-        _ => ("Done".to_string(), 1.0),
-    };
+    let (title, status_text, fraction) = loading_copy(state);
     let bar_width = 300.0_f32.min(viewport_width as f32 - 80.0);
 
     div()
@@ -116,11 +104,7 @@ pub(crate) fn loading_element(state: &LoadProgress, viewport_width: f64) -> gpui
                 .rounded(px(8.0))
                 .text_color(rgb(theme::TEXT_PRIMARY))
                 .font_family(theme::FONT_FAMILY_SANS)
-                .child(
-                    div()
-                        .text_size(px(16.0))
-                        .child(format!("Indexing {}…", state.folder_name)),
-                )
+                .child(div().text_size(px(16.0)).child(title))
                 .child(
                     div()
                         .w(px(bar_width))
@@ -142,6 +126,30 @@ pub(crate) fn loading_element(state: &LoadProgress, viewport_width: f64) -> gpui
                         .child(status_text),
                 ),
         )
+}
+
+fn loading_copy(state: &LoadProgress) -> (String, String, f32) {
+    let indexing_title = || format!("Indexing {}…", state.folder_name);
+    match state.phase {
+        LoadPhase::Scanning => (indexing_title(), "Scanning files…".into(), 0.0),
+        LoadPhase::Parsing if state.total > 0 => (
+            indexing_title(),
+            format!("Parsing {}/{} files…", state.completed, state.total),
+            state.completed as f32 / state.total as f32,
+        ),
+        LoadPhase::Parsing => (indexing_title(), "Parsing…".into(), 0.0),
+        LoadPhase::BuildingTree => (indexing_title(), "Building symbol tree…".into(), 1.0),
+        LoadPhase::Packing if state.total > 0 => (
+            format!("Packing {}...", state.folder_name),
+            format!("Packing {}/{} nodes...", state.completed, state.total),
+            state.completed as f32 / state.total as f32,
+        ),
+        LoadPhase::Packing => (
+            format!("Packing {}...", state.folder_name),
+            format!("Packing {}/{} nodes...", state.completed, state.total),
+            0.0,
+        ),
+    }
 }
 
 pub(crate) fn context_menu_row(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
@@ -654,7 +662,39 @@ pub(crate) fn pre_scan_loading_element(map_width: f64, folder_name: &str) -> gpu
 
 #[cfg(test)]
 mod tests {
-    use super::{Notification, Notifications};
+    use super::{loading_copy, Notification, Notifications};
+    use crate::project_loader::{LoadPhase, LoadProgress};
+
+    #[test]
+    fn packing_copy_reports_nodes_and_reset_fraction() {
+        let state = LoadProgress {
+            folder_name: "outrider".into(),
+            phase: LoadPhase::Packing,
+            completed: 3,
+            total: 12,
+        };
+
+        assert_eq!(
+            loading_copy(&state),
+            (
+                "Packing outrider...".into(),
+                "Packing 3/12 nodes...".into(),
+                0.25,
+            )
+        );
+    }
+
+    #[test]
+    fn packing_copy_uses_zero_fraction_when_total_is_zero() {
+        let state = LoadProgress {
+            folder_name: "empty".into(),
+            phase: LoadPhase::Packing,
+            completed: 0,
+            total: 0,
+        };
+
+        assert_eq!(loading_copy(&state).2, 0.0);
+    }
 
     #[test]
     fn newest_notification_is_visible_and_dismissible() {

@@ -43,7 +43,7 @@ use crate::paint_model::{
 };
 use crate::palette;
 use crate::project_loader::{
-    LoadProgress, LoadResult, LoaderPoll, PreScanPoll, PreScanner, ProjectLoader,
+    LoadProgress, LoaderPoll, PreScanPoll, PreScanner, ProjectLoader, ProjectPreview,
 };
 use crate::project_settings::{self, ExtensionCategory, ProjectSettings};
 use crate::rasterize::{self, TextureCache};
@@ -2701,20 +2701,12 @@ impl TreemapView {
                 self.load_progress = Some(progress);
                 changed
             }
-            LoaderPoll::Ready(result) => match *result {
-                Ok(project) => {
-                    self.install_project(project);
-                    self.load_progress = None;
-                    true
-                }
-                Err(error) => {
-                    self.load_progress = None;
-                    self.notifications.push(Notification::warning(format!(
-                        "Could not open project: {error}"
-                    )));
-                    true
-                }
-            },
+            // Task 4 owns installing previews, applying geometry-only snapshots,
+            // and finalizing or recovering from terminal loader events.
+            LoaderPoll::Preview(_)
+            | LoaderPoll::Snapshot { .. }
+            | LoaderPoll::Complete { .. }
+            | LoaderPoll::Failed { .. } => true,
         }
     }
 
@@ -2750,8 +2742,9 @@ impl TreemapView {
         }
     }
 
-    fn install_project(&mut self, project: LoadResult) {
-        let LoadResult {
+    #[allow(dead_code)]
+    fn install_project(&mut self, project: ProjectPreview) {
+        let ProjectPreview {
             generation,
             project_root,
             tree,
