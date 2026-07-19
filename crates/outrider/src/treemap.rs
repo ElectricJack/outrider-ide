@@ -278,6 +278,8 @@ impl ProjectSetupDraft {
         ProjectSettings {
             filter_extensions,
             filter_folders,
+            filter_files: vec![],
+            max_display_lines: None,
         }
     }
 
@@ -1186,7 +1188,7 @@ impl TreemapView {
             repo_root: project_root.clone(),
         };
         let (settings, settings_notification) = loaded_settings.into_parts();
-        let layout = outrider_layout::pack(&tree, &world::pack_config(settings.node_padding));
+        let layout = outrider_layout::pack(&tree, &world::pack_config(settings.node_padding, settings.max_display_lines));
         let mut view = Self::from_parts(
             tree,
             layout,
@@ -2363,6 +2365,7 @@ impl TreemapView {
     fn merge_project_settings(&mut self, ps: &ProjectSettings) {
         self.settings.filter_extensions = self.global_settings.filter_extensions.clone();
         self.settings.filter_folders = self.global_settings.filter_folders.clone();
+        self.settings.filter_files = ps.filter_files.clone();
         for ext in &ps.filter_extensions {
             if !self.settings.filter_extensions.iter().any(|e| e == ext) {
                 self.settings.filter_extensions.push(ext.clone());
@@ -2373,15 +2376,48 @@ impl TreemapView {
                 self.settings.filter_folders.push(folder.clone());
             }
         }
+        self.settings.max_display_lines = ps.max_display_lines;
     }
 
     fn hide_folder(&mut self, rel_path: &str) {
-        let mut ps = ProjectSettings::load(&self.tree.repo_root).unwrap_or(ProjectSettings {
-            filter_extensions: vec![],
-            filter_folders: vec![],
-        });
+        let mut ps = self.load_or_default_project_settings();
         if !ps.filter_folders.iter().any(|f| f == rel_path) {
             ps.filter_folders.push(rel_path.to_string());
+        }
+        if let Err(e) = ps.save(&self.tree.repo_root) {
+            self.notifications.push(Notification::warning(e));
+            return;
+        }
+        self.merge_project_settings(&ps);
+        self.reindex();
+    }
+
+    fn load_or_default_project_settings(&self) -> ProjectSettings {
+        ProjectSettings::load(&self.tree.repo_root).unwrap_or(ProjectSettings {
+            filter_extensions: vec![],
+            filter_folders: vec![],
+            filter_files: vec![],
+            max_display_lines: None,
+        })
+    }
+
+    fn hide_file(&mut self, rel_path: &str) {
+        let mut ps = self.load_or_default_project_settings();
+        if !ps.filter_files.iter().any(|f| f == rel_path) {
+            ps.filter_files.push(rel_path.to_string());
+        }
+        if let Err(e) = ps.save(&self.tree.repo_root) {
+            self.notifications.push(Notification::warning(e));
+            return;
+        }
+        self.merge_project_settings(&ps);
+        self.reindex();
+    }
+
+    fn hide_extension(&mut self, ext: &str) {
+        let mut ps = self.load_or_default_project_settings();
+        if !ps.filter_extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            ps.filter_extensions.push(ext.to_string());
         }
         if let Err(e) = ps.save(&self.tree.repo_root) {
             self.notifications.push(Notification::warning(e));
@@ -3031,6 +3067,16 @@ impl TreemapView {
                 );
 
         let is_folder = target.kind == SymbolKind::Folder && !target.qualified_path.is_empty();
+        let is_file = matches!(target.kind, SymbolKind::File);
+        let file_ext = if is_file {
+            std::path::Path::new(&rel_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_string())
+        } else {
+            None
+        };
+
         let menu_div = if is_folder {
             let hide_folder = rel_path.clone();
             menu_div
@@ -3043,6 +3089,35 @@ impl TreemapView {
                             cx.notify();
                         })),
                 )
+        } else {
+            menu_div
+        };
+
+        let menu_div = if is_file {
+            let hide_file_path = rel_path.clone();
+            let mut menu_div = menu_div
+                .child(crate::overlays::context_menu_separator())
+                .child(
+                    crate::overlays::context_menu_row("ctx-hide-file", "Hide this File")
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.hide_file(&hide_file_path);
+                            this.context_menu = None;
+                            cx.notify();
+                        })),
+                );
+            if let Some(ext) = file_ext {
+                let ext_label = format!("Hide *.{ext} Files");
+                let ext_clone = ext.clone();
+                menu_div = menu_div.child(
+                    crate::overlays::context_menu_row_dynamic("ctx-hide-ext", &ext_label)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.hide_extension(&ext_clone);
+                            this.context_menu = None;
+                            cx.notify();
+                        })),
+                );
+            }
+            menu_div
         } else {
             menu_div
         };

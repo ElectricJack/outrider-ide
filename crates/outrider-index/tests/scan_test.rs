@@ -8,7 +8,7 @@ use outrider_index::SymbolKind;
 #[test]
 fn scan_respects_gitignore_and_builds_sorted_tree() {
     let dir = common::copy_fixture("mini_repo");
-    let files = scan_files(dir.path(), &[], &[]).unwrap();
+    let files = scan_files(dir.path(), &[], &[], &[]).unwrap();
 
     let paths: Vec<Vec<String>> = files
         .iter()
@@ -87,7 +87,7 @@ fn legacy_build_tree_is_a_pure_structural_assembler() {
         .map(|line| format!("# Section {line}\nbody\n"))
         .collect::<String>();
     std::fs::write(&path, text).unwrap();
-    let files = scan_files(dir.path(), &[], &[]).unwrap();
+    let files = scan_files(dir.path(), &[], &[], &[]).unwrap();
 
     let while_readable = build_tree(dir.path(), &files, &BTreeMap::new());
     assert!(while_readable.root.children[0].children.is_empty());

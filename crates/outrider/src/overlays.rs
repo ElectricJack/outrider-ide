@@ -165,6 +165,19 @@ pub(crate) fn context_menu_row(id: &'static str, label: &'static str) -> gpui::S
         .child(label)
 }
 
+pub(crate) fn context_menu_row_dynamic(id: &'static str, label: &str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(ElementId::Name(id.into()))
+        .px(px(12.0))
+        .py(px(7.0))
+        .text_size(px(13.0))
+        .font_family(theme::FONT_FAMILY_SANS)
+        .text_color(rgb(theme::TEXT_PRIMARY))
+        .cursor_pointer()
+        .hover(|element| element.bg(rgb(0x2a3040_u32)))
+        .child(label.to_string())
+}
+
 pub(crate) fn context_menu_separator() -> gpui::Div {
     div()
         .h(px(1.0))

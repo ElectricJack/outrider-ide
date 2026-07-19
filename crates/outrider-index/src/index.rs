@@ -119,6 +119,7 @@ pub fn index_repo_outcome(
         repo_root,
         filter_extensions,
         filter_folders,
+        &[],
         None,
         None,
         None,
@@ -136,6 +137,7 @@ pub fn index_repo_outcome_with_cache(
         repo_root,
         filter_extensions,
         filter_folders,
+        &[],
         None,
         Some(cache_root),
         None,
@@ -146,6 +148,7 @@ fn index_repo_outcome_impl(
     repo_root: &Path,
     filter_extensions: &[String],
     filter_folders: &[String],
+    filter_files: &[String],
     progress: Option<&IndexProgress>,
     cache_root: Option<&Path>,
     is_cancelled: Option<&CancellationCheck<'_>>,
@@ -154,7 +157,7 @@ fn index_repo_outcome_impl(
     if let Some(progress) = progress {
         progress.phase.store(0, Ordering::Relaxed);
     }
-    let paths = discover_files(repo_root, filter_extensions, filter_folders)?;
+    let paths = discover_files(repo_root, filter_extensions, filter_folders, filter_files)?;
     if let Some(progress) = progress {
         progress.files_total.store(paths.len(), Ordering::Relaxed);
     }
@@ -233,6 +236,7 @@ pub fn index_repo_with_progress_outcome(
         repo_root,
         filter_extensions,
         filter_folders,
+        &[],
         Some(progress),
         None,
         None,
@@ -248,6 +252,7 @@ pub fn index_repo_with_progress_outcome_cancellable(
     repo_root: &Path,
     filter_extensions: &[String],
     filter_folders: &[String],
+    filter_files: &[String],
     progress: &IndexProgress,
     is_cancelled: &CancellationCheck<'_>,
 ) -> anyhow::Result<IndexOutcome> {
@@ -255,6 +260,7 @@ pub fn index_repo_with_progress_outcome_cancellable(
         repo_root,
         filter_extensions,
         filter_folders,
+        filter_files,
         Some(progress),
         None,
         Some(is_cancelled),
@@ -753,7 +759,7 @@ mod tests {
         let checkpoints = AtomicUsize::new(0);
 
         let error =
-            index_repo_with_progress_outcome_cancellable(repo.path(), &[], &[], &progress, &|| {
+            index_repo_with_progress_outcome_cancellable(repo.path(), &[], &[], &[], &progress, &|| {
                 checkpoints.fetch_add(1, Ordering::SeqCst) >= 1
             })
             .err()

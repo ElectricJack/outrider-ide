@@ -359,6 +359,7 @@ mod tests {
             bottom_pad: 6.0,
             gap: 8.0,
             aspect: 1.0,
+            max_display_lines: None,
         }
     }
 

@@ -35,6 +35,8 @@ impl std::ops::Deref for SettingsLoad {
 pub struct Settings {
     pub filter_extensions: Vec<String>,
     pub filter_folders: Vec<String>,
+    #[serde(default)]
+    pub filter_files: Vec<String>,
     pub show_welcome: bool,
     #[serde(default = "default_cache_mb")]
     pub cache_mb: u32,
@@ -42,6 +44,8 @@ pub struct Settings {
     pub node_padding: f64,
     #[serde(default = "default_show_churn")]
     pub show_churn: bool,
+    #[serde(default)]
+    pub max_display_lines: Option<u64>,
     #[serde(default)]
     pub(crate) disk_cache_bytes: BTreeMap<String, u64>,
 }
@@ -85,10 +89,12 @@ impl Default for Settings {
             .into_iter()
             .map(String::from)
             .collect(),
+            filter_files: vec![],
             show_welcome: true,
             cache_mb: default_cache_mb(),
             node_padding: default_node_padding(),
             show_churn: default_show_churn(),
+            max_display_lines: None,
             disk_cache_bytes: BTreeMap::new(),
         }
     }

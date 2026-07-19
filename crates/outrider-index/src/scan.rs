@@ -32,8 +32,9 @@ pub fn scan_files(
     repo_root: &Path,
     filter_extensions: &[String],
     filter_folders: &[String],
+    filter_files: &[String],
 ) -> anyhow::Result<Vec<ScannedFile>> {
-    let paths = discover_files(repo_root, filter_extensions, filter_folders)?;
+    let paths = discover_files(repo_root, filter_extensions, filter_folders, filter_files)?;
     paths
         .into_iter()
         .map(|rel_path| {
@@ -83,6 +84,7 @@ pub fn discover_files(
     repo_root: &Path,
     filter_extensions: &[String],
     filter_folders: &[String],
+    filter_files: &[String],
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let root_folder_name = repo_root.file_name();
@@ -135,6 +137,13 @@ pub fn discover_files(
                     .components()
                     .any(|c| c.as_os_str().to_string_lossy() == f.as_str())
             }
+        }) {
+            continue;
+        }
+        let rel_str = rel_path.to_string_lossy();
+        if filter_files.iter().any(|f| {
+            let normalized = rel_str.replace('\\', "/");
+            normalized == *f
         }) {
             continue;
         }
@@ -451,7 +460,7 @@ mod tests {
     use super::*;
 
     fn scan_tree(dir: &std::path::Path) -> SymbolTree {
-        let files = scan_files(dir, &[], &[]).unwrap();
+        let files = scan_files(dir, &[], &[], &[]).unwrap();
         build_tree(dir, &files, &BTreeMap::new())
     }
 

@@ -467,6 +467,7 @@ fn load_project_cancellable(
         project_root,
         &settings.filter_extensions,
         &settings.filter_folders,
+        &settings.filter_files,
         &worker.index_progress,
         &|| worker.cancellation.is_cancelled(),
     )
@@ -492,7 +493,7 @@ fn load_project_cancellable(
     ));
     let layout = pack_progressive(
         &tree,
-        &crate::world::pack_config(settings.node_padding),
+        &crate::world::pack_config(settings.node_padding, settings.max_display_lines),
         30,
         || worker.cancellation.is_cancelled(),
         |progress| {
@@ -862,7 +863,7 @@ mod tests {
             let mut release_rx = Some(release_rx);
             let result = outrider_layout::pack_progressive(
                 &tree,
-                &crate::world::pack_config(4.0),
+                &crate::world::pack_config(4.0, None),
                 30,
                 || worker.cancellation.is_cancelled(),
                 |progress| {

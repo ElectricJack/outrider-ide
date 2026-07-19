@@ -31,7 +31,7 @@ pub const PACK_ASPECT: f64 = 1.0;
 
 /// The app's packing configuration: leaf pages sized by the content
 /// module's row metrics, so a page at zoom 1.0 is exactly natural size.
-pub fn pack_config(gap: f64) -> outrider_layout::PackConfig {
+pub fn pack_config(gap: f64, max_display_lines: Option<u64>) -> outrider_layout::PackConfig {
     outrider_layout::PackConfig {
         page_w: PAGE_W,
         line_step: content::LINE_STEP,
@@ -40,6 +40,7 @@ pub fn pack_config(gap: f64) -> outrider_layout::PackConfig {
         bottom_pad: content::BOTTOM_PAD,
         gap,
         aspect: PACK_ASPECT,
+        max_display_lines,
     }
 }
 
@@ -382,6 +383,7 @@ mod tests {
             bottom_pad: 6.0,
             gap: 8.0,
             aspect: 1.6,
+            max_display_lines: None,
         }
     }
 

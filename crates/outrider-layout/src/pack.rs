@@ -39,6 +39,10 @@ pub struct PackConfig {
     pub gap: f64,
     /// Target container width/height ratio for column wrapping.
     pub aspect: f64,
+    /// Cap on the measure (line count) used for layout sizing. `None` means
+    /// no cap — leaves use their full measure. Useful to prevent huge files
+    /// from dominating the treemap.
+    pub max_display_lines: Option<u64>,
 }
 
 /// Output of a full layout pass: world-space rectangles for every symbol.
@@ -66,7 +70,11 @@ pub fn pack(tree: &SymbolTree, cfg: &PackConfig) -> PackLayout {
 }
 
 pub(crate) fn leaf_local_layout(node: &SymbolNode, cfg: &PackConfig) -> LocalLayout {
-    let h = cfg.header + (1.0 + node.measure as f64) * cfg.line_step + cfg.bottom_pad;
+    let measure = match cfg.max_display_lines {
+        Some(cap) => node.measure.min(cap),
+        None => node.measure,
+    };
+    let h = cfg.header + (1.0 + measure as f64) * cfg.line_step + cfg.bottom_pad;
     LocalLayout {
         size: (cfg.page_w, h),
         children: BTreeMap::new(),
@@ -516,6 +524,7 @@ mod tests {
             bottom_pad: 6.0,
             gap: 8.0,
             aspect: 1.6,
+            max_display_lines: None,
         }
     }
 

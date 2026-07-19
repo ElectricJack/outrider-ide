@@ -356,6 +356,7 @@ mod tests {
             bottom_pad: 3.0,
             gap: 4.0,
             aspect: 1.6,
+            max_display_lines: None,
         }
     }
 

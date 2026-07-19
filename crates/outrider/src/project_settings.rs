@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 pub struct ProjectSettings {
     pub filter_extensions: Vec<String>,
     pub filter_folders: Vec<String>,
+    #[serde(default)]
+    pub filter_files: Vec<String>,
+    #[serde(default)]
+    pub max_display_lines: Option<u64>,
 }
 
 fn project_settings_path(project_root: &Path) -> PathBuf {
@@ -188,6 +192,8 @@ mod tests {
         let settings = ProjectSettings {
             filter_extensions: vec!["exe".into(), "png".into()],
             filter_folders: vec!["target".into()],
+            filter_files: vec![],
+            max_display_lines: None,
         };
         settings.save(dir.path()).unwrap();
         let loaded = ProjectSettings::load(dir.path()).expect("should load");
@@ -207,6 +213,8 @@ mod tests {
         let settings = ProjectSettings {
             filter_extensions: vec![],
             filter_folders: vec![],
+            filter_files: vec![],
+            max_display_lines: None,
         };
         settings.save(dir.path()).unwrap();
         assert!(ProjectSettings::exists(dir.path()));
