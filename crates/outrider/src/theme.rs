@@ -36,6 +36,30 @@ const DEPTH_FILL_0: u32 = 0x17171B;
 const DEPTH_FILL_8: u32 = 0x3C3C46;
 /// Editor background for boxes that render code (Full leaf items).
 pub const CODE_BG: u32 = 0x101014;
+/// Target every mask-dimmed color converges to. Sits between the old
+/// call-graph scrim (pure black) and `BG` so dimmed boxes still separate
+/// from the window background.
+pub const DIM: u32 = 0x0c0c0e;
+pub const NARRATION_TEXT: u32 = 0xe8dcc0;
+pub const NARRATION_BG: u32 = 0x1c1b1e;
+pub const NARRATION_BORDER: u32 = 0x5a5560;
+pub const NARRATION_MARK: &str = "✎ ";
+pub const NARRATION_FONT: &str = FONT_FAMILY_SANS;
+pub const EDGE_CALLS: u32 = 0x4da6ff;
+pub const EDGE_IMPORTS: u32 = 0x8fd18f;
+pub const EDGE_COCHANGE: u32 = 0xd9a441;
+pub const EDGE_PAIRS: u32 = 0xc08ee0;
+pub const EDGE_VIOLATION: u32 = 0xe06060;
+
+pub fn edge_color(key: &str) -> u32 {
+    match key {
+        "calls" => EDGE_CALLS,
+        "imports" => EDGE_IMPORTS,
+        "cochange" => EDGE_COCHANGE,
+        "violation" => EDGE_VIOLATION,
+        _ => EDGE_PAIRS,
+    }
+}
 
 /// Deterministic identity of every theme input used by texture rendering.
 pub fn fingerprint() -> u64 {
@@ -57,6 +81,15 @@ pub fn fingerprint() -> u64 {
         DEPTH_FILL_0,
         DEPTH_FILL_8,
         CODE_BG,
+        DIM,
+        NARRATION_TEXT,
+        NARRATION_BG,
+        NARRATION_BORDER,
+        EDGE_CALLS,
+        EDGE_IMPORTS,
+        EDGE_COCHANGE,
+        EDGE_PAIRS,
+        EDGE_VIOLATION,
         TINT_DOCS,
         TINT_TEST,
         TINT_TYPEDEF,
@@ -276,6 +309,26 @@ pub fn border_for(fill: u32) -> u32 {
     lerp_rgb(fill, 0xffffff, 0.12)
 }
 
+/// Mask-dim a color toward `DIM` proportionally to `1 - light`.
+/// `light >= 1.0` returns `color` unchanged; `light <= 0.0` returns `DIM`.
+pub fn dim_toward(color: u32, light: f32) -> u32 {
+    lerp_rgb(color, DIM, 1.0 - light.clamp(0.0, 1.0))
+}
+
+/// Pack a `0xRRGGBB` color with an alpha byte into `0xRRGGBBAA`
+/// (the format `gpui::rgba` expects).
+pub fn with_alpha(rgb: u32, a: f32) -> u32 {
+    (rgb << 8) | ((a.clamp(0.0, 1.0) * 255.0).round() as u32)
+}
+
+/// Scale the alpha byte of an existing `0xRRGGBBAA` color by `k`, leaving
+/// the RGB channels untouched.
+pub fn scale_alpha(rgba: u32, k: f32) -> u32 {
+    let a = rgba & 0xff;
+    let scaled = ((a as f32) * k.clamp(0.0, 1.0)).round() as u32 & 0xff;
+    (rgba & !0xff) | scaled
+}
+
 /// Ring around the four arrow-key neighbor targets, painted on top of all
 /// content: translucent white (0xRRGGBBAA, use with `gpui::rgba`).
 pub const NEIGHBOR_BORDER: u32 = 0xffffff80;
@@ -385,6 +438,30 @@ mod tests {
         assert!((b >> 8) & 0xff >= (f >> 8) & 0xff);
         assert!(b & 0xff >= f & 0xff);
         assert_ne!(b, f);
+    }
+
+    #[test]
+    fn dim_toward_endpoints_and_monotone() {
+        let c = 0x8090a0;
+        assert_eq!(dim_toward(c, 1.0), c);
+        assert_eq!(dim_toward(c, 0.0), DIM);
+        let half = dim_toward(c, 0.5);
+        assert_ne!(half, c);
+        assert_ne!(half, DIM);
+    }
+
+    #[test]
+    fn with_alpha_packs_rgb_and_alpha_byte() {
+        assert_eq!(with_alpha(0xffffff, 1.0), 0xffffffff);
+        assert_eq!(with_alpha(0xffffff, 0.0), 0xffffff00);
+    }
+
+    #[test]
+    fn scale_alpha_scales_only_the_alpha_byte() {
+        assert_eq!(scale_alpha(0xffffff80, 1.0), 0xffffff80);
+        assert_eq!(scale_alpha(0xffffff80, 0.0), 0xffffff00);
+        // RGB channels untouched.
+        assert_eq!(scale_alpha(0xffffff80, 0.5) & !0xff, 0xffffff00);
     }
 
     #[test]

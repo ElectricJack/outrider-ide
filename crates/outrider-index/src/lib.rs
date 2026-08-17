@@ -3,6 +3,7 @@
 //! folder/file/item hierarchy (index), and annotates with git churn (churn).
 //! The resulting `SymbolTree` is the input to outrider-layout's shelf-packer.
 
+pub mod ast_metrics;
 pub mod buffer;
 pub mod call_graph;
 pub mod chunk;
@@ -12,6 +13,8 @@ pub mod index;
 pub mod language;
 pub mod parse;
 pub mod scan;
+pub mod tree_index;
+pub mod search;
 pub mod type_resolve;
 pub mod types;
 
@@ -21,5 +24,9 @@ pub use index::{
     IndexProgress,
 };
 pub use language::SourceLanguage;
-pub use types::{dedupe_ids, finalize_children, SymbolId, SymbolKind, SymbolNode, SymbolTree};
+pub use tree_index::TreeIndex;
+pub use types::{
+    dedupe_ids, finalize_children, is_leaf_item, SymbolId, SymbolKind, SymbolNode, SymbolTree,
+};
+pub use search::fuzzy_match;
 pub use types::{IndexedFile, ParsedFile};

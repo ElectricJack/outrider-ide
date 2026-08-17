@@ -225,7 +225,7 @@ fn is_git_unavailable(error: &anyhow::Error) -> bool {
         .is_some_and(|io| io.kind() == ErrorKind::NotFound)
 }
 
-fn git_command(repo_root: &Path) -> Command {
+pub fn git_command(repo_root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .env("LC_ALL", "C")
@@ -236,7 +236,7 @@ fn git_command(repo_root: &Path) -> Command {
 }
 
 /// Run a git subcommand in `repo_root` and return its UTF-8 stdout, or error on non-zero exit.
-fn git_stdout(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub fn git_stdout(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = git_command(repo_root)
         .args(args)
         .output()

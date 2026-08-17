@@ -41,6 +41,28 @@ impl NavigationHistory {
         self.entries.get(self.cursor)
     }
 
+    pub(crate) fn entries(&self) -> &[SymbolId] {
+        &self.entries
+    }
+
+    pub(crate) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Every visit becomes a Focus step.
+    pub(crate) fn to_steps(&self) -> Vec<outrider_view::spec::Step> {
+        use outrider_view::spec::{Step, StepTarget};
+        self.entries
+            .iter()
+            .map(|id| Step {
+                target: StepTarget::Focus(outrider_view::symbol_id::to_wire(id)),
+                push: vec![],
+                pop: 0,
+                note: None,
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn current(&self) -> &SymbolId {
         &self.entries[self.cursor]
@@ -99,5 +121,49 @@ mod tests {
         assert_eq!(history.back(), Some(&id("2")));
         assert_eq!(history.back(), Some(&id("1")));
         assert!(history.back().is_none());
+    }
+
+    #[test]
+    fn entries_returns_full_history() {
+        let mut history = NavigationHistory::new(id("root"), 64);
+        history.push(id("a"));
+        history.push(id("b"));
+        assert_eq!(history.entries().len(), 3);
+        assert_eq!(history.entries()[0], id("root"));
+        assert_eq!(history.entries()[2], id("b"));
+    }
+
+    #[test]
+    fn cursor_tracks_position() {
+        let mut history = NavigationHistory::new(id("root"), 64);
+        history.push(id("a"));
+        assert_eq!(history.cursor(), 1);
+        history.back();
+        assert_eq!(history.cursor(), 0);
+    }
+
+    #[test]
+    fn to_steps_converts_all_entries() {
+        let mut history = NavigationHistory::new(id("root"), 64);
+        history.push(id("a"));
+        history.push(id("b"));
+        let steps = history.to_steps();
+        assert_eq!(steps.len(), 3);
+        // Each step should be a Focus target
+        for step in &steps {
+            assert!(matches!(step.target, outrider_view::spec::StepTarget::Focus(_)));
+            assert!(step.push.is_empty());
+            assert_eq!(step.pop, 0);
+        }
+    }
+
+    #[test]
+    fn to_steps_after_back_still_has_all_entries() {
+        let mut history = NavigationHistory::new(id("root"), 64);
+        history.push(id("a"));
+        history.push(id("b"));
+        history.back(); // cursor at "a"
+        let steps = history.to_steps();
+        assert_eq!(steps.len(), 3); // export is the full path, cursor ignored
     }
 }

@@ -71,6 +71,11 @@ pub struct SymbolTree {
     pub repo_root: PathBuf,
 }
 
+/// A leaf page: has source bytes, no children, and is not a folder.
+pub fn is_leaf_item(node: &SymbolNode) -> bool {
+    node.byte_range.is_some() && node.children.is_empty() && node.id.kind != SymbolKind::Folder
+}
+
 /// Parsed products derived from one retained source buffer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedFile {

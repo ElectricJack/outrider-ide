@@ -7,12 +7,22 @@ use outrider_index::buffer::HighlightSpan;
 
 use crate::theme;
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RowStyle {
+    #[default]
+    Code,
+    Doc,
+    Metric,
+    Narration,
+}
+
 pub(crate) struct BodyText {
     pub(crate) x: f32,
     pub(crate) y: f32,
     pub(crate) text: String,
     pub(crate) runs: Vec<(usize, u32)>,
     pub(crate) highlighted: bool,
+    pub(crate) style: RowStyle,
 }
 
 pub(crate) struct NameRow {
@@ -38,6 +48,16 @@ pub(crate) struct DocPanel {
     pub(crate) rows: Vec<BodyText>,
 }
 
+pub(crate) struct NoteCallout {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+    pub(crate) rows: Vec<BodyText>,
+    pub(crate) anchor: (f32, f32),
+    pub(crate) style: RowStyle,
+}
+
 pub(crate) struct PaintItem {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -51,6 +71,7 @@ pub(crate) struct PaintItem {
     pub(crate) focused: bool,
     pub(crate) deferred_overlay: bool,
     pub(crate) neighbor: bool,
+    pub(crate) light: f32,
     pub(crate) body_font_px: f32,
     pub(crate) header_bg_h: f32,
     pub(crate) header_bg_y: f32,
@@ -59,6 +80,13 @@ pub(crate) struct PaintItem {
     pub(crate) name: Option<NameRow>,
     pub(crate) body: Vec<BodyText>,
     pub(crate) tex: Option<TexQuad>,
+}
+
+pub(crate) struct PaintFrame {
+    pub(crate) items: Vec<PaintItem>,
+    pub(crate) doc_panel: Option<DocPanel>,
+    pub(crate) cg_scrim: bool,
+    pub(crate) edges: crate::view::edge_pass::EdgeFrame,
 }
 
 pub(crate) fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {

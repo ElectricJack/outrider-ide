@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/outrider-index",
     "crates/outrider-layout",
+    "crates/outrider-view",
+    "crates/outrider-cli",
     "crates/outrider",
 ]
 

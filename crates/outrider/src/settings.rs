@@ -46,6 +46,8 @@ pub struct Settings {
     pub show_churn: bool,
     #[serde(default)]
     pub max_display_lines: Option<u64>,
+    #[serde(default = "default_rpc_enabled")]
+    pub rpc_enabled: bool,
     #[serde(default)]
     pub(crate) disk_cache_bytes: BTreeMap<String, u64>,
 }
@@ -55,6 +57,10 @@ fn default_node_padding() -> f64 {
 }
 
 fn default_show_churn() -> bool {
+    true
+}
+
+fn default_rpc_enabled() -> bool {
     true
 }
 
@@ -95,6 +101,7 @@ impl Default for Settings {
             node_padding: default_node_padding(),
             show_churn: default_show_churn(),
             max_display_lines: None,
+            rpc_enabled: default_rpc_enabled(),
             disk_cache_bytes: BTreeMap::new(),
         }
     }

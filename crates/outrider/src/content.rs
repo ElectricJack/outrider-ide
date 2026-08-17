@@ -4,7 +4,9 @@
 
 #[cfg(test)]
 use crate::world::Rung;
-use outrider_index::{SymbolKind, SymbolNode};
+#[cfg(test)]
+use outrider_index::SymbolKind;
+use outrider_index::SymbolNode;
 
 /// Monospace body font size (px); shared by content math and the paint path.
 pub const FONT_PX: f64 = 12.0;
@@ -19,13 +21,7 @@ pub const BOTTOM_PAD: f64 = 6.0;
 /// text (the text/texture tier boundary).
 pub const MIN_TEXT_FONT_PX: f64 = 4.0;
 
-/// A leaf page: has source bytes, no children, and is not a folder.
-/// Items are code pages; childless files (markdown, TOML, plain text,
-/// unparsed .rs) are text pages. These boxes render their content at
-/// Full and keep the editor background at every rung.
-pub fn is_leaf_item(node: &SymbolNode) -> bool {
-    node.byte_range.is_some() && node.children.is_empty() && node.id.kind != SymbolKind::Folder
-}
+pub use outrider_index::is_leaf_item;
 
 /// Natural pixel height of a leaf item's box: header + signature row +
 /// one row per code line + bottom pad.

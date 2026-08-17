@@ -812,6 +812,15 @@ impl Fnv1a {
     }
 }
 
+/// Compute a 16-hex-char identity hash for a project root path.
+/// Used by the RPC instance file and texture namespace (shared identity).
+pub(crate) fn project_identity_hash(project_root: &Path) -> String {
+    let identity = canonical_project_identity(project_root);
+    let mut hash = Fnv1a::new();
+    hash.field(identity.as_bytes());
+    format!("{:016x}", hash.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TextureKey, TexturePayload, TextureStore, HEADER_LEN};

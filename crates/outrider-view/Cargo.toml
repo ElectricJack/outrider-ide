@@ -1,0 +1,17 @@
+[package]
+name = "outrider-view"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+outrider-index = { path = "../outrider-index" }
+outrider-layout = { path = "../outrider-layout" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+globset = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

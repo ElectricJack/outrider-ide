@@ -74,6 +74,8 @@ impl Camera {
 pub const FOCUS_FRACTION: f64 = 0.5;
 /// End-key framing: the focus rect fills the viewport.
 pub const END_FRACTION: f64 = 0.95;
+/// Set framing (camera.frame command): fills 90% of the viewport.
+pub const FRAME_FRACTION: f64 = 0.9;
 /// Camera-follow tween duration, seconds (spec: ~250 ms, interruptible).
 pub const TWEEN_SECS: f64 = 0.25;
 /// World units are natural pixels; 8× natural size is as far as zoom goes.
