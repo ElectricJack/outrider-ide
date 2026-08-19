@@ -155,6 +155,10 @@ mod tests {
             measure,
             churn,
             churn_count,
+            visibility: None,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
             children,
         }
     }

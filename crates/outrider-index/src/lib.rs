@@ -7,7 +7,9 @@ pub mod ast_metrics;
 pub mod buffer;
 pub mod call_graph;
 pub mod chunk;
+pub mod inheritance;
 pub mod churn;
+pub mod diff;
 pub mod dump;
 pub mod index;
 pub mod language;
@@ -26,7 +28,8 @@ pub use index::{
 pub use language::SourceLanguage;
 pub use tree_index::TreeIndex;
 pub use types::{
-    dedupe_ids, finalize_children, is_leaf_item, SymbolId, SymbolKind, SymbolNode, SymbolTree,
+    dedupe_ids, finalize_children, is_leaf_item, DeletedDiffLine, DiffHunk, DiffSource, DiffStatus,
+    HunkKind, SymbolId, SymbolKind, SymbolNode, SymbolTree, Visibility,
 };
 pub use search::fuzzy_match;
 pub use types::{IndexedFile, ParsedFile};

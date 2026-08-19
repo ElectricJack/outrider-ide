@@ -52,11 +52,65 @@ impl SourceLanguage {
     }
 }
 
+/// Heuristic for ambiguous `.h` headers: true when the source uses C++-only
+/// constructs. Checks a bounded prefix so huge headers stay cheap. Tokens are
+/// matched at word boundaries to avoid false hits inside identifiers.
+pub fn looks_like_cpp(bytes: &[u8]) -> bool {
+    const LIMIT: usize = 64 * 1024;
+    let head = &bytes[..bytes.len().min(LIMIT)];
+    let text = String::from_utf8_lossy(head);
+    const MARKERS: [&str; 8] = [
+        "class ", "namespace ", "template<", "template <", "public:", "private:", "protected:",
+        "::",
+    ];
+    for line in text.lines() {
+        let t = line.trim_start();
+        // Skip comment lines; `::` inside prose is common.
+        if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
+            continue;
+        }
+        if t.starts_with("#include") && (t.contains('<') && !t.contains(".h")) {
+            // `#include <vector>` style (no extension) is C++ standard library.
+            return true;
+        }
+        for m in MARKERS {
+            if let Some(pos) = t.find(m) {
+                // Word-boundary check for keyword markers; `::` is an
+                // operator and legitimately follows an identifier.
+                let boundary_ok = m == "::"
+                    || pos == 0
+                    || !t.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                        && t.as_bytes()[pos - 1] != b'_';
+                if boundary_ok {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::SourceLanguage;
+    use super::{looks_like_cpp, SourceLanguage};
+
+    #[test]
+    fn sniffs_cpp_headers() {
+        assert!(looks_like_cpp(b"namespace foo {\nclass Bar {};\n}\n"));
+        assert!(looks_like_cpp(b"#include <vector>\nstruct S { int x; };\n"));
+        assert!(looks_like_cpp(b"struct S {\npublic:\n  int x;\n};\n"));
+        assert!(looks_like_cpp(b"template <typename T>\nstruct S {};\n"));
+        assert!(looks_like_cpp(b"void f(std::string s);\n"));
+    }
+
+    #[test]
+    fn plain_c_headers_stay_c() {
+        assert!(!looks_like_cpp(b"#include <stdio.h>\nstruct S { int x; };\nvoid f(void);\n"));
+        assert!(!looks_like_cpp(b"// a class of problems\nint subclass_count;\n"));
+        assert!(!looks_like_cpp(b"typedef struct { int a; } my_namespace_t;\n"));
+    }
 
     #[test]
     fn recognizes_make_paths() {

@@ -27,8 +27,10 @@ use gpui::{px, size, App, AppContext as _, Bounds, Menu, MenuItem, WindowBounds,
 use gpui_platform::application;
 
 use crate::treemap::{
-    ClearDiskCache, OpenFilePalette, OpenFolder, OpenSymbolPalette, Quit, RevealInFileManager,
-    ToggleProjectSettings, ToggleSettings, TreemapView,
+    BaseViewTab, ClearDiskCache, NextViewTab, OpenCommandPalette, OpenFilePalette, OpenFolder,
+    OpenSymbolPalette, PrevViewTab, Quit, RevealInFileManager, ToggleProjectSettings,
+    ToggleSettings, TreemapView, ViewTab1, ViewTab2, ViewTab3, ViewTab4, ViewTab5, ViewTab6,
+    ViewTab7, ViewTab8, ViewTab9,
 };
 
 pub(crate) const fn uses_native_application_menu(target_os: &str) -> bool {
@@ -110,10 +112,24 @@ fn main() {
             gpui::KeyBinding::new("secondary-o", OpenFolder, None),
             gpui::KeyBinding::new("secondary-p", OpenFilePalette, None),
             gpui::KeyBinding::new("secondary-t", OpenSymbolPalette, None),
+            gpui::KeyBinding::new("secondary-shift-p", OpenCommandPalette, None),
             gpui::KeyBinding::new("secondary-,", ToggleSettings, None),
             gpui::KeyBinding::new("secondary-shift-,", ToggleProjectSettings, None),
             gpui::KeyBinding::new("secondary-shift-e", RevealInFileManager, None),
             gpui::KeyBinding::new("secondary-q", Quit, None),
+            // View tabs: `secondary` is Ctrl on Windows/Linux, Cmd on macOS.
+            gpui::KeyBinding::new("ctrl-tab", NextViewTab, None),
+            gpui::KeyBinding::new("ctrl-shift-tab", PrevViewTab, None),
+            gpui::KeyBinding::new("secondary-`", BaseViewTab, None),
+            gpui::KeyBinding::new("secondary-1", ViewTab1, None),
+            gpui::KeyBinding::new("secondary-2", ViewTab2, None),
+            gpui::KeyBinding::new("secondary-3", ViewTab3, None),
+            gpui::KeyBinding::new("secondary-4", ViewTab4, None),
+            gpui::KeyBinding::new("secondary-5", ViewTab5, None),
+            gpui::KeyBinding::new("secondary-6", ViewTab6, None),
+            gpui::KeyBinding::new("secondary-7", ViewTab7, None),
+            gpui::KeyBinding::new("secondary-8", ViewTab8, None),
+            gpui::KeyBinding::new("secondary-9", ViewTab9, None),
         ]);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -144,6 +160,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("Go to File...", OpenFilePalette),
                     MenuItem::action("Go to Symbol...", OpenSymbolPalette),
+                    MenuItem::action("Command Palette...", OpenCommandPalette),
                     MenuItem::separator(),
                     MenuItem::action("Reveal in File Manager", RevealInFileManager),
                 ],

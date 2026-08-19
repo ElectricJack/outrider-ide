@@ -82,8 +82,22 @@ pub(crate) fn aggregate(
             let to_cx = to_rect.x + to_rect.w / 2.0;
             let to_cy = to_rect.y + to_rect.h / 2.0;
 
-            let (sx1, sy1) = camera.world_to_screen(from_cx, from_cy, vw, vh);
-            let (sx2, sy2) = camera.world_to_screen(to_cx, to_cy, vw, vh);
+            // Clip the center-to-center segment to each rect's border so
+            // the line starts and ends at the box edges, not the centers.
+            let (dx, dy) = (to_cx - from_cx, to_cy - from_cy);
+            let (wx1, wy1) = exit_point(from_rect, from_cx, from_cy, dx, dy);
+            let (wx2, wy2) = exit_point(to_rect, to_cx, to_cy, -dx, -dy);
+            // If the clipped segment inverted (overlapping/nested rects),
+            // fall back to the raw centers.
+            let ((wx1, wy1), (wx2, wy2)) =
+                if (wx2 - wx1) * dx + (wy2 - wy1) * dy > 0.0 {
+                    ((wx1, wy1), (wx2, wy2))
+                } else {
+                    ((from_cx, from_cy), (to_cx, to_cy))
+                };
+
+            let (sx1, sy1) = camera.world_to_screen(wx1, wy1, vw, vh);
+            let (sx2, sy2) = camera.world_to_screen(wx2, wy2, vw, vh);
 
             let w = (weight as f32).clamp(0.0, 1.0);
 
@@ -98,6 +112,26 @@ pub(crate) fn aggregate(
         .collect();
 
     EdgeFrame { edges }
+}
+
+/// Point where the ray from (cx, cy) along (dx, dy) exits rect `r`.
+/// Returns the origin when the direction is zero.
+fn exit_point(r: &outrider_layout::Rect, cx: f64, cy: f64, dx: f64, dy: f64) -> (f64, f64) {
+    let mut t = f64::INFINITY;
+    if dx > 0.0 {
+        t = t.min((r.x + r.w - cx) / dx);
+    } else if dx < 0.0 {
+        t = t.min((r.x - cx) / dx);
+    }
+    if dy > 0.0 {
+        t = t.min((r.y + r.h - cy) / dy);
+    } else if dy < 0.0 {
+        t = t.min((r.y - cy) / dy);
+    }
+    if !t.is_finite() || t < 0.0 {
+        return (cx, cy);
+    }
+    (cx + dx * t, cy + dy * t)
 }
 
 /// Parse a color string (e.g. "#8a8a8a" or "0xRRGGBB") into a u32.

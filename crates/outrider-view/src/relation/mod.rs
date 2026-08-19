@@ -1,6 +1,7 @@
 //! Relation providers and registry (edges between symbols).
 
 pub mod calls;
+pub mod inherits;
 
 use std::ops::Range;
 use std::path::Path;
@@ -12,6 +13,7 @@ use outrider_index::{SymbolId, SymbolTree};
 use crate::deps::Deps;
 
 use calls::{CallsProvider, CallsWorker};
+use inherits::InheritsProvider;
 
 /// What providers see when asked to look up edges.
 pub struct ProviderCtx<'a> {
@@ -93,11 +95,12 @@ impl RelationRegistry {
         }
     }
 
-    /// Registry pre-populated with the built-in providers (currently: `calls`).
+    /// Registry pre-populated with the built-in providers.
     pub fn builtin(tree: Arc<SymbolTree>) -> Self {
         let mut reg = RelationRegistry::empty();
-        let worker = CallsWorker::spawn(tree);
+        let worker = CallsWorker::spawn(Arc::clone(&tree));
         reg.register(Box::new(CallsProvider::new(worker)));
+        reg.register(Box::new(InheritsProvider::new(Arc::clone(&tree))));
         reg
     }
 
@@ -194,6 +197,10 @@ mod tests {
                 byte_range: None,
                 churn: 0.0,
                 churn_count: 0,
+                diff_status: None,
+                diff_hunks: Vec::new(),
+                deleted_lines: Vec::new(),
+                visibility: None,
                 children: vec![],
             },
         };

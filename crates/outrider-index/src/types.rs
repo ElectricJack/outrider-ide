@@ -34,6 +34,60 @@ impl SymbolKind {
     }
 }
 
+/// Member access level, recorded where the language declares one.
+/// C++ uses access sections; Rust/TS/C# use declaration modifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Visibility {
+    Public,
+    Protected,
+    Private,
+}
+
+/// Git working-tree status of a file (git-diff-overlay spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffStatus {
+    Staged,
+    Unstaged,
+    Both,
+    Added,
+    Deleted,
+}
+
+/// Kind of change a `DiffHunk` represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HunkKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+/// A contiguous changed line range, 1-based and inclusive, in new-file
+/// coordinates (or item-relative coordinates once attached to an item).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub kind: HunkKind,
+    pub staged: bool,
+}
+
+/// Text of a removed line, anchored at the new-file position where it
+/// used to be (so it can be rendered inline as a red ghost line).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedDiffLine {
+    pub position: u32,
+    pub text: String,
+}
+
+/// What to diff against: the working tree (vs HEAD) or a single commit
+/// (vs its parent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffSource {
+    WorkingTree,
+    Commit(String),
+}
+
 /// Stable, layout-keyed identity for a single node (spec §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId {
@@ -61,6 +115,20 @@ pub struct SymbolNode {
     pub churn: f32,
     /// Raw commit count behind `churn` (inspectability, spec §5.4).
     pub churn_count: u64,
+    /// Declared access level, when the language records one. None for
+    /// folders, files, and languages/positions without access info.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
+    /// Git diff status, set by `diff::annotate_diff`. None when unchanged
+    /// or when diff annotation has not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_status: Option<DiffStatus>,
+    /// Changed line ranges (file-relative for files, item-relative for items).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diff_hunks: Vec<DiffHunk>,
+    /// Removed lines, positioned relative to this node (items only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_lines: Vec<DeletedDiffLine>,
     pub children: Vec<SymbolNode>,
 }
 
@@ -166,6 +234,10 @@ mod tests {
             measure: 1,
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children: vec![],
         }
     }
@@ -208,6 +280,10 @@ mod tests {
                 measure: 1,
                 churn: 0.0,
                 churn_count: 0,
+                diff_status: None,
+                diff_hunks: Vec::new(),
+                deleted_lines: Vec::new(),
+                visibility: None,
                 children: vec![],
             },
             repo_root: std::path::PathBuf::from("/tmp/x"),
@@ -235,6 +311,10 @@ mod tests {
             measure: 2,
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children: vec![SymbolNode {
                 id: SymbolId {
                     kind: SymbolKind::Item { label: "fn".into() },
@@ -248,6 +328,10 @@ mod tests {
                 measure: 1,
                 churn: 0.0,
                 churn_count: 0,
+                diff_status: None,
+                diff_hunks: Vec::new(),
+                deleted_lines: Vec::new(),
+                visibility: None,
                 children: vec![],
             }],
         };

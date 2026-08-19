@@ -1,9 +1,12 @@
+pub(crate) mod command_palette;
 pub(crate) mod edge_pass;
 pub(crate) mod git_watch;
+pub(crate) mod graph_scaffold;
 pub(crate) mod note_pass;
 pub(crate) mod paint_resolver;
 pub(crate) mod panel_view;
 pub(crate) mod rpc;
 pub(crate) mod rpc_dispatch;
 pub(crate) mod session;
+pub(crate) mod tabs;
 pub(crate) mod watch;

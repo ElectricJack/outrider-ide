@@ -236,6 +236,10 @@ fn build_legacy_folder(
                     measure: file.lines,
                     churn: 0.0,
                     churn_count: 0,
+                    diff_status: None,
+                    diff_hunks: Vec::new(),
+                    deleted_lines: Vec::new(),
+                    visibility: None,
                     children: parsed.items,
                 };
                 children.push(node);
@@ -270,6 +274,10 @@ fn build_legacy_folder(
         measure: children.iter().map(|child| child.measure).sum(),
         churn: 0.0,
         churn_count: 0,
+        diff_status: None,
+        diff_hunks: Vec::new(),
+        deleted_lines: Vec::new(),
+        visibility: None,
         children,
     }
 }
@@ -302,6 +310,10 @@ fn build_indexed_folder(
                     measure: file.lines,
                     churn: 0.0,
                     churn_count: 0,
+                    diff_status: None,
+                    diff_hunks: Vec::new(),
+                    deleted_lines: Vec::new(),
+                    visibility: None,
                     children: parsed.items,
                 };
                 if node.children.is_empty() {
@@ -339,6 +351,10 @@ fn build_indexed_folder(
         measure,
         churn: 0.0,
         churn_count: 0,
+        diff_status: None,
+        diff_hunks: Vec::new(),
+        deleted_lines: Vec::new(),
+        visibility: None,
         children,
     }
 }

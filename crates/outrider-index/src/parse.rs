@@ -8,7 +8,7 @@ use std::ops::Range;
 use anyhow::Context;
 use tree_sitter::Node;
 
-use crate::types::SymbolKind;
+use crate::types::{SymbolKind, Visibility};
 
 /// Raw output of a single tree-sitter parse pass: one structural item with its
 /// metadata and nested children, before `SymbolId` assignment.
@@ -21,7 +21,56 @@ pub struct RawItem {
     pub doc: Option<String>,
     pub byte_range: Range<usize>,
     pub line_count: u64,
+    /// Declared access level, when the language records one.
+    pub visibility: Option<Visibility>,
     pub children: Vec<RawItem>,
+}
+
+/// Derive visibility from declaration-modifier languages (Rust `pub`,
+/// TS/C#/Java `public`/`protected`/`private`). Returns None when the
+/// signature carries no access keyword.
+fn visibility_from_signature(signature: &str) -> Option<Visibility> {
+    let head: Vec<&str> = signature.split_whitespace().take(4).collect();
+    for word in head {
+        match word {
+            "pub" | "public" | "export" => return Some(Visibility::Public),
+            "protected" => return Some(Visibility::Protected),
+            "private" => return Some(Visibility::Private),
+            _ => {}
+        }
+        if word.starts_with("pub(") {
+            return Some(Visibility::Public);
+        }
+    }
+    None
+}
+
+/// C++ visibility: walk back through preceding siblings in the class body
+/// to the nearest `access_specifier` label; fall back to the container's
+/// default (class = private, struct = public).
+fn cpp_member_visibility(node: Node, src: &[u8]) -> Option<Visibility> {
+    let body = node.parent()?;
+    if body.kind() != "field_declaration_list" {
+        return None;
+    }
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() == "access_specifier" {
+            let text = node_text(p, src);
+            return Some(match text.trim().trim_end_matches(':').trim() {
+                "public" => Visibility::Public,
+                "protected" => Visibility::Protected,
+                _ => Visibility::Private,
+            });
+        }
+        prev = p.prev_sibling();
+    }
+    let container = body.parent()?;
+    Some(if container.kind() == "struct_specifier" {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    })
 }
 
 /// Extract Make rules while retaining all non-rule bytes as adjacent sections.
@@ -128,6 +177,7 @@ fn make_target(node: Node<'_>, source: &[u8]) -> RawItem {
         doc: None,
         byte_range: range,
         line_count: line_count as u64,
+        visibility: None,
         children: Vec::new(),
     }
 }
@@ -169,6 +219,7 @@ fn make_section(range: Range<usize>, root: Node<'_>, source: &[u8], is_preamble:
         doc: None,
         byte_range: range,
         line_count: line_count as u64,
+        visibility: None,
         children: Vec::new(),
     }
 }
@@ -459,6 +510,23 @@ pub fn parse_cpp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             "namespace_definition" => Some("namespace"),
             "type_definition" => Some("typedef"),
             "template_declaration" => None,
+            // Class-body members: method declarations (no inline body) and
+            // data fields, so headers yield complete member lists.
+            "field_declaration" | "declaration"
+                if node
+                    .parent()
+                    .is_some_and(|p| p.kind() == "field_declaration_list") =>
+            {
+                if find_descendant(node, "function_declarator").is_some() {
+                    Some("fn")
+                } else if node_kind == "field_declaration"
+                    && node.child_by_field_name("declarator").is_some()
+                {
+                    Some("field")
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     };
@@ -493,7 +561,7 @@ fn cpp_item_name(node: Node, src: &[u8]) -> String {
             }
             last_ident.unwrap_or_else(|| "<anon>".to_string())
         }
-        "function_definition" => {
+        "function_definition" | "field_declaration" | "declaration" => {
             let declarator = node.child_by_field_name("declarator");
             if let Some(decl) = declarator {
                 return cpp_declarator_name(decl, src);
@@ -727,6 +795,7 @@ fn collect_shader_items(node: Node, src: &[u8], language: ShaderLanguage) -> Vec
                     doc: item_doc(src, child.byte_range().start),
                     byte_range: child.byte_range(),
                     line_count: (child.end_position().row - child.start_position().row + 1) as u64,
+                    visibility: None,
                     children: collect_shader_items(child, src, language),
                 });
                 continue;
@@ -828,6 +897,7 @@ fn scan_hlsl_cbuffers(src: &[u8]) -> Vec<RawItem> {
                 doc: item_doc(src, start),
                 byte_range: range,
                 line_count: text[start..end].lines().count() as u64,
+                visibility: None,
                 children: Vec::new(),
             });
         }
@@ -860,15 +930,19 @@ fn collect_items_with_doc(
         if let Some(label) = kind_fn(child.kind(), child, src) {
             let doc = item_doc(src, child.byte_range().start)
                 .or_else(|| doc_fn.and_then(|f| f(child, src)));
+            let signature = item_signature(child, src);
+            let visibility = cpp_member_visibility(child, src)
+                .or_else(|| visibility_from_signature(&signature));
             items.push(RawItem {
                 kind: SymbolKind::Item {
                     label: label.into(),
                 },
                 name: name_fn(child, src),
-                signature: item_signature(child, src),
+                signature,
                 doc,
                 byte_range: child.byte_range(),
                 line_count: (child.end_position().row - child.start_position().row + 1) as u64,
+                visibility,
                 children: collect_items_with_doc(child, src, kind_fn, name_fn, doc_fn),
             });
         } else {
@@ -978,6 +1052,7 @@ pub fn file_doc(source: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::Visibility;
     use super::{
         parse_c_items, parse_cpp_items, parse_csharp_items, parse_glsl_items, parse_hlsl_items,
         parse_js_items, parse_make_items, parse_python_items, parse_rust_items, parse_ts_items,
@@ -1176,6 +1251,57 @@ fn free() {
         assert_eq!(items[0].line_count, 5);
         // `fn free() { ... }` spans 3 lines
         assert_eq!(items[3].line_count, 3);
+    }
+
+    #[test]
+    fn cpp_members_capture_kinds_and_visibility() {
+        let src = br#"
+class Widget {
+public:
+    Widget();
+    int area() const { return w * h; }
+    void resize(int nw, int nh);
+protected:
+    int shared_state;
+private:
+    int w;
+    int h;
+};
+struct Point {
+    int x;
+    int y;
+};
+"#;
+        let items = parse_cpp_items(src).unwrap();
+        let widget = items.iter().find(|i| i.name == "Widget").unwrap();
+        let member = |name: &str| widget.children.iter().find(|c| c.name == name).unwrap();
+
+        // Method declarations without bodies are captured as fns.
+        assert_eq!(member("resize").kind.label(), "fn");
+        assert_eq!(member("resize").visibility, Some(Visibility::Public));
+        // Inline definitions too.
+        assert_eq!(member("area").kind.label(), "fn");
+        assert_eq!(member("area").visibility, Some(Visibility::Public));
+        // Fields with section-based access.
+        assert_eq!(member("shared_state").kind.label(), "field");
+        assert_eq!(member("shared_state").visibility, Some(Visibility::Protected));
+        assert_eq!(member("w").kind.label(), "field");
+        assert_eq!(member("w").visibility, Some(Visibility::Private));
+
+        // struct members default to public.
+        let point = items.iter().find(|i| i.name == "Point").unwrap();
+        let x = point.children.iter().find(|c| c.name == "x").unwrap();
+        assert_eq!(x.kind.label(), "field");
+        assert_eq!(x.visibility, Some(Visibility::Public));
+    }
+
+    #[test]
+    fn rust_visibility_from_pub_modifier() {
+        let src = b"pub fn open() {}\nfn hidden() {}\npub(crate) struct S;\n";
+        let items = parse_rust_items(src).unwrap();
+        let by_name = |n: &str| items.iter().find(|i| i.name == n).unwrap();
+        assert_eq!(by_name("open").visibility, Some(Visibility::Public));
+        assert_eq!(by_name("hidden").visibility, None);
     }
 
     #[test]
@@ -1584,10 +1710,17 @@ void standalone() {
                 ("enum", "Color"),
             ]
         );
-        // Shape has destructor only (pure virtual decl is not a definition)
-        assert_eq!(items[0].children[0].children.len(), 1);
-        // Circle has constructor + destructor + method
-        assert_eq!(items[0].children[1].children.len(), 3);
+        // Shape has destructor + pure virtual method declaration
+        assert_eq!(items[0].children[0].children.len(), 2);
+        // Circle has constructor + destructor + method + radius field
+        assert_eq!(items[0].children[1].children.len(), 4);
+        let radius = items[0].children[1]
+            .children
+            .iter()
+            .find(|c| c.name == "radius")
+            .expect("radius field captured");
+        assert_eq!(radius.kind.label(), "field");
+        assert_eq!(radius.visibility, Some(Visibility::Private));
 
         // Top-level items after namespace
         let top: Vec<(&str, &str)> = items[1..]

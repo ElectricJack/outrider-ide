@@ -330,7 +330,7 @@ pub fn validate(
                 hard: false,
             });
         }
-        SpaceKind::Treemap => {}
+        SpaceKind::Treemap | SpaceKind::Graph => {}
     }
 
     violations

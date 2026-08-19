@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use gpui::{
     canvas, div, point, prelude::*, px, quad, rgb, rgba, size, transparent_black, App, BorderStyle,
-    Bounds, ContentMask, Context, Corners, FocusHandle, Pixels, TextAlign, TextRun, Window,
+    Bounds, ContentMask, Context, Corners, FocusHandle, PathBuilder, Pixels, TextAlign, TextRun,
+    Window,
 };
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 use outrider_layout::{PackLayout, Rect};
@@ -25,12 +26,33 @@ actions!(
         ToggleProjectSettings,
         OpenFilePalette,
         OpenSymbolPalette,
+        OpenCommandPalette,
         RevealInFileManager,
         Quit,
+        NextViewTab,
+        PrevViewTab,
+        BaseViewTab,
+        ViewTab1,
+        ViewTab2,
+        ViewTab3,
+        ViewTab4,
+        ViewTab5,
+        ViewTab6,
+        ViewTab7,
+        ViewTab8,
+        ViewTab9,
     ]
 );
 
 use outrider_index::call_graph::{CallEdge, CallGraphData};
+
+/// Target of a view-tab keyboard action.
+#[derive(Clone, Copy)]
+enum TabJump {
+    Next,
+    Prev,
+    Index(usize),
+}
 
 use crate::buffers::{collect_file_symbols, BufferManager};
 use crate::camera::{self, Camera, CameraTween};
@@ -513,6 +535,10 @@ pub struct TreemapView {
     layout: PackLayout,
     layout_transition: Option<LayoutTransition>,
     packing_target_layout: Option<PackLayout>,
+    /// Alternate display scaffold when `space.kind == "graph"`: a synthetic
+    /// flat tree + graph-positioned layout replacing the treemap pair for
+    /// culling, hit testing, navigation, camera, and edge projection.
+    graph_scaffold: Option<crate::view::graph_scaffold::GraphScaffold>,
     /// None until the first render supplies a viewport; then Home-framed.
     pub(crate) camera: Option<Camera>,
     home_zoom: f64,
@@ -552,12 +578,19 @@ pub struct TreemapView {
     rename_state: Option<RenameState>,
     /// Unified panel state (palette + call-graph + future panels).
     panels: crate::view::panel_view::PanelState,
+    /// Command palette (Ctrl+Shift+P).
+    cmd_palette: crate::view::command_palette::CommandPaletteState,
     /// Call graph exploration mode.
     call_graph: Option<CallGraphMode>,
     call_graph_cache: HashMap<SymbolId, CallGraphData>,
     cg_resolver: CallGraphResolver,
     /// The current view document; starts as the session default.
     pub(crate) view_spec: outrider_view::ViewSpec,
+    /// Switchable views: the base treemap plus one tab per view file.
+    view_tabs: crate::view::tabs::ViewTabs,
+    /// Set on tab switch: after the next scaffold rebuild, reframe the
+    /// camera on the retained focus (or the root if it isn't in the view).
+    pending_focus_reframe: bool,
     view_resolver: outrider_view::ViewResolver,
     pub(crate) view_dirty: outrider_view::Deps,
     pub(crate) metrics: outrider_view::metric::MetricRegistry,
@@ -1202,6 +1235,10 @@ impl TreemapView {
             measure: 0,
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children: Vec::new(),
         };
         let tree = SymbolTree {
@@ -1250,11 +1287,13 @@ impl TreemapView {
         }
         let global_settings = settings.clone();
         let view_spec = crate::view::session::default_view(&settings);
+        let view_tabs = crate::view::tabs::ViewTabs::new(view_spec.clone());
         Self {
             tree,
             layout,
             layout_transition: None,
             packing_target_layout: None,
+            graph_scaffold: None,
             camera: None,
             home_zoom: 1.0,
             drag_last: None,
@@ -1280,12 +1319,15 @@ impl TreemapView {
             delete_confirm: None,
             rename_state: None,
             view_spec,
+            view_tabs,
+            pending_focus_reframe: false,
             view_resolver: outrider_view::ViewResolver::new(),
             view_dirty: outrider_view::Deps::SPEC,
             metrics: outrider_view::metric::MetricRegistry::builtin(),
             relations: outrider_view::relation::RelationRegistry::empty(),
             partitions: outrider_view::partition::PartitionRegistry::default(),
             panels: crate::view::panel_view::PanelState::new(),
+            cmd_palette: crate::view::command_palette::CommandPaletteState::new(),
             call_graph: None,
             call_graph_cache: HashMap::new(),
             cg_resolver: CallGraphResolver::new(),
@@ -1303,11 +1345,30 @@ impl TreemapView {
         }
     }
 
+    /// The display scaffold: the (tree, layout) pair every geometric
+    /// consumer reads. Treemap mode uses the index tree + packed layout;
+    /// graph mode substitutes the synthetic graph scaffold.
+    fn active_pair(&self) -> (&SymbolTree, &PackLayout) {
+        match &self.graph_scaffold {
+            Some(s) => (&s.tree, &s.layout),
+            None => (&self.tree, &self.layout),
+        }
+    }
+
+    fn active_tree(&self) -> &SymbolTree {
+        self.active_pair().0
+    }
+
+    fn active_layout(&self) -> &PackLayout {
+        self.active_pair().1
+    }
+
     /// World-space rect of the root node, used for Home framing.
     fn root_rect(&self) -> Rect {
-        self.layout
+        let (tree, layout) = self.active_pair();
+        layout
             .rects
-            .get(&self.tree.root.id)
+            .get(&tree.root.id)
             .copied()
             .unwrap_or(Rect {
                 x: 0.0,
@@ -1344,7 +1405,11 @@ impl TreemapView {
         frame: impl Fn(f64) -> Camera,
     ) -> Camera {
         let c0 = frame(vh);
-        let stack = pinned_stack_h(&self.focus.current, &self.layout, index, &c0, vw, vh);
+        let layout = match &self.graph_scaffold {
+            Some(s) => &s.layout,
+            None => &self.layout,
+        };
+        let stack = pinned_stack_h(&self.focus.current, layout, index, &c0, vw, vh);
         let top0 = (vh - r.h * c0.zoom) / 2.0;
         if stack <= top0 {
             return c0;
@@ -1357,8 +1422,12 @@ impl TreemapView {
     /// (capped END fit), containers at FOCUS_FRACTION — both nudged below
     /// any pinned ancestor headers so the focus is never underlapped.
     fn frame_focus(&mut self, vw: f64, vh: f64, min_zoom: f64, max_zoom: f64) -> Option<Camera> {
-        let packed = *self.layout.rects.get(&self.focus.current)?;
-        let index = TreeIndex::new(&self.tree);
+        let (frame_tree, frame_layout) = match &self.graph_scaffold {
+            Some(s) => (&s.tree, &s.layout),
+            None => (&self.tree, &self.layout),
+        };
+        let packed = *frame_layout.rects.get(&self.focus.current)?;
+        let index = TreeIndex::new(frame_tree);
         let node = index.node(&self.focus.current)?;
         let leaf = content::is_leaf_item(node);
         let framed = if leaf {
@@ -1540,6 +1609,17 @@ impl TreemapView {
         &mut self,
         cmd: outrider_view::command::ViewCommand,
     ) -> outrider_view::command::Applied {
+        // Focus/neighbor rings are session navigation chrome, not view
+        // content: a user-authored spec that omits them still needs to show
+        // the selected node. Inject the defaults unless the spec declares
+        // its own focusRing layer.
+        let cmd = match cmd {
+            outrider_view::command::ViewCommand::Apply(mut spec) => {
+                crate::view::session::ensure_navigation_marks(&mut spec);
+                outrider_view::command::ViewCommand::Apply(spec)
+            }
+            other => other,
+        };
         let applied = outrider_view::command::apply(cmd, &mut self.view_spec);
         self.view_dirty |= applied.changed;
         for v in &applied.violations {
@@ -1588,6 +1668,125 @@ impl TreemapView {
         });
         self.settings_draft = None;
         self.context_menu = None;
+    }
+
+    fn open_command_palette(&mut self) {
+        let names = self.metrics.names();
+        self.cmd_palette.open(&names);
+        self.close_all_panels();
+        self.settings_draft = None;
+        self.context_menu = None;
+    }
+
+    fn on_cmd_palette_key(&mut self, e: &gpui::KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+        let ch = e.keystroke.key_char.as_ref().and_then(|s| {
+            let mut chars = s.chars();
+            let c = chars.next()?;
+            if chars.next().is_none() { Some(c) } else { None }
+        });
+        let effect = crate::view::command_palette::cmd_palette_key(
+            &mut self.cmd_palette,
+            e.keystroke.key.as_str(),
+            ch,
+        );
+        match effect {
+            crate::view::command_palette::CmdPaletteEffect::None => {}
+            crate::view::command_palette::CmdPaletteEffect::SelectionChanged
+            | crate::view::command_palette::CmdPaletteEffect::QueryChanged => {
+                cx.notify();
+            }
+            crate::view::command_palette::CmdPaletteEffect::Close => {
+                cx.notify();
+            }
+            crate::view::command_palette::CmdPaletteEffect::Execute(idx) => {
+                if let Some(entry) = self.cmd_palette.entries.get(idx) {
+                    match &entry.action {
+                        crate::view::command_palette::CommandAction::View(cmd) => {
+                            let cmd = cmd.clone();
+                            // Special case: Tour::SetSteps with empty vec means "load history"
+                            if matches!(&cmd, outrider_view::command::ViewCommand::Tour(
+                                outrider_view::command::TourCommand::SetSteps(v)
+                            ) if v.is_empty()) {
+                                let steps = self.nav_history.to_steps();
+                                self.apply_view_command(
+                                    outrider_view::command::ViewCommand::Tour(
+                                        outrider_view::command::TourCommand::SetSteps(steps),
+                                    ),
+                                );
+                            } else if matches!(&cmd, outrider_view::command::ViewCommand::Camera(
+                                outrider_view::command::CameraCommand::Home
+                            )) {
+                                let cmd_c = outrider_view::command::CameraCommand::Home;
+                                self.apply_view_command(outrider_view::command::ViewCommand::Camera(cmd_c.clone()));
+                                let (vw, vh) = Self::map_viewport(window);
+                                self.enact_camera(&cmd_c, vw, vh);
+                            } else {
+                                self.apply_view_command(cmd);
+                            }
+                        }
+                        crate::view::command_palette::CommandAction::OpenFilePalette => {
+                            self.open_palette(true);
+                        }
+                        crate::view::command_palette::CommandAction::OpenSymbolPalette => {
+                            self.open_palette(false);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_command_palette(&self, map_w: f64) -> Option<gpui::Div> {
+        if !self.cmd_palette.open {
+            return None;
+        }
+        use crate::view::panel_view::PALETTE_W;
+        use gpui::{div, px, rgb, IntoElement};
+
+        let left = ((map_w as f32 - PALETTE_W) / 2.0).max(0.0);
+
+        let query_text = format!("[Command] {}│", self.cmd_palette.query);
+
+        let mut list = div()
+            .w(px(PALETTE_W))
+            .ml(px(left))
+            .mt(px(60.0))
+            .bg(rgb(theme::CODE_BG))
+            .border_1()
+            .border_color(rgb(theme::FOCUS_BORDER))
+            .rounded(px(4.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(14.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .child(query_text),
+            );
+
+        for (vi, &entry_idx) in self.cmd_palette.filtered.iter().enumerate().take(14) {
+            let entry = &self.cmd_palette.entries[entry_idx];
+            let selected = vi == self.cmd_palette.selection;
+            list = list.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .text_size(px(13.0))
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(if selected {
+                        rgb(theme::TEXT_PRIMARY)
+                    } else {
+                        rgb(theme::TEXT_SECONDARY)
+                    })
+                    .when(selected, |d| d.bg(rgb(0x2a2d32_u32)))
+                    .child(format!("{}: {}", entry.category, entry.label)),
+            );
+        }
+
+        Some(div().absolute().top_0().left_0().size_full().child(list))
     }
 
     fn redefine_palette_set(&mut self) {
@@ -1647,38 +1846,109 @@ impl TreemapView {
         for e in &events {
             self.watch_state.record(e);
         }
-        let Some(path) = self.watch_state.newest().cloned() else {
-            return true;
-        };
-        if !events.iter().any(|e| {
-            matches!(e, crate::view::watch::WatchEvent::Changed(p) if *p == path)
-        }) {
-            return true;
-        }
-        match std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| {
-                serde_json::from_str::<outrider_view::ViewSpec>(&s).map_err(|e| e.to_string())
-            }) {
-            Ok(spec) => {
-                self.apply_view_command(outrider_view::command::ViewCommand::Apply(spec));
-                self.notifications.push(Notification::warning(format!(
-                    "Applied view {}",
-                    path.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                )));
+        // Every view file is a tab. Removed files drop their tab; changed
+        // files refresh theirs. Then switch to the newest changed file so
+        // an agent-authored view pops up, but only re-apply in place when
+        // the edited file is already the active tab (hot reload).
+        let mut removed_active = false;
+        for e in &events {
+            if let crate::view::watch::WatchEvent::Removed(p) = e {
+                removed_active |= self.view_tabs.remove_file(p);
             }
-            Err(msg) => {
-                if !self.watch_state.retry_once(&path) {
-                    self.notifications.push(Notification::warning(format!(
-                        "{}: {msg}",
-                        path.display()
-                    )));
+        }
+        let mut switch_to: Option<usize> = None;
+        let newest = self.watch_state.newest().cloned();
+        for e in &events {
+            let crate::view::watch::WatchEvent::Changed(path) = e else {
+                continue;
+            };
+            match std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<outrider_view::ViewSpec>(&s).map_err(|e| e.to_string())
+                }) {
+                Ok(spec) => {
+                    let idx = self.view_tabs.upsert_file(path, spec);
+                    if newest.as_ref() == Some(path) {
+                        switch_to = Some(idx);
+                    }
+                }
+                Err(msg) => {
+                    if !self.watch_state.retry_once(path) {
+                        self.notifications.push(Notification::warning(format!(
+                            "{}: {msg}",
+                            path.display()
+                        )));
+                    }
                 }
             }
         }
+        if let Some(idx) = switch_to {
+            if idx == self.view_tabs.active_index() {
+                // Hot reload of the active view.
+                self.apply_active_tab_spec();
+            } else {
+                self.switch_to_tab(idx);
+            }
+        } else if removed_active {
+            self.apply_active_tab_spec();
+        }
         true
+    }
+
+    /// Make tab `idx` active: stash the live spec on the outgoing tab,
+    /// apply the incoming tab's spec, and keep the focused symbol — reframed
+    /// in the new layout if it exists there, else fall back to the root.
+    fn switch_to_tab(&mut self, idx: usize) {
+        if idx == self.view_tabs.active_index() {
+            return;
+        }
+        let live = self.view_spec.clone();
+        self.view_tabs.store_active_spec(live);
+        if !self.view_tabs.activate(idx) {
+            return;
+        }
+        self.apply_active_tab_spec();
+    }
+
+    /// Apply the active tab's spec to the session and reframe the focus.
+    fn apply_active_tab_spec(&mut self) {
+        let tab = self.view_tabs.active().clone();
+        let result =
+            self.apply_view_command(outrider_view::command::ViewCommand::Apply(tab.spec));
+        if result.changed.is_none() {
+            let msgs: Vec<_> = result.violations.iter().map(|v| v.message.clone()).collect();
+            self.notifications.push(Notification::warning(format!(
+                "View '{}' rejected: {}",
+                tab.label,
+                msgs.join("; ")
+            )));
+            return;
+        }
+        // Layout may change (treemap <-> graph). Let paint_items rebuild
+        // the scaffold, then reframe on the retained focus next frame.
+        self.pending_focus_reframe = true;
+        self.neighbors = None;
+        self.context_menu = None;
+    }
+
+    /// Keyboard tab switching (bound in main.rs): Ctrl+Tab / Ctrl+Shift+Tab
+    /// cycle, Ctrl+1..9 jump, Ctrl+` returns to the base treemap.
+    fn tab_action(&mut self, jump: TabJump) {
+        if !self.map_interaction_enabled() {
+            return;
+        }
+        let n = self.view_tabs.len();
+        let cur = self.view_tabs.active_index();
+        let target = match jump {
+            TabJump::Next if n > 1 => Some((cur + 1) % n),
+            TabJump::Prev if n > 1 => Some((cur + n - 1) % n),
+            TabJump::Index(i) if i < n => Some(i),
+            _ => None,
+        };
+        if let Some(t) = target {
+            self.switch_to_tab(t);
+        }
     }
 
     fn poll_git_watch(&mut self) -> bool {
@@ -1743,11 +2013,13 @@ impl TreemapView {
         let focus_id = self.focus.current.clone();
         let stale = !matches!(&self.neighbors, Some((k, _)) if k == &focus_id);
         if stale {
-            let index = TreeIndex::new(&self.tree);
-            self.neighbors = Some((
-                focus_id.clone(),
-                focus::neighbors(&focus_id, &self.layout, &index),
-            ));
+            let (nav_tree, nav_layout) = match &self.graph_scaffold {
+                Some(s) => (&s.tree, &s.layout),
+                None => (&self.tree, &self.layout),
+            };
+            let index = TreeIndex::new(nav_tree);
+            let n = focus::neighbors(&focus_id, nav_layout, &index);
+            self.neighbors = Some((focus_id.clone(), n));
         }
         let (_, _neighbor_ids) = self.neighbors.clone().unwrap();
 
@@ -1772,6 +2044,90 @@ impl TreemapView {
         let resolved = self.view_resolver.resolve(&self.view_spec, &ctx, dirty);
         self.panels.sync(&resolved.panels);
         let ov = crate::view::paint_resolver::PaintOverrides::new(resolved);
+
+        // Maintain the graph scaffold when the spec requests graph space.
+        let graph_mode =
+            self.view_spec.space.kind == outrider_view::spec::SpaceKind::Graph;
+        let mut scaffold_changed = false;
+        if graph_mode {
+            let stale = self.graph_scaffold.is_none()
+                || dirty.intersects(
+                    outrider_view::Deps::SPEC
+                        | outrider_view::Deps::TREE
+                        | outrider_view::Deps::RELATIONS,
+                );
+            if stale {
+                let old_count = self
+                    .graph_scaffold
+                    .as_ref()
+                    .map(|s| s.tree.root.children.len());
+                self.graph_scaffold = Some(crate::view::graph_scaffold::build(
+                    &self.tree,
+                    resolved,
+                    self.view_spec.space.members.as_ref(),
+                ));
+                let new_count = self
+                    .graph_scaffold
+                    .as_ref()
+                    .map(|s| s.tree.root.children.len());
+                scaffold_changed = old_count != new_count;
+            }
+        } else if self.graph_scaffold.take().is_some() {
+            scaffold_changed = true;
+        }
+        let (active_tree, active_layout): (&SymbolTree, &PackLayout) =
+            match &self.graph_scaffold {
+                Some(s) => (&s.tree, &s.layout),
+                None => (&self.tree, &self.layout),
+            };
+        // Reframe after a scaffold change or tab switch. Keep the focused
+        // symbol if the new layout has it (frame it), else fall back to the
+        // root fit. The base tab never rebuilds a scaffold, so the tab
+        // switch flag is what drives treemap-side reframing.
+        let reframe = scaffold_changed || std::mem::take(&mut self.pending_focus_reframe);
+        let camera = if reframe {
+            let root_rect = active_layout
+                .rects
+                .get(&active_tree.root.id)
+                .copied()
+                .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
+            let home = Camera::fit(root_rect, vw, vh);
+            self.home_zoom = home.zoom;
+            let focus_rect = if self.focus.current != active_tree.root.id {
+                active_layout.rects.get(&self.focus.current).copied()
+            } else {
+                None
+            };
+            let target = match focus_rect {
+                Some(r) => camera::frame_rect(
+                    r,
+                    vw,
+                    vh,
+                    camera::FOCUS_FRACTION,
+                    (self.home_zoom * 0.5).min(camera::MAX_ZOOM),
+                    camera::MAX_ZOOM,
+                ),
+                None => home,
+            };
+            // Snap on scaffold change (layout is discontinuous); tween when
+            // only the tab's framing changed within the same layout.
+            if scaffold_changed {
+                self.camera = Some(target);
+                self.tween = None;
+                target
+            } else {
+                // Inline start_tween: `resolved` still borrows the resolver.
+                let tw = match self.tween.take() {
+                    Some((tw, started)) => tw.retarget(started.elapsed().as_secs_f64(), target),
+                    None => CameraTween::new(camera, target),
+                };
+                self.camera = Some(tw.from);
+                self.tween = Some((tw, std::time::Instant::now()));
+                camera
+            }
+        } else {
+            camera
+        };
 
         let cg_highlight_lines: Option<std::ops::Range<usize>> =
             self.call_graph.as_ref().and_then(|mode| {
@@ -1798,10 +2154,14 @@ impl TreemapView {
         if let Some(textures) = self.textures.as_mut() {
             textures.begin_visibility_frame();
         }
-        let items = world::visible_nodes(&self.tree, &self.layout, &camera, vw, vh, |id| {
-            self.textures
-                .as_ref()
-                .is_some_and(|textures| textures.contains(id))
+        // In graph mode boxes are text-only UML nodes: report no thumbnails
+        // so member subtrees are never pruned behind a code texture.
+        let items = world::visible_nodes(active_tree, active_layout, &camera, vw, vh, |id| {
+            !graph_mode
+                && self
+                    .textures
+                    .as_ref()
+                    .is_some_and(|textures| textures.contains(id))
         });
         let mut out = Vec::with_capacity(items.len());
         let mut focused_paint_idx = None;
@@ -1867,6 +2227,7 @@ impl TreemapView {
                     }
                     if matches!(rung, Rung::Dot | Rung::Label | Rung::Card)
                         && !item.node.children.is_empty()
+                        && !graph_mode
                     {
                         let area = item.label_w * item.full_h;
                         if let Some(textures) = self.textures.as_mut() {
@@ -1997,11 +2358,7 @@ impl TreemapView {
                 if rung_ok && !notes.is_empty() {
                     let panel_notes: Vec<_> = notes
                         .iter()
-                        .filter(|n| {
-                            n.range.is_none()
-                                && n.lines.is_none()
-                                && n.source != outrider_view::spec::NoteSource::Agent
-                        })
+                        .filter(|n| n.range.is_none() && n.lines.is_none())
                         .cloned()
                         .collect();
                     if !panel_notes.is_empty()
@@ -2017,6 +2374,19 @@ impl TreemapView {
                     }
                 }
             }
+            // In graph mode the root is a synthetic canvas, not a symbol:
+            // keep the neutral container fill so metric colors on it don't
+            // wash out the whole diagram background.
+            let is_graph_canvas = graph_mode && item.level == 0;
+            let effective_fill = if is_graph_canvas {
+                fill
+            } else {
+                ov.fill(&item.node.id).unwrap_or(fill)
+            };
+            if let Some(op) = ov.opacity(&item.node.id) {
+                body_opacity *= op;
+                tex_opacity *= op;
+            }
             out.push(PaintItem {
                 x: item.px.x as f32,
                 y: item.px.y as f32,
@@ -2024,8 +2394,8 @@ impl TreemapView {
                 h: paint_h,
                 clip_y: clip_y as f32,
                 clip_h: clip_h as f32,
-                fill: theme::dim_toward(fill, light),
-                border: theme::dim_toward(theme::border_for(fill), light),
+                fill: theme::dim_toward(effective_fill, light),
+                border: theme::dim_toward(theme::border_for(effective_fill), light),
                 stripe: ov.stripe(&item.node.id).map(|c| theme::dim_toward(c, light)),
                 focused: ov.is_focus_ring(&item.node.id),
                 deferred_overlay: defer_leaf_to_overlay(is_focused, is_leaf),
@@ -2116,7 +2486,7 @@ impl TreemapView {
         let cg_scrim = self.call_graph.is_some();
         let edge_frame = crate::view::edge_pass::aggregate(
             &resolved.edges,
-            &self.layout,
+            active_layout,
             &camera,
             vw,
             vh,
@@ -2336,10 +2706,16 @@ impl TreemapView {
         }
         let Some(cam) = self.camera else { return };
         let (vw, vh) = Self::map_viewport(window);
-        let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
-            self.textures
-                .as_ref()
-                .is_some_and(|textures| textures.contains(id))
+        let (hit_tree, hit_layout) = match &self.graph_scaffold {
+            Some(s) => (&s.tree, &s.layout),
+            None => (&self.tree, &self.layout),
+        };
+        let items = world::visible_nodes(hit_tree, hit_layout, &cam, vw, vh, |id| {
+            self.graph_scaffold.is_none()
+                && self
+                    .textures
+                    .as_ref()
+                    .is_some_and(|textures| textures.contains(id))
         });
         let (mx, my) = (f64::from(e.position.x), f64::from(e.position.y));
         if let Some(hit) = world::hit_test(&items, mx, my) {
@@ -2374,16 +2750,22 @@ impl TreemapView {
         }
         let Some(cam) = self.camera else { return };
         let (vw, vh) = Self::map_viewport(window);
-        let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
-            self.textures
-                .as_ref()
-                .is_some_and(|textures| textures.contains(id))
+        let (hit_tree, hit_layout) = match &self.graph_scaffold {
+            Some(s) => (&s.tree, &s.layout),
+            None => (&self.tree, &self.layout),
+        };
+        let items = world::visible_nodes(hit_tree, hit_layout, &cam, vw, vh, |id| {
+            self.graph_scaffold.is_none()
+                && self
+                    .textures
+                    .as_ref()
+                    .is_some_and(|textures| textures.contains(id))
         });
         let (mx, my) = (f64::from(e.position.x), f64::from(e.position.y));
         let hit = world::hit_test(&items, mx, my).map(|i| i.node.id.clone());
         drop(items);
         if let Some(id) = hit {
-            let index = TreeIndex::new(&self.tree);
+            let index = TreeIndex::new(hit_tree);
             if self.focus.set(id, &index) {
                 self.view_dirty |= outrider_view::Deps::FOCUS;
                 self.nav_history.push(self.focus.current.clone());
@@ -2411,10 +2793,16 @@ impl TreemapView {
         } else {
             let Some(cam) = self.camera else { return };
             let (vw, vh) = Self::map_viewport(window);
-            let items = world::visible_nodes(&self.tree, &self.layout, &cam, vw, vh, |id| {
-                self.textures
-                    .as_ref()
-                    .is_some_and(|textures| textures.contains(id))
+            let (hit_tree, hit_layout) = match &self.graph_scaffold {
+                Some(s) => (&s.tree, &s.layout),
+                None => (&self.tree, &self.layout),
+            };
+            let items = world::visible_nodes(hit_tree, hit_layout, &cam, vw, vh, |id| {
+                self.graph_scaffold.is_none()
+                    && self
+                        .textures
+                        .as_ref()
+                        .is_some_and(|textures| textures.contains(id))
             });
             let (mx, my) = (f64::from(e.position.x), f64::from(e.position.y));
             let hit = world::hit_test(&items, mx, my)
@@ -2574,6 +2962,10 @@ impl TreemapView {
             cx.notify();
             return;
         }
+        if self.cmd_palette.open {
+            self.on_cmd_palette_key(e, window, cx);
+            return;
+        }
         if self.panels.is_open() {
             self.on_panel_key(e, window, cx);
             return;
@@ -2644,7 +3036,11 @@ impl TreemapView {
         let (vw, vh) = Self::map_viewport(window);
         let max_zoom = camera::MAX_ZOOM;
         let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
-        let index = TreeIndex::new(&self.tree);
+        let (nav_tree, nav_layout) = match &self.graph_scaffold {
+            Some(s) => (&s.tree, &s.layout),
+            None => (&self.tree, &self.layout),
+        };
+        let index = TreeIndex::new(nav_tree);
         let target = match e.keystroke.key.as_str() {
             "enter" => {
                 if !self.focus.step_in(&index) {
@@ -2666,8 +3062,7 @@ impl TreemapView {
                 self.prefetch_relations();
                 self.frame_focus(vw, vh, min_zoom, max_zoom)
             }
-            "end" => self
-                .layout
+            "end" => nav_layout
                 .rects
                 .get(&self.focus.current)
                 .copied()
@@ -2718,7 +3113,7 @@ impl TreemapView {
                     _ => focus::Dir::Right,
                 };
                 let Some(next) =
-                    focus::spatial_step(&self.focus.current, dir, &self.layout, &index)
+                    focus::spatial_step(&self.focus.current, dir, nav_layout, &index)
                 else {
                     return;
                 };
@@ -3534,6 +3929,84 @@ impl TreemapView {
         };
 
         Some(menu_div)
+    }
+
+    /// Top-center view tab strip. Hidden while only the base tab exists.
+    fn render_tab_bar(&self, vw: f64, cx: &mut Context<Self>) -> gpui::Div {
+        let tabs = self.view_tabs.tabs();
+        if tabs.len() < 2 {
+            return div();
+        }
+        let active = self.view_tabs.active_index();
+        let mut strip = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .p(px(3.0))
+            .rounded(px(6.0))
+            .bg(rgba(0x000000a0));
+        for (i, tab) in tabs.iter().enumerate() {
+            let is_active = i == active;
+            let (bg, fg) = if is_active {
+                (rgb(0x2a3040_u32), rgb(theme::TEXT_PRIMARY))
+            } else {
+                (rgba(0x00000000), rgb(theme::TEXT_SECONDARY))
+            };
+            let hint = if i < 9 { format!("{}", i + 1) } else { String::new() };
+            let label = tab.label.clone();
+            strip = strip.child(
+                div()
+                    .id(("view-tab", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(bg)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgb(0x232a38_u32)))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child(hint),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_family(theme::FONT_FAMILY_SANS)
+                            .text_color(fg)
+                            .child(label),
+                    )
+                    // Swallow the press so the map beneath doesn't treat the
+                    // tab click as a click-to-focus on whatever box is there.
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.press_origin = None;
+                        this.drag_last = None;
+                        this.switch_to_tab(i);
+                        this.context_menu = None;
+                        this.file_menu_open = false;
+                        cx.notify();
+                    })),
+            );
+        }
+        // Center the strip: absolute at top, full width flex container.
+        div()
+            .absolute()
+            .top(px(8.0))
+            .left(px(0.0))
+            .w(px(vw as f32))
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(strip)
     }
 
     fn render_file_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -4539,6 +5012,9 @@ impl Render for TreemapView {
         // Build the panels overlay (palette + future docked panels).
         let panels_overlay = self.render_panels(vw);
 
+        // Build the command palette overlay.
+        let cmd_palette_overlay = self.render_command_palette(vw);
+
         // Build the settings overlay (needs cx for click listeners).
         let settings_overlay = self
             .settings_draft
@@ -4570,6 +5046,8 @@ impl Render for TreemapView {
         // Build the context menu overlay (needs cx for click listeners).
         let context_menu_overlay = self.render_context_menu(cx);
         let file_menu_overlay = self.render_file_menu(cx);
+        let tab_bar_overlay =
+            (!has_overlays && self.map_interaction_enabled()).then(|| self.render_tab_bar(vw, cx));
 
         // Build the call graph overlay.
         let call_graph_overlay = self.render_call_graph(vw, vh, cx);
@@ -4691,12 +5169,67 @@ impl Render for TreemapView {
                 this.open_palette(false);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, _w, cx| {
+                if !this.map_interaction_enabled() {
+                    return;
+                }
+                this.open_command_palette();
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &RevealInFileManager, _w, _cx| {
                 if !this.map_interaction_enabled() {
                     return;
                 }
                 let path = resolve_fs_path(&this.focus.current, &this.tree.repo_root);
                 open_in_file_manager(&path);
+            }))
+            .on_action(cx.listener(|this, _: &NextViewTab, _w, cx| {
+                this.tab_action(TabJump::Next);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PrevViewTab, _w, cx| {
+                this.tab_action(TabJump::Prev);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &BaseViewTab, _w, cx| {
+                this.tab_action(TabJump::Index(crate::view::tabs::BASE_TAB));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab1, _w, cx| {
+                this.tab_action(TabJump::Index(0));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab2, _w, cx| {
+                this.tab_action(TabJump::Index(1));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab3, _w, cx| {
+                this.tab_action(TabJump::Index(2));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab4, _w, cx| {
+                this.tab_action(TabJump::Index(3));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab5, _w, cx| {
+                this.tab_action(TabJump::Index(4));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab6, _w, cx| {
+                this.tab_action(TabJump::Index(5));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab7, _w, cx| {
+                this.tab_action(TabJump::Index(6));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab8, _w, cx| {
+                this.tab_action(TabJump::Index(7));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewTab9, _w, cx| {
+                this.tab_action(TabJump::Index(8));
+                cx.notify();
             }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -4993,6 +5526,64 @@ impl Render for TreemapView {
                                 });
                             }
                         }
+                        // Pass 3b: edge lines with arrowheads.
+                        for edge in &frame.edges.edges {
+                            let x1 = origin.x + px(edge.from.0);
+                            let y1 = origin.y + px(edge.from.1);
+                            let x2 = origin.x + px(edge.to.0);
+                            let y2 = origin.y + px(edge.to.1);
+
+                            let dx = edge.to.0 - edge.from.0;
+                            let dy = edge.to.1 - edge.from.1;
+                            let len = (dx * dx + dy * dy).sqrt();
+                            if len < 1.0 {
+                                continue;
+                            }
+
+                            let color = rgba((edge.color << 8) | 0xCC);
+                            let line_w = 1.5 + edge.weight;
+
+                            // Stem line
+                            let mut stem = PathBuilder::stroke(px(line_w));
+                            stem.move_to(point(x1, y1));
+                            stem.line_to(point(x2, y2));
+                            if edge.dashed {
+                                stem = stem.dash_array(&[px(6.0), px(4.0)]);
+                            }
+                            if let Ok(path) = stem.build() {
+                                window.paint_path(path, color);
+                            }
+
+                            // Arrowhead (filled triangle at the "to" end)
+                            let nx = dx / len;
+                            let ny = dy / len;
+                            let arrow_len: f32 = 8.0 + line_w * 2.0;
+                            let arrow_w: f32 = 4.0 + line_w;
+                            let tip_x = edge.to.0;
+                            let tip_y = edge.to.1;
+                            let base_x = tip_x - nx * arrow_len;
+                            let base_y = tip_y - ny * arrow_len;
+                            let wing1_x = base_x + ny * arrow_w;
+                            let wing1_y = base_y - nx * arrow_w;
+                            let wing2_x = base_x - ny * arrow_w;
+                            let wing2_y = base_y + nx * arrow_w;
+
+                            let mut arrow = PathBuilder::fill();
+                            arrow.move_to(point(origin.x + px(tip_x), origin.y + px(tip_y)));
+                            arrow.line_to(point(
+                                origin.x + px(wing1_x),
+                                origin.y + px(wing1_y),
+                            ));
+                            arrow.line_to(point(
+                                origin.x + px(wing2_x),
+                                origin.y + px(wing2_y),
+                            ));
+                            arrow.close();
+                            if let Ok(path) = arrow.build() {
+                                window.paint_path(path, color);
+                            }
+                        }
+
                         // Pass 4: focused-leaf doc panel (floats to the right).
                         // Skipped in call-graph mode.
                         if let Some(dp) = frame.doc_panel.as_ref().filter(|_| !frame.cg_scrim) {
@@ -5043,7 +5634,9 @@ impl Render for TreemapView {
                 .size_full(),
             )
             .children(toolbar_overlay)
+            .children(tab_bar_overlay)
             .children(panels_overlay)
+            .children(cmd_palette_overlay)
             .children(settings_overlay)
             .children(welcome_overlay)
             .children(context_menu_overlay)
@@ -5522,6 +6115,10 @@ mod tests {
             measure,
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children: vec![],
         }
     }
@@ -5745,6 +6342,10 @@ mod tests {
             measure: 0,
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children: vec![],
         }
     }

@@ -323,6 +323,16 @@ fn materialize_file(
         if let Some(bytes) = read.bytes {
             let lines = read.lines;
             let mut parsed = ParsedFile::default();
+            // `.h` is ambiguous: C++ projects overwhelmingly use it for C++
+            // headers, which the C grammar garbles (classes and namespaces
+            // come out as anonymous fns). Sniff the content and upgrade.
+            let (language, parser) = if language == Some(SourceLanguage::C)
+                && crate::language::looks_like_cpp(&bytes)
+            {
+                (Some(SourceLanguage::Cpp), parser_for(SourceLanguage::Cpp))
+            } else {
+                (language, parser)
+            };
             if let Some(parser) = parser {
                 let items =
                     parser(&bytes).with_context(|| format!("parsing {}", path.display()))?;
@@ -524,6 +534,10 @@ fn chunk_nodes(path: &Path, chunks: Vec<crate::chunk::Chunk>) -> Vec<SymbolNode>
             measure: (chunk.end_line - chunk.start_line) as u64,
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children: vec![],
         })
         .collect::<Vec<_>>();
@@ -554,6 +568,10 @@ fn to_symbol_node(item: RawItem, parent_qual: &str) -> SymbolNode {
         measure: item.line_count,
         churn: 0.0,
         churn_count: 0,
+        diff_status: None,
+        diff_hunks: Vec::new(),
+        deleted_lines: Vec::new(),
+        visibility: item.visibility,
         children,
     }
 }

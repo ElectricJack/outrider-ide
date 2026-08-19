@@ -29,6 +29,9 @@ pub struct ResolvedEdgeLayer {
     pub directed: bool,
     pub style: EdgeStyle,
     pub color: String,
+    /// Name of the `incidentTo` set, when it was a named set. Lets the
+    /// graph space include the set's unconnected members as isolated nodes.
+    pub incident_set: Option<String>,
     /// Number of source symbols still waiting on an async provider lookup.
     pub pending: usize,
     pub deps: Deps,
@@ -46,6 +49,7 @@ fn empty_layer(layer_index: usize, spec: &EdgesSpec, relation: String) -> Resolv
         directed: true,
         style: spec.style,
         color: spec.color.clone().unwrap_or_else(default_color),
+        incident_set: None,
         pending: 0,
         deps: Deps::NONE,
     }
@@ -90,6 +94,9 @@ pub fn resolve_edges(
     // ── filters ──
     let within = resolve_scope_set(spec.within.as_ref(), sets, warnings, "within");
     let incident_to = resolve_scope_set(spec.incident_to.as_ref(), sets, warnings, "incidentTo");
+    if let Some(SetRef::Name(name)) = spec.incident_to.as_ref() {
+        layer.incident_set = Some(name.clone());
+    }
 
     layer.edges.retain(|e| {
         if let Some(w) = within {
@@ -217,6 +224,7 @@ fn resolve_from_relation(
         directed: true,
         style: spec.style,
         color: spec.color.clone().unwrap_or_else(default_color),
+        incident_set: None,
         pending,
         deps: provider.deps().union(Deps::TREE).union(Deps::RELATIONS),
     }
@@ -256,6 +264,7 @@ fn resolve_from_pairs(
         directed: true,
         style: spec.style,
         color: spec.color.clone().unwrap_or_else(default_color),
+        incident_set: None,
         pending: 0,
         deps: Deps::TREE,
     }

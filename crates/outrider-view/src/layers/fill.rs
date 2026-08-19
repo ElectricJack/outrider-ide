@@ -176,6 +176,10 @@ mod tests {
             measure: 1,
             churn,
             churn_count,
+            visibility: None,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
             children: vec![],
         }
     }
@@ -194,6 +198,10 @@ mod tests {
             measure: 0,
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children: vec![leaf("a.rs", 0.2, 2), leaf("b.rs", 0.8, 8)],
         };
         SymbolTree {

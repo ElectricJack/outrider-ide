@@ -378,6 +378,10 @@ mod tests {
             measure: 1 + u64::from(ordinal),
             churn: 0.0,
             churn_count: 0,
+            diff_status: None,
+            diff_hunks: Vec::new(),
+            deleted_lines: Vec::new(),
+            visibility: None,
             children,
         }
     }

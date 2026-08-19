@@ -13,6 +13,18 @@ impl<'a> PaintOverrides<'a> {
         PaintOverrides { resolved }
     }
 
+    pub fn fill(&self, id: &SymbolId) -> Option<u32> {
+        let fill = self.resolved.fill.as_ref()?;
+        let &value = fill.values.get(id)?;
+        Some(theme::churn_heat(value))
+    }
+
+    pub fn opacity(&self, id: &SymbolId) -> Option<f32> {
+        let fill = self.resolved.opacity.as_ref()?;
+        let &value = fill.values.get(id)?;
+        Some(value.clamp(0.0, 1.0))
+    }
+
     pub fn stripe(&self, id: &SymbolId) -> Option<u32> {
         let fill = self.resolved.stripe.as_ref()?;
         let &value = fill.values.get(id)?;

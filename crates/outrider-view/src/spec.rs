@@ -68,6 +68,23 @@ pub struct SpaceSpec {
     pub exclude: Option<SetRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<PackOverrides>,
+    /// Graph space only: which class members to list inside node boxes.
+    /// Omitted = show all members. `{"show": []}` hides members entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<MembersSpec>,
+}
+
+/// Member filter for graph-space node boxes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MembersSpec {
+    /// Visibilities to include: "public", "protected", "private".
+    /// None = all; empty list = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show: Option<Vec<String>>,
+    /// Member kind labels to include (e.g. "fn", "field"). None = all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -75,6 +92,10 @@ pub struct SpaceSpec {
 pub enum SpaceKind {
     #[default]
     Treemap,
+    /// Relationship-driven node/edge layout: symbols incident to the view's
+    /// edge layers are laid out as simple boxes positioned by their edges
+    /// (layered, parents above children) instead of by file structure.
+    Graph,
     Callgraph,
     Matrix,
 }
@@ -86,6 +107,7 @@ impl Default for SpaceSpec {
             regroup: None,
             exclude: None,
             pack: None,
+            members: None,
         }
     }
 }
