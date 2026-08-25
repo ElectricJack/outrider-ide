@@ -20,7 +20,11 @@ impl LayoutTransition {
     }
 
     pub(crate) fn sample(&self, now: Instant) -> PackLayout {
-        if self.from.rects.keys().ne(self.to.rects.keys()) {
+        // Key sets must match exactly for a per-rect tween; any difference
+        // means a structurally different layout, so snap to the target.
+        if self.from.rects.len() != self.to.rects.len()
+            || !self.from.rects.keys().all(|k| self.to.rects.contains_key(k))
+        {
             return self.to.clone();
         }
         if now <= self.started_at {
@@ -92,7 +96,7 @@ mod tests {
             rects: entries
                 .iter()
                 .map(|(id, rect)| ((*id).clone(), *rect))
-                .collect::<BTreeMap<_, _>>(),
+                .collect::<std::collections::HashMap<_, _>>(),
         }
     }
 

@@ -1,6 +1,6 @@
 //! Marks layer resolution.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use outrider_index::SymbolId;
 
@@ -21,7 +21,7 @@ pub struct Mark {
 #[derive(Debug, Clone, Default)]
 pub struct MarkTable {
     /// Marks per symbol (for corner glyphs and ring decisions).
-    pub by_symbol: BTreeMap<SymbolId, Vec<Mark>>,
+    pub by_symbol: HashMap<SymbolId, Vec<Mark>>,
     /// Focus ring set.
     pub focus_ring: HashSet<SymbolId>,
     /// Neighbor ring set.

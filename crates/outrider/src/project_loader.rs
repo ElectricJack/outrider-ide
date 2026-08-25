@@ -785,7 +785,7 @@ mod tests {
             ordinal: 0,
         };
         outrider_layout::PackLayout {
-            rects: BTreeMap::from([(
+            rects: std::collections::HashMap::from([(
                 id,
                 Rect {
                     x: 0.0,

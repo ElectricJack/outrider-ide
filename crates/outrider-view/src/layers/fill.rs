@@ -1,6 +1,6 @@
 //! Fill layer resolution: metric -> scaled value -> theme color.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use outrider_index::{SymbolId, SymbolNode};
 
@@ -16,7 +16,7 @@ pub struct ResolvedFill {
     pub channel: FillChannel,
     pub scale: Scale,
     /// Scaled value 0.0..1.0 for each symbol in the domain.
-    pub values: BTreeMap<SymbolId, f32>,
+    pub values: HashMap<SymbolId, f32>,
     pub deps: Deps,
 }
 
@@ -125,12 +125,12 @@ pub fn resolve_fill(
     // so the result exactly matches the pre-existing (pre-view-layer) churn stripes.
     let use_native = spec.metric == "churn" && matches!(spec.scale, Scale::Percentile) && domain.is_none();
 
-    let mut values = BTreeMap::new();
+    let mut values = HashMap::new();
     if use_native {
         fn collect_native(
             node: &SymbolNode,
             provider: &dyn crate::metric::MetricProvider,
-            values: &mut BTreeMap<SymbolId, f32>,
+            values: &mut HashMap<SymbolId, f32>,
         ) {
             if let Some(p) = provider.native_percentile(node) {
                 values.insert(node.id.clone(), p);

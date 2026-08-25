@@ -75,6 +75,29 @@ fn walk_tree(node: &SymbolNode, f: &mut impl FnMut(&SymbolNode)) {
     }
 }
 
+/// The literal (meta-character-free) prefix of a glob pattern.
+fn glob_literal_prefix(pattern: &str) -> &str {
+    let end = pattern
+        .find(['*', '?', '[', '{'])
+        .unwrap_or(pattern.len());
+    &pattern[..end]
+}
+
+/// Walk only the subtrees that can contain paths matching a glob with the
+/// given literal prefix. A subtree rooted at qualified path `q` is worth
+/// descending into iff `q` is an ancestor of the prefix or lies inside
+/// it; anything else can never match, and on large trees this prunes the
+/// walk from the whole tree down to the pattern's neighbourhood.
+fn walk_tree_glob_pruned(node: &SymbolNode, prefix: &str, f: &mut impl FnMut(&SymbolNode)) {
+    f(node);
+    for child in &node.children {
+        let q = child.id.qualified_path.as_str();
+        if prefix.starts_with(q) || q.starts_with(prefix) {
+            walk_tree_glob_pruned(child, prefix, f);
+        }
+    }
+}
+
 /// Subsequence match on `name`, case-insensitive (palette-style fuzzy match).
 /// An empty query matches everything.
 fn fuzzy_match(query: &str, name: &str) -> bool {
@@ -242,7 +265,8 @@ pub fn resolve_set_expr(
             {
                 Ok(glob) => {
                     let matcher = glob.compile_matcher();
-                    walk_tree(&tree.root, &mut |node| {
+                    let prefix = glob_literal_prefix(pattern);
+                    walk_tree_glob_pruned(&tree.root, prefix, &mut |node| {
                         if matcher.is_match(&node.id.qualified_path) {
                             result.ids.insert(node.id.clone());
                         }

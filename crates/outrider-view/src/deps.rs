@@ -31,6 +31,11 @@ impl Deps {
     pub const fn is_none(self) -> bool {
         self.0 == 0
     }
+
+    /// The bits of `self` that are not in `other`.
+    pub const fn without(self, other: Deps) -> Deps {
+        Deps(self.0 & !other.0)
+    }
 }
 
 impl std::ops::BitOr for Deps {

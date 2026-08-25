@@ -6,7 +6,7 @@
 //! the pair exactly like the treemap scaffold. Class members render as
 //! rows inside each box (UML style), filtered by `space.members`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree, Visibility};
 use outrider_layout::{layout_graph, GraphConfig, GraphNode, PackLayout, Rect};
@@ -138,6 +138,9 @@ fn filter_members<'a>(
     members
 }
 
+/// Default cap on member rows per box.
+const DEFAULT_MEMBER_MAX: usize = 24;
+
 /// Build the graph scaffold from the resolved view's edge layers.
 /// Returns a scaffold containing only the root when no edges resolved yet
 /// (async relation providers may still be pending).
@@ -145,6 +148,7 @@ pub(crate) fn build(
     index_tree: &SymbolTree,
     resolved: &ResolvedView,
     members_spec: Option<&MembersSpec>,
+    left_to_right: bool,
 ) -> GraphScaffold {
     // 1. Collect edge endpoints across every resolved edge layer, plus all
     //    members of each layer's `incidentTo` set so unconnected symbols
@@ -184,12 +188,24 @@ pub(crate) fn build(
         .map(|(i, id)| (id, i))
         .collect();
 
+    let member_max = members_spec
+        .and_then(|m| m.max)
+        .unwrap_or(DEFAULT_MEMBER_MAX);
+    // Visible members per box, plus how many were hidden by the cap.
+    let mut overflow_counts: Vec<usize> = Vec::with_capacity(ordered.len());
     let member_lists: Vec<Vec<&SymbolNode>> = ordered
         .iter()
         .map(|id| {
-            real.get(id)
+            let mut v = real
+                .get(id)
                 .map(|n| filter_members(n, members_spec))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let overflow = v.len().saturating_sub(member_max);
+            if overflow > 0 {
+                v.truncate(member_max);
+            }
+            overflow_counts.push(overflow);
+            v
         })
         .collect();
 
@@ -207,10 +223,11 @@ pub(crate) fn build(
                 .map(|m| member_display(m).chars().count() + 3)
                 .max()
                 .unwrap_or(0);
-            let extra_h = if member_lists[i].is_empty() {
+            let rows = member_lists[i].len() + usize::from(overflow_counts[i] > 0);
+            let extra_h = if rows == 0 {
                 0.0
             } else {
-                member_lists[i].len() as f64 * MEMBER_ROW_H + MEMBER_PAD_BOTTOM
+                rows as f64 * MEMBER_ROW_H + MEMBER_PAD_BOTTOM
             };
             GraphNode {
                 label_len: name_len.max(member_len),
@@ -224,12 +241,16 @@ pub(crate) fn build(
         .collect();
 
     // 3. Layered layout.
-    let gl = layout_graph(&graph_nodes, &edges, &GraphConfig::default());
+    let cfg = GraphConfig {
+        left_to_right,
+        ..GraphConfig::default()
+    };
+    let gl = layout_graph(&graph_nodes, &edges, &cfg);
 
     // 4. Assemble the synthetic tree and rect map. Each box is a container
     //    whose children are its member rows; both carry real SymbolIds so
     //    selection, fill, and marks apply to actual symbols.
-    let mut rects: BTreeMap<SymbolId, Rect> = BTreeMap::new();
+    let mut rects: HashMap<SymbolId, Rect> = HashMap::new();
     let mut children: Vec<SymbolNode> = Vec::with_capacity(ordered.len());
     for (i, id) in ordered.iter().enumerate() {
         let box_rect = gl.rects[i];
@@ -261,6 +282,40 @@ pub(crate) fn build(
                     h: MEMBER_ROW_H - 2.0,
                 },
             );
+        }
+        if overflow_counts[i] > 0 {
+            // Synthetic "+n more" row: a Chunk-kind child so it renders as a
+            // plain labelled row. Unique id per box.
+            let more_id = SymbolId {
+                kind: SymbolKind::Chunk,
+                qualified_path: format!("{}::+{} more", id.qualified_path, overflow_counts[i]),
+                ordinal: 0,
+            };
+            let j = member_nodes.len();
+            rects.insert(
+                more_id.clone(),
+                Rect {
+                    x: box_rect.x + MEMBER_PAD_X,
+                    y: box_rect.y + BOX_HEADER_H + j as f64 * MEMBER_ROW_H,
+                    w: (box_rect.w - 2.0 * MEMBER_PAD_X).max(1.0),
+                    h: MEMBER_ROW_H - 2.0,
+                },
+            );
+            member_nodes.push(SymbolNode {
+                id: more_id,
+                name: format!("\u{2026} +{} more", overflow_counts[i]),
+                byte_range: None,
+                signature: None,
+                doc: None,
+                measure: 0,
+                churn: 0.0,
+                churn_count: 0,
+                diff_status: None,
+                diff_hunks: Vec::new(),
+                deleted_lines: Vec::new(),
+                visibility: None,
+                children: Vec::new(),
+            });
         }
 
         let node = match real.get(id) {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
@@ -300,7 +300,7 @@ fn absolute_from_layouts_cancellable(
         x: f64,
         y: f64,
         layouts: &ExactLayouts,
-        rects: &mut BTreeMap<SymbolId, Rect>,
+        rects: &mut HashMap<SymbolId, Rect>,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<(), PackCancelled> {
         if is_cancelled() {
@@ -330,7 +330,7 @@ fn absolute_from_layouts_cancellable(
         Ok(())
     }
 
-    let mut rects = BTreeMap::new();
+    let mut rects = HashMap::new();
     absolute(root, 0.0, 0.0, layouts, &mut rects, is_cancelled)?;
     Ok(PackLayout { rects })
 }

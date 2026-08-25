@@ -80,6 +80,15 @@ pub(crate) struct PaintItem {
     pub(crate) name: Option<NameRow>,
     pub(crate) body: Vec<BodyText>,
     pub(crate) tex: Option<TexQuad>,
+    /// Structural/agent mark: draw an accent ring and, if present, a small
+    /// corner badge with this text (custom mark label, or the kind name).
+    pub(crate) badge: Option<MarkBadge>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MarkBadge {
+    pub(crate) text: String,
+    pub(crate) color: u32,
 }
 
 pub(crate) struct PaintFrame {
@@ -87,6 +96,8 @@ pub(crate) struct PaintFrame {
     pub(crate) doc_panel: Option<DocPanel>,
     pub(crate) cg_scrim: bool,
     pub(crate) edges: crate::view::edge_pass::EdgeFrame,
+    /// Guided-tour narration card anchored to the live step's target.
+    pub(crate) tour_callout: Option<NoteCallout>,
 }
 
 pub(crate) fn truncate_to_width(name: &str, w_px: f32, font_px: f32) -> Option<String> {
@@ -179,6 +190,131 @@ pub(crate) fn wrap_doc(text: &str, w_px: f64, font_px: f64) -> Vec<String> {
         rows.extend(wrap_to_budget(&joined, budget));
     }
     rows
+}
+
+/// True for a markdown-style list-item line: `- `, `* `, `• `, or `1. `.
+fn is_list_item(t: &str) -> bool {
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("\u{2022} ") {
+        return true;
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && matches!(t[digits..].chars().next(), Some('.') | Some(')'))
+}
+
+/// Hanging indent for a list item's continuation rows: the marker width.
+fn list_hang(t: &str) -> usize {
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("\u{2022} ") {
+        return 2;
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    (digits + 2).min(6)
+}
+
+/// Strip inline backticks from a row and return the text plus color runs:
+/// `base` prose with `code` spans recolored CODE_SPAN. An unpaired backtick
+/// colors the remainder of the row.
+fn code_runs(text: &str, base: u32) -> (String, Vec<(usize, u32)>) {
+    if !text.contains('`') {
+        return (text.to_string(), vec![(text.len(), base)]);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut runs: Vec<(usize, u32)> = Vec::new();
+    let mut push = |s: &str, color: u32, out: &mut String, runs: &mut Vec<(usize, u32)>| {
+        if s.is_empty() {
+            return;
+        }
+        out.push_str(s);
+        match runs.last_mut() {
+            Some((len, c)) if *c == color => *len += s.len(),
+            _ => runs.push((s.len(), color)),
+        }
+    };
+    let mut rest = text;
+    let mut in_code = false;
+    while let Some(pos) = rest.find('`') {
+        push(&rest[..pos], if in_code { theme::CODE_SPAN } else { base }, &mut out, &mut runs);
+        rest = &rest[pos + 1..];
+        in_code = !in_code;
+    }
+    push(rest, if in_code { theme::CODE_SPAN } else { base }, &mut out, &mut runs);
+    if runs.is_empty() {
+        runs.push((0, base));
+    }
+    (out, runs)
+}
+
+/// Markdown-lite formatting for note and doc prose, replacing the flat
+/// wrap: paragraphs separated by spacer rows, list items (`- `, `1. `, …)
+/// on their own rows with a hanging indent, and inline `code` spans
+/// recolored with the backticks stripped. Returns (text, color runs) rows;
+/// spacer rows are empty strings.
+pub(crate) fn format_note_rows(
+    text: &str,
+    w_px: f64,
+    font_px: f64,
+    base: u32,
+) -> Vec<(String, Vec<(usize, u32)>)> {
+    let budget = ((w_px - 12.0) / (font_px * 0.62) + 1e-6).floor() as isize;
+    if budget < 4 {
+        return Vec::new();
+    }
+    let budget = budget as usize;
+
+    // Group lines into blocks: blank lines separate paragraphs, and every
+    // list item is its own block so it keeps its own row(s).
+    enum Piece {
+        Gap,
+        Block { hang: usize, text: String },
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut cur: Option<(usize, String)> = None;
+    let mut saw_blank = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if let Some((h, s)) = cur.take() {
+                pieces.push(Piece::Block { hang: h, text: s });
+            }
+            saw_blank = true;
+            continue;
+        }
+        if is_list_item(t) || cur.is_none() || saw_blank {
+            if let Some((h, s)) = cur.take() {
+                pieces.push(Piece::Block { hang: h, text: s });
+            }
+            if saw_blank && !pieces.is_empty() {
+                pieces.push(Piece::Gap);
+            }
+            saw_blank = false;
+            let hang = if is_list_item(t) { list_hang(t) } else { 0 };
+            cur = Some((hang, t.to_string()));
+        } else if let Some((_, s)) = &mut cur {
+            s.push(' ');
+            s.push_str(t);
+        }
+    }
+    if let Some((h, s)) = cur.take() {
+        pieces.push(Piece::Block { hang: h, text: s });
+    }
+
+    let mut out: Vec<(String, Vec<(usize, u32)>)> = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Gap => out.push((String::new(), vec![(0, base)])),
+            Piece::Block { hang, text } => {
+                let wrapped = wrap_to_budget(&text, budget.saturating_sub(hang).max(4));
+                for (i, row) in wrapped.into_iter().enumerate() {
+                    let prefixed = if i == 0 || hang == 0 {
+                        row
+                    } else {
+                        format!("{}{row}", " ".repeat(hang))
+                    };
+                    out.push(code_runs(&prefixed, base));
+                }
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn runs_from_spans(len: usize, spans: &[HighlightSpan]) -> Vec<(usize, u32)> {

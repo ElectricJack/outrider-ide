@@ -186,6 +186,172 @@ pub fn visible_nodes<'a>(
     out
 }
 
+/// Pre-order snapshot of a layout's rects aligned to a tree's DFS order, so
+/// the per-frame visibility walk indexes a Vec instead of hashing a
+/// `SymbolId` per node. Rebuilt only when the (tree, layout) pair changes —
+/// see `PreorderRects::for_generation`.
+pub struct PreorderRects {
+    pub generation: u64,
+    /// (rect, subtree size incl. self) per pre-order position.
+    rects: Vec<(Option<outrider_layout::Rect>, usize)>,
+}
+
+impl PreorderRects {
+    /// Build for `tree` against `pack`, tagged with `generation`.
+    pub fn build(tree: &SymbolTree, pack: &outrider_layout::PackLayout, generation: u64) -> Self {
+        let mut rects = Vec::with_capacity(pack.rects.len().max(1));
+        fn walk(
+            n: &SymbolNode,
+            pack: &outrider_layout::PackLayout,
+            out: &mut Vec<(Option<outrider_layout::Rect>, usize)>,
+        ) -> usize {
+            let my = out.len();
+            out.push((pack.rects.get(&n.id).copied(), 1));
+            let mut size = 1;
+            for c in &n.children {
+                size += walk(c, pack, out);
+            }
+            out[my].1 = size;
+            size
+        }
+        walk(&tree.root, pack, &mut rects);
+        PreorderRects { generation, rects }
+    }
+
+    /// Reuse `cached` when its generation matches, else rebuild.
+    pub fn for_generation(
+        cached: Option<PreorderRects>,
+        tree: &SymbolTree,
+        pack: &outrider_layout::PackLayout,
+        generation: u64,
+    ) -> PreorderRects {
+        match cached {
+            Some(c) if c.generation == generation && c.rects.len() > 0 => c,
+            _ => PreorderRects::build(tree, pack, generation),
+        }
+    }
+}
+
+/// `visible_nodes` driven by a pre-order rect cache: identical output, no
+/// per-node hashing. The cache must have been built for this exact tree.
+pub fn visible_nodes_cached<'a>(
+    tree: &'a SymbolTree,
+    pre: &PreorderRects,
+    camera: &Camera,
+    vw: f64,
+    vh: f64,
+    has_thumbnail: impl Fn(&outrider_index::SymbolId) -> bool,
+) -> Vec<DrawItem<'a>> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    walk_cached(
+        &tree.root,
+        pre,
+        &mut cursor,
+        camera,
+        vw,
+        vh,
+        0,
+        false,
+        &has_thumbnail,
+        &mut out,
+    );
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_cached<'a>(
+    node: &'a SymbolNode,
+    pre: &PreorderRects,
+    cursor: &mut usize,
+    camera: &Camera,
+    vw: f64,
+    vh: f64,
+    level: u8,
+    parent_has_thumb: bool,
+    has_thumbnail: &dyn Fn(&outrider_index::SymbolId) -> bool,
+    out: &mut Vec<DrawItem<'a>>,
+) {
+    let my_index = *cursor;
+    *cursor += 1;
+    let Some(&(rect, span)) = pre.rects.get(my_index) else {
+        return;
+    };
+    let skip = span - 1;
+    let Some(r) = rect else {
+        // No rect: the subtree has none either; skip its pre-order span.
+        *cursor += skip;
+        return;
+    };
+    let (sx, sy) = camera.world_to_screen(r.x, r.y, vw, vh);
+    let (pw, ph) = (r.w * camera.zoom, r.h * camera.zoom);
+    if sx > vw || sx + pw < 0.0 || sy > vh || sy + ph < 0.0 {
+        *cursor += skip;
+        return;
+    }
+    let draw = if content::is_leaf_item(node) {
+        match leaf_draw(ph, pw, content::natural_px(node)) {
+            Some(ld) => Draw::Leaf(ld),
+            None if !parent_has_thumb && ph >= 1.0 => Draw::Leaf(LeafDraw::Dot),
+            None => {
+                *cursor += skip;
+                return;
+            }
+        }
+    } else {
+        match rung_for(ph, pw) {
+            Some(r) => Draw::Container(r),
+            None if !parent_has_thumb && ph >= 1.0 => Draw::Container(Rung::Dot),
+            None => {
+                *cursor += skip;
+                return;
+            }
+        }
+    };
+    let x0 = sx.max(-2.0);
+    let x1 = (sx + pw).min(vw + 2.0);
+    let y0 = sy.max(-2.0);
+    let y1 = (sy + ph).min(vh + 2.0);
+    out.push(DrawItem {
+        node,
+        px: PxRect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        },
+        label_w: pw,
+        level,
+        draw,
+        top: sy,
+        left: sx,
+        full_h: ph,
+    });
+    let this_has_thumb = has_thumbnail(&node.id);
+    let prune = match draw {
+        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => this_has_thumb,
+        _ => false,
+    };
+    if prune {
+        *cursor += skip;
+        return;
+    }
+    for child in &node.children {
+        walk_cached(
+            child,
+            pre,
+            cursor,
+            camera,
+            vw,
+            vh,
+            level.saturating_add(1),
+            this_has_thumb,
+            has_thumbnail,
+            out,
+        );
+    }
+}
+
 /// Recursive DFS helper for `visible_nodes`: project, cull, classify, clip.
 ///
 /// `parent_has_thumb` is true when the immediate parent already has a cached
@@ -482,6 +648,37 @@ mod tests {
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |id| *id == root_id);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec![""]);
+    }
+
+    #[test]
+    fn cached_walk_matches_plain_walk() {
+        let (tree, p) = packed_example();
+        for zoom in [0.03, 0.5, 1.0, 3.0] {
+            let cam = Camera {
+                center_x: 400.0,
+                center_y: 300.0,
+                zoom,
+            };
+            let plain = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
+            let pre = PreorderRects::build(&tree, &p, 1);
+            let cached = visible_nodes_cached(&tree, &pre, &cam, 800.0, 600.0, |_| false);
+            let a: Vec<(&str, f64, f64)> =
+                plain.iter().map(|i| (i.node.name.as_str(), i.px.x, i.px.y)).collect();
+            let b: Vec<(&str, f64, f64)> =
+                cached.iter().map(|i| (i.node.name.as_str(), i.px.x, i.px.y)).collect();
+            assert_eq!(a, b, "zoom {zoom}");
+        }
+        // With a thumbnail on root, both prune identically.
+        let root_id = tree.root.id.clone();
+        let cam = Camera {
+            center_x: 500.0,
+            center_y: 819.6,
+            zoom: 0.03,
+        };
+        let plain = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |id| *id == root_id);
+        let pre = PreorderRects::build(&tree, &p, 1);
+        let cached = visible_nodes_cached(&tree, &pre, &cam, 800.0, 600.0, |id| *id == root_id);
+        assert_eq!(plain.len(), cached.len());
     }
 
     #[test]

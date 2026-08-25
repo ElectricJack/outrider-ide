@@ -3,7 +3,7 @@
 //! kind/height or source-ordered shelf placement. Layout stays deterministic.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
 
@@ -49,7 +49,7 @@ pub struct PackConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackLayout {
     /// Absolute rects for every node; the root sits at (0, 0).
-    pub rects: BTreeMap<SymbolId, Rect>,
+    pub rects: HashMap<SymbolId, Rect>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -260,7 +260,7 @@ pub(crate) fn absolute_from_layouts(root: &SymbolNode, layouts: &ExactLayouts) -
         x: f64,
         y: f64,
         layouts: &ExactLayouts,
-        rects: &mut BTreeMap<SymbolId, Rect>,
+        rects: &mut HashMap<SymbolId, Rect>,
     ) {
         let local = &layouts[&node.id];
         rects.insert(
@@ -278,7 +278,7 @@ pub(crate) fn absolute_from_layouts(root: &SymbolNode, layouts: &ExactLayouts) -
         }
     }
 
-    let mut rects = BTreeMap::new();
+    let mut rects = HashMap::new();
     absolute(root, 0.0, 0.0, layouts, &mut rects);
     PackLayout { rects }
 }

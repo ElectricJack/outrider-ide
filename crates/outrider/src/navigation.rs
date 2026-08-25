@@ -59,6 +59,8 @@ impl NavigationHistory {
                 push: vec![],
                 pop: 0,
                 note: None,
+                tab: None,
+                parts: Vec::new(),
             })
             .collect()
     }

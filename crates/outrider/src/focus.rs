@@ -168,7 +168,71 @@ pub fn neighbors(
     pack: &PackLayout,
     index: &TreeIndex,
 ) -> [Option<SymbolId>; 4] {
-    [Dir::Left, Dir::Right, Dir::Up, Dir::Down].map(|d| spatial_step(current, d, pack, index))
+    // Same beam-cast semantics as `spatial_step`, but one pass over the
+    // rects with a single index lookup per candidate instead of four —
+    // this runs on every focus change over the whole layout, and the id
+    // hashing dominates.
+    let none = [None, None, None, None];
+    let Some(cur) = pack.rects.get(current) else {
+        return none;
+    };
+    let Some(depth) = index.depth(current) else {
+        return none;
+    };
+    let leaf_mode = index
+        .node(current)
+        .is_some_and(crate::content::is_leaf_item);
+    const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+    let mut best: [Option<(f64, f64, &SymbolId)>; 4] = [None, None, None, None];
+    for (id, r) in &pack.rects {
+        if id == current {
+            continue;
+        }
+        let eligible = if leaf_mode {
+            index.node(id).is_some_and(crate::content::is_leaf_item)
+        } else {
+            index.depth(id) == Some(depth)
+        };
+        if !eligible {
+            continue;
+        }
+        for (slot, dir) in DIRS.iter().enumerate() {
+            let (overlap, primary, misalign) = match dir {
+                Dir::Left | Dir::Right => (
+                    r.y < cur.y + cur.h && r.y + r.h > cur.y,
+                    if *dir == Dir::Left {
+                        cur.x - (r.x + r.w)
+                    } else {
+                        r.x - (cur.x + cur.w)
+                    },
+                    ((r.y + r.h / 2.0) - (cur.y + cur.h / 2.0)).abs(),
+                ),
+                Dir::Up | Dir::Down => (
+                    r.x < cur.x + cur.w && r.x + r.w > cur.x,
+                    if *dir == Dir::Up {
+                        cur.y - (r.y + r.h)
+                    } else {
+                        r.y - (cur.y + cur.h)
+                    },
+                    ((r.x + r.w / 2.0) - (cur.x + cur.w / 2.0)).abs(),
+                ),
+            };
+            if !overlap || primary < 0.0 {
+                continue;
+            }
+            let better = match best[slot] {
+                None => true,
+                Some((bp, bm, bid)) => {
+                    primary < bp
+                        || (primary == bp && (misalign < bm || (misalign == bm && id < bid)))
+                }
+            };
+            if better {
+                best[slot] = Some((primary, misalign, id));
+            }
+        }
+    }
+    best.map(|b| b.map(|(_, _, id)| id.clone()))
 }
 
 #[cfg(test)]

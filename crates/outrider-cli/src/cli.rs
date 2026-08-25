@@ -125,6 +125,11 @@ pub enum Command {
         #[command(subcommand)]
         action: CameraAction,
     },
+    /// User comments left in the app (the feedback half of the loop)
+    Comments {
+        #[command(subcommand)]
+        action: CommentsAction,
+    },
     /// Check connection to a running instance
     Status,
 }
@@ -146,6 +151,18 @@ pub enum QueryAction {
     Metrics {
         /// Symbol ID (wire format, e.g. "fn:src/a.rs::foo")
         symbol: String,
+    },
+    /// Find symbols by name (exact > prefix > substring > fuzzy); prints
+    /// wire ids usable in notes, focus steps, and edge pairs
+    Symbols {
+        /// Name or fragment to search for
+        query: String,
+        /// Restrict to a kind label (class, struct, fn, field, file, ...)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Maximum results (default 20)
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
@@ -176,6 +193,21 @@ pub enum TourAction {
     },
     /// Load navigation history as tour steps
     LoadHistory,
+}
+
+#[derive(Subcommand)]
+pub enum CommentsAction {
+    /// List comments; includes a ready-to-use agent prompt
+    List,
+    /// Print only the generated agent prompt
+    Prompt,
+    /// Remove one comment by id
+    Remove {
+        /// Comment id (from `comments list`)
+        id: u64,
+    },
+    /// Clear all comments (do this after responding to them)
+    Clear,
 }
 
 #[derive(Subcommand)]

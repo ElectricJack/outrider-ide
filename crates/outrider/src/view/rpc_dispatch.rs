@@ -86,7 +86,77 @@ impl TreemapView {
                 Ok(serde_json::json!({"ok": true}))
             }
             "query.focus" => {
-                Ok(serde_json::json!({"symbol": self.focus.current.qualified_path}))
+                Ok(serde_json::json!({
+                    "symbol": outrider_view::symbol_id::to_wire(&self.focus.current),
+                    "path": self.focus.current.qualified_path,
+                }))
+            }
+            // Find symbols by (fuzzy) name so agents can author exact wire ids
+            // for notes, focus steps, and pairs without guessing paths.
+            "query.symbols" => {
+                let p: QuerySymbolsParams = parse_params(&req.params)?;
+                let limit = p.limit.unwrap_or(20).min(200);
+                let kind_filter = p.kind.as_deref();
+                let q = p.query.to_lowercase();
+                let mut hits: Vec<(i32, serde_json::Value)> = Vec::new();
+                fn walk(
+                    n: &outrider_index::SymbolNode,
+                    q: &str,
+                    kind_filter: Option<&str>,
+                    out: &mut Vec<(i32, serde_json::Value)>,
+                ) {
+                    let label = n.id.kind.label();
+                    // Folders are excluded from open-ended searches (noise)
+                    // but returned when asked for explicitly.
+                    let kind_ok = match kind_filter {
+                        Some(k) => k == label,
+                        None => label != "folder",
+                    };
+                    if kind_ok {
+                        let name_l = n.name.to_lowercase();
+                        // Rank: exact > prefix > substring > fuzzy.
+                        let rank = if name_l == q {
+                            0
+                        } else if name_l.starts_with(q) {
+                            1
+                        } else if name_l.contains(q) {
+                            2
+                        } else if outrider_index::fuzzy_match(q, &n.name) {
+                            3
+                        } else {
+                            -1
+                        };
+                        if rank >= 0 {
+                            out.push((
+                                rank,
+                                serde_json::json!({
+                                    "id": outrider_view::symbol_id::to_wire(&n.id),
+                                    "name": n.name,
+                                    "kind": label,
+                                    "path": n.id.qualified_path,
+                                    "signature": n.signature,
+                                    "visibility": n.visibility,
+                                    "measure": n.measure,
+                                }),
+                            ));
+                        }
+                    }
+                    for c in &n.children {
+                        walk(c, q, kind_filter, out);
+                    }
+                }
+                walk(&self.tree.root, &q, kind_filter, &mut hits);
+                hits.sort_by(|a, b| {
+                    a.0.cmp(&b.0).then_with(|| {
+                        let la = a.1["name"].as_str().map(|s| s.len()).unwrap_or(0);
+                        let lb = b.1["name"].as_str().map(|s| s.len()).unwrap_or(0);
+                        la.cmp(&lb)
+                    })
+                });
+                let total = hits.len();
+                let symbols: Vec<serde_json::Value> =
+                    hits.into_iter().take(limit).map(|(_, v)| v).collect();
+                Ok(serde_json::json!({ "total": total, "symbols": symbols }))
             }
             "metric.import" => {
                 let p: MetricImportParams = parse_params(&req.params)?;
@@ -151,19 +221,57 @@ impl TreemapView {
             }
             "tour.goto" => {
                 let p: TourGotoParams = parse_params(&req.params)?;
-                self.apply_and_respond(ViewCommand::Tour(TourCommand::Goto(p.index)))
+                self.dispatch_tour_command(&TourCommand::Goto(p.index));
+                Ok(self.tour_status_json())
             }
             "tour.stop" => {
-                self.apply_and_respond(ViewCommand::Tour(TourCommand::Stop))
+                self.dispatch_tour_command(&TourCommand::Stop);
+                Ok(self.tour_status_json())
             }
             "tour.play" => {
-                self.apply_and_respond(ViewCommand::Tour(TourCommand::Play))
+                self.dispatch_tour_command(&TourCommand::Play);
+                Ok(self.tour_status_json())
             }
             "tour.next" => {
-                self.apply_and_respond(ViewCommand::Tour(TourCommand::Next))
+                self.dispatch_tour_command(&TourCommand::Next);
+                Ok(self.tour_status_json())
             }
             "tour.prev" => {
-                self.apply_and_respond(ViewCommand::Tour(TourCommand::Prev))
+                self.dispatch_tour_command(&TourCommand::Prev);
+                Ok(self.tour_status_json())
+            }
+            "tour.status" => Ok(self.tour_status_json()),
+            "comments.list" => {
+                let items: Vec<serde_json::Value> = self
+                    .comments
+                    .comments
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id,
+                            "target": c.target,
+                            "label": c.target_label,
+                            "text": c.text,
+                            "view": c.view,
+                            "tourStep": c.tour_step,
+                        })
+                    })
+                    .collect();
+                let prompt =
+                    (!self.comments.is_empty()).then(|| self.build_comment_prompt());
+                Ok(serde_json::json!({"comments": items, "prompt": prompt}))
+            }
+            "comments.clear" => {
+                let cleared = self.comments.comments.len();
+                self.comments.clear();
+                self.comments.save(&self.tree.repo_root);
+                Ok(serde_json::json!({"cleared": cleared}))
+            }
+            "comments.remove" => {
+                let p: CommentRemoveParams = parse_params(&req.params)?;
+                let removed = self.comments.remove(p.id);
+                self.comments.save(&self.tree.repo_root);
+                Ok(serde_json::json!({"removed": removed}))
             }
             "tour.loadHistory" => {
                 let steps = self.nav_history.to_steps();
@@ -190,6 +298,15 @@ impl TreemapView {
                 data: None,
             }),
         }
+    }
+
+    fn tour_status_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "step": self.view_spec.camera.step,
+            "stepsCount": self.view_spec.camera.steps.len(),
+            "view": self.view_spec.meta.title,
+        })
     }
 
     fn apply_and_respond(
@@ -271,6 +388,16 @@ struct QueryMetricsParams {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QuerySymbolsParams {
+    query: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CameraFollowParams {
     mode: String,
 }
@@ -291,6 +418,12 @@ struct TourSetStepsParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TourGotoParams {
     index: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommentRemoveParams {
+    id: u64,
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(

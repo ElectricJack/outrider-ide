@@ -591,6 +591,33 @@ pub struct TreemapView {
     /// Set on tab switch: after the next scaffold rebuild, reframe the
     /// camera on the retained focus (or the root if it isn't in the view).
     pending_focus_reframe: bool,
+    /// Guided-tour playback over the active view's `camera.steps`.
+    tour: crate::view::tour::TourState,
+    /// User comments on symbols (the feedback half of the agentic loop).
+    pub(crate) comments: crate::view::comments::CommentList,
+    /// Open comment composer: the in-progress text plus the captured
+    /// target (wire id + label). None while closed.
+    comment_draft: Option<CommentDraft>,
+    /// Deferred tour camera move: enacted in paint_items once the step's
+    /// layers have been resolved (frame targets need resolved sets).
+    pending_tour_camera: Option<outrider_view::spec::StepTarget>,
+    /// Bumped whenever `layout`, `tree`, or the graph scaffold changes, so
+    /// the pre-order rect cache knows to rebuild.
+    layout_generation: u64,
+    /// Pre-order rect cache for the active scaffold (see world::PreorderRects).
+    preorder_rects: Option<crate::world::PreorderRects>,
+    /// Screen geometry of the last painted tour callout: card rect and
+    /// anchor point. Lets clicks on the card/anchor act on the referenced
+    /// item even though the callout is canvas-painted, not a GPUI element.
+    tour_callout_hit: Option<((f32, f32, f32, f32), (f32, f32))>,
+    /// True when the callout collapsed to its one-line pill because no
+    /// placement avoided the target; the panel then carries the prose.
+    tour_callout_minimized: bool,
+    /// Memoised world rect of the live tour step's target, keyed by
+    /// (step index, layout rect count, active tab). A `frame` target unions
+    /// every rect in a set — thousands of lookups — so it must not run per
+    /// frame.
+    tour_target_cache: Option<((usize, usize, usize), Option<Rect>)>,
     view_resolver: outrider_view::ViewResolver,
     pub(crate) view_dirty: outrider_view::Deps,
     pub(crate) metrics: outrider_view::metric::MetricRegistry,
@@ -681,6 +708,14 @@ fn clear_project_setup_before_load<T>(project_setup: &mut Option<T>, pre_scanner
 
 struct RenameState {
     path: std::path::PathBuf,
+    input: String,
+}
+
+/// In-progress comment: target captured when the composer opened.
+struct CommentDraft {
+    /// Wire id of the commented symbol; None for a general comment.
+    target: Option<String>,
+    target_label: String,
     input: String,
 }
 
@@ -1288,6 +1323,7 @@ impl TreemapView {
         let global_settings = settings.clone();
         let view_spec = crate::view::session::default_view(&settings);
         let view_tabs = crate::view::tabs::ViewTabs::new(view_spec.clone());
+        let comments = crate::view::comments::CommentList::load(&tree.repo_root);
         Self {
             tree,
             layout,
@@ -1321,6 +1357,15 @@ impl TreemapView {
             view_spec,
             view_tabs,
             pending_focus_reframe: false,
+            tour: crate::view::tour::TourState::default(),
+            comments,
+            comment_draft: None,
+            pending_tour_camera: None,
+            tour_target_cache: None,
+            tour_callout_hit: None,
+            tour_callout_minimized: false,
+            layout_generation: 1,
+            preorder_rects: None,
             view_resolver: outrider_view::ViewResolver::new(),
             view_dirty: outrider_view::Deps::SPEC,
             metrics: outrider_view::metric::MetricRegistry::builtin(),
@@ -1720,6 +1765,10 @@ impl TreemapView {
                                 self.apply_view_command(outrider_view::command::ViewCommand::Camera(cmd_c.clone()));
                                 let (vw, vh) = Self::map_viewport(window);
                                 self.enact_camera(&cmd_c, vw, vh);
+                            } else if let outrider_view::command::ViewCommand::Tour(tc) = &cmd {
+                                if !self.dispatch_tour_command(tc) {
+                                    self.apply_view_command(cmd);
+                                }
                             } else {
                                 self.apply_view_command(cmd);
                             }
@@ -1856,12 +1905,27 @@ impl TreemapView {
                 removed_active |= self.view_tabs.remove_file(p);
             }
         }
+        // Initial scan (several files arrive at once, none tracked before):
+        // open the FIRST view alphabetically so a numbered lesson series
+        // starts at chapter 1. Later single-file changes switch to that file
+        // (an agent just wrote it).
+        let initial_scan = self.view_tabs.len() == 1
+            && events
+                .iter()
+                .filter(|e| matches!(e, crate::view::watch::WatchEvent::Changed(_)))
+                .count()
+                > 1;
         let mut switch_to: Option<usize> = None;
         let newest = self.watch_state.newest().cloned();
-        for e in &events {
-            let crate::view::watch::WatchEvent::Changed(path) = e else {
-                continue;
-            };
+        let mut changed_paths: Vec<&std::path::PathBuf> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::view::watch::WatchEvent::Changed(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        changed_paths.sort();
+        for path in changed_paths {
             match std::fs::read_to_string(path)
                 .map_err(|e| e.to_string())
                 .and_then(|s| {
@@ -1869,7 +1933,12 @@ impl TreemapView {
                 }) {
                 Ok(spec) => {
                     let idx = self.view_tabs.upsert_file(path, spec);
-                    if newest.as_ref() == Some(path) {
+                    let pick = if initial_scan {
+                        switch_to.is_none()
+                    } else {
+                        newest.as_ref() == Some(path)
+                    };
+                    if pick {
                         switch_to = Some(idx);
                     }
                 }
@@ -1900,19 +1969,33 @@ impl TreemapView {
     /// apply the incoming tab's spec, and keep the focused symbol — reframed
     /// in the new layout if it exists there, else fall back to the root.
     fn switch_to_tab(&mut self, idx: usize) {
+        self.switch_to_tab_inner(idx, false);
+    }
+
+    /// `keep_tour`: the switch is driven by the tour itself (a step's `tab`),
+    /// so playback must survive. A user-driven switch ends the tour first so
+    /// its pushed layers are never stashed into the outgoing tab.
+    fn switch_to_tab_inner(&mut self, idx: usize, keep_tour: bool) {
         if idx == self.view_tabs.active_index() {
             return;
+        }
+        if !keep_tour {
+            self.tour_stop();
         }
         let live = self.view_spec.clone();
         self.view_tabs.store_active_spec(live);
         if !self.view_tabs.activate(idx) {
             return;
         }
-        self.apply_active_tab_spec();
+        self.apply_active_tab_spec_inner(keep_tour);
     }
 
     /// Apply the active tab's spec to the session and reframe the focus.
     fn apply_active_tab_spec(&mut self) {
+        self.apply_active_tab_spec_inner(false);
+    }
+
+    fn apply_active_tab_spec_inner(&mut self, in_tour: bool) {
         let tab = self.view_tabs.active().clone();
         let result =
             self.apply_view_command(outrider_view::command::ViewCommand::Apply(tab.spec));
@@ -1930,6 +2013,416 @@ impl TreemapView {
         self.pending_focus_reframe = true;
         self.neighbors = None;
         self.context_menu = None;
+        // An authored walkthrough starts playing as soon as its tab opens —
+        // unless a tour is already driving this switch.
+        if !in_tour && !self.view_spec.camera.steps.is_empty() {
+            self.tour_goto(0);
+        }
+    }
+
+    // ── Guided tour ──
+
+    /// Resolve a step's `tab` label (title or file stem) to a tab index.
+    fn tab_index_for_label(&self, label: &str) -> Option<usize> {
+        let want = label.trim().to_lowercase();
+        self.view_tabs.tabs().iter().position(|t| {
+            t.label.trim().to_lowercase() == want
+                || t
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_stem())
+                    .map(|st| st.to_string_lossy().to_lowercase() == want)
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Truncate the active spec to the tour base for the active tab, then
+    /// push `layers`. Records the base the first time a tab is visited.
+    fn tour_apply_layers(&mut self, layers: &[outrider_view::spec::LayerSpec]) {
+        let tab = self.view_tabs.active_index();
+        self.tour.note_base(tab, self.view_spec.layers.len());
+        let base = self.tour.base_layers(tab).unwrap_or(self.view_spec.layers.len());
+        while self.view_spec.layers.len() > base {
+            let top = self.view_spec.layers.len() - 1;
+            self.apply_view_command(outrider_view::command::ViewCommand::RemoveLayer(top));
+        }
+        for layer in layers {
+            self.apply_view_command(outrider_view::command::ViewCommand::PushLayer(layer.clone()));
+        }
+    }
+
+    /// Jump the tour to step `index`: switch tab if the step asks for one,
+    /// rebuild that tab's tour layer stack by replaying the same-tab run,
+    /// record the step, and queue the camera move. Starts the tour from the
+    /// active view if not yet active.
+    fn tour_goto(&mut self, index: usize) {
+        if !self.tour.is_active() {
+            let steps = self.view_spec.camera.steps.clone();
+            if steps.is_empty() {
+                return;
+            }
+            self.tour.start(self.view_tabs.active_index(), steps);
+        }
+        let Some(plan) = self.tour.plan_goto(index) else {
+            return;
+        };
+        // Which tab does this step play on?
+        let want_tab = match plan.tab.as_deref() {
+            Some(label) => match self.tab_index_for_label(label) {
+                Some(i) => i,
+                None => {
+                    self.notifications.push(Notification::warning(format!(
+                        "Tour step {}: no tab named '{label}'",
+                        index + 1
+                    )));
+                    self.tour.origin_tab
+                }
+            },
+            None => self.tour.origin_tab,
+        };
+        if want_tab != self.view_tabs.active_index() {
+            // Leaving a tab: strip its tour layers so the stash is clean.
+            let leaving = self.view_tabs.active_index();
+            if let Some(base) = self.tour.base_layers(leaving) {
+                while self.view_spec.layers.len() > base {
+                    let top = self.view_spec.layers.len() - 1;
+                    self.apply_view_command(outrider_view::command::ViewCommand::RemoveLayer(top));
+                }
+            }
+            self.switch_to_tab_inner(want_tab, true);
+        }
+        self.tour_apply_layers(&plan.tour_layers);
+        // Mirror the step index into the origin view's spec for RPC/status
+        // (only meaningful while on the origin tab).
+        if self.view_tabs.active_index() == self.tour.origin_tab {
+            self.apply_view_command(outrider_view::command::ViewCommand::Tour(
+                outrider_view::command::TourCommand::Goto(index),
+            ));
+        }
+        self.tour.commit(&plan);
+        // Focus targets move keyboard focus too, so the ring, neighbors, and
+        // the focused node's doc note all follow the tour.
+        if let outrider_view::spec::StepTarget::Focus(wire) = &plan.target {
+            if let Ok(id) = outrider_view::symbol_id::parse_wire(wire) {
+                let tree = match &self.graph_scaffold {
+                    Some(s) => &s.tree,
+                    None => &self.tree,
+                };
+                let index = TreeIndex::new(tree);
+                if index.node(&id).is_some() && self.focus.set(id.clone(), &index) {
+                    self.view_dirty |= outrider_view::Deps::FOCUS;
+                    self.nav_history.push(id);
+                    self.neighbors = None;
+                }
+            }
+        }
+        self.pending_tour_camera = Some(plan.target);
+        self.context_menu = None;
+    }
+
+    fn tour_next(&mut self) {
+        use crate::view::tour::Advance;
+        match self.tour.next_move() {
+            Some(Advance::Step(i)) => self.tour_goto(i),
+            Some(Advance::Part(p)) => self.tour_goto_part(Some(p)),
+            Some(Advance::Part0Back) => self.tour_goto_part(None),
+            Some(Advance::StepAtPart(i, p)) => {
+                self.tour_goto(i);
+                self.tour_goto_part(Some(p));
+            }
+            None => {}
+        }
+    }
+
+    fn tour_prev(&mut self) {
+        use crate::view::tour::Advance;
+        match self.tour.prev_move() {
+            Some(Advance::Step(i)) => self.tour_goto(i),
+            Some(Advance::Part(p)) => self.tour_goto_part(Some(p)),
+            Some(Advance::Part0Back) => self.tour_goto_part(None),
+            Some(Advance::StepAtPart(i, p)) => {
+                self.tour_goto(i);
+                self.tour_goto_part(Some(p));
+            }
+            None => {}
+        }
+    }
+
+    /// Move within the live step: to part `part` (or back to the step's own
+    /// target with None). Layers and tab are the step's; only the camera,
+    /// focus, and narration change.
+    fn tour_goto_part(&mut self, part: Option<usize>) {
+        if !self.tour.is_active() {
+            return;
+        }
+        if let Some(p) = part {
+            if p >= self.tour.part_count() {
+                return;
+            }
+        }
+        self.tour.set_part(part);
+        let Some((target, _note)) = self.tour.live_target() else {
+            return;
+        };
+        if let outrider_view::spec::StepTarget::Focus(wire) = &target {
+            if let Ok(id) = outrider_view::symbol_id::parse_wire(wire) {
+                let tree = match &self.graph_scaffold {
+                    Some(s) => &s.tree,
+                    None => &self.tree,
+                };
+                let index = TreeIndex::new(tree);
+                if index.node(&id).is_some() && self.focus.set(id.clone(), &index) {
+                    self.view_dirty |= outrider_view::Deps::FOCUS;
+                    self.nav_history.push(id);
+                    self.neighbors = None;
+                }
+            }
+        }
+        self.pending_tour_camera = Some(target);
+        self.tour_target_cache = None;
+        self.context_menu = None;
+    }
+
+    /// Leave the tour: drop tour-pushed layers from every tab it touched and
+    /// clear the step marker. The reader keeps the current tab and camera.
+    fn tour_stop(&mut self) {
+        if !self.tour.is_active() {
+            return;
+        }
+        let active = self.view_tabs.active_index();
+        for (tab, base) in self.tour.touched_tabs() {
+            if tab == active {
+                while self.view_spec.layers.len() > base {
+                    let top = self.view_spec.layers.len() - 1;
+                    self.apply_view_command(outrider_view::command::ViewCommand::RemoveLayer(top));
+                }
+            } else {
+                // Tabs we left were stripped on exit; nothing stashed above base.
+            }
+        }
+        if active == self.tour.origin_tab {
+            self.apply_view_command(outrider_view::command::ViewCommand::Tour(
+                outrider_view::command::TourCommand::Stop,
+            ));
+        }
+        self.tour.clear();
+        self.pending_tour_camera = None;
+    }
+
+    /// Start (or restart) the active view's tour from step 0.
+    fn tour_play(&mut self) {
+        if self.view_spec.camera.steps.is_empty() {
+            self.notifications
+                .push(Notification::warning("This view has no tour steps".to_string()));
+            return;
+        }
+        if self.tour.is_active() {
+            self.tour_stop();
+        }
+        self.tour_goto(0);
+    }
+
+    /// Route a playback command (palette / RPC) into the tour engine.
+    /// Returns false for commands that only mutate the spec (SetSteps, Add),
+    /// which the caller should apply normally.
+    pub(crate) fn dispatch_tour_command(
+        &mut self,
+        cmd: &outrider_view::command::TourCommand,
+    ) -> bool {
+        use outrider_view::command::TourCommand;
+        match cmd {
+            TourCommand::Play => self.tour_play(),
+            TourCommand::Next => {
+                if self.tour.is_active() {
+                    self.tour_next();
+                } else {
+                    self.tour_play();
+                }
+            }
+            TourCommand::Prev => self.tour_prev(),
+            TourCommand::Stop => self.tour_stop(),
+            TourCommand::Goto(i) => {
+                if !self.tour.is_active() && self.view_spec.camera.steps.is_empty() {
+                    return true;
+                }
+                self.tour_goto(*i);
+            }
+            TourCommand::SetSteps(_) | TourCommand::Add(_) => return false,
+        }
+        true
+    }
+
+    /// Select the live step's referenced item and zoom the camera onto it
+    /// (Enter, or a click on the callout card / anchor dot). Focus targets
+    /// select the symbol; frame targets zoom the whole set; home refits.
+    fn tour_zoom_target(&mut self, vw: f64, vh: f64) {
+        let Some((target, _)) = self.tour.live_target() else {
+            return;
+        };
+        // Resolve the target to a world rect (and, for symbols, select it).
+        let rect: Option<Rect> = match &target {
+            outrider_view::spec::StepTarget::Focus(wire) => self.select_wire(wire),
+            outrider_view::spec::StepTarget::Frame(outrider_view::spec::SetRef::Name(n)) => {
+                let layout = match &self.graph_scaffold {
+                    Some(s) => &s.layout,
+                    None => &self.layout,
+                };
+                self.view_resolver
+                    .current()
+                    .and_then(|rv| rv.sets.get(n))
+                    .and_then(|set| outrider_view::camera::union_rect(set.ids.iter(), layout))
+            }
+            _ => {
+                let (tree, layout) = match &self.graph_scaffold {
+                    Some(s) => (&s.tree, &s.layout),
+                    None => (&self.tree, &self.layout),
+                };
+                layout.rects.get(&tree.root.id).copied()
+            }
+        };
+        let Some(r) = rect else { return };
+        self.frame_rect_beside_panel(r, vw, vh);
+    }
+
+    /// Select `wire`'s symbol (focus ring + nav history) in the active
+    /// scaffold, returning its rect there when it has one.
+    fn select_wire(&mut self, wire: &str) -> Option<Rect> {
+        let id = outrider_view::symbol_id::parse_wire(wire).ok()?;
+        let (tree, layout) = match &self.graph_scaffold {
+            Some(s) => (&s.tree, &s.layout),
+            None => (&self.tree, &self.layout),
+        };
+        let r = layout.rects.get(&id).copied();
+        let index = TreeIndex::new(tree);
+        if index.node(&id).is_some() && self.focus.set(id.clone(), &index) {
+            self.view_dirty |= outrider_view::Deps::FOCUS;
+            self.nav_history.push(id);
+            self.neighbors = None;
+        }
+        r
+    }
+
+    /// Frame `r` close (END fraction) into the band left of the right-hand
+    /// panel so the panel doesn't cover it.
+    fn frame_rect_beside_panel(&mut self, r: Rect, vw: f64, vh: f64) {
+        let usable_w = (vw - crate::view::tour_panel::PANEL_W as f64 - 16.0).max(vw * 0.5);
+        let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+        let mut to =
+            camera::frame_rect(r, usable_w, vh, camera::END_FRACTION, min_zoom, camera::MAX_ZOOM);
+        to.center_x += (vw - usable_w) / 2.0 / to.zoom;
+        self.start_tween(to);
+    }
+
+    /// Open the comment composer on the current selection (hotkey `c`).
+    /// Root focus (or an unresolvable id) becomes a general comment.
+    fn open_comment_composer(&mut self) {
+        let focus_id = self.focus.current.clone();
+        let (tree, _) = match &self.graph_scaffold {
+            Some(s) => (&s.tree, &s.layout),
+            None => (&self.tree, &self.layout),
+        };
+        let is_root = focus_id == tree.root.id || focus_id == self.tree.root.id;
+        let (target, target_label) = if is_root {
+            (None, "this view".to_string())
+        } else {
+            let index = TreeIndex::new(tree);
+            let label = index
+                .node(&focus_id)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| {
+                    focus_id
+                        .qualified_path
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(&focus_id.qualified_path)
+                        .to_string()
+                });
+            (Some(outrider_view::symbol_id::to_wire(&focus_id)), label)
+        };
+        self.comment_draft = Some(CommentDraft {
+            target,
+            target_label,
+            input: String::new(),
+        });
+    }
+
+    /// Save the open composer as a comment (Enter). Empty text cancels.
+    fn commit_comment(&mut self) {
+        let Some(d) = self.comment_draft.take() else {
+            return;
+        };
+        let text = d.input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let view = self
+            .view_tabs
+            .tabs()
+            .get(self.view_tabs.active_index())
+            .map(|t| t.label.clone())
+            .unwrap_or_default();
+        let tour_step = self.tour.step.map(|s| {
+            let title = self
+                .view_tabs
+                .tabs()
+                .get(self.tour.origin_tab)
+                .map(|t| t.label.clone())
+                .unwrap_or_default();
+            format!("{title} \u{00B7} step {}", s + 1)
+        });
+        self.comments.add(d.target, d.target_label, text, view, tour_step);
+        self.comments.save(&self.tree.repo_root);
+    }
+
+    /// The agent prompt for the current comment list, with per-target
+    /// file/signature context resolved against the live index.
+    pub(crate) fn build_comment_prompt(&self) -> String {
+        let index = TreeIndex::new(&self.tree);
+        crate::view::comments::build_prompt(
+            &self.tree.root.name,
+            &self.comments.comments,
+            |wire| {
+                let id = outrider_view::symbol_id::parse_wire(wire).ok()?;
+                let node = index.node(&id)?;
+                let file = BufferManager::file_path_of(&id.qualified_path).to_string();
+                Some(crate::view::comments::TargetContext {
+                    file: (!file.is_empty()).then_some(file),
+                    signature: node.signature.clone(),
+                })
+            },
+        )
+    }
+
+    /// Keys consumed while a tour is playing. Returns true if handled.
+    fn on_tour_key(&mut self, e: &gpui::KeyDownEvent) -> bool {
+        if !self.tour.is_active() {
+            return false;
+        }
+        let m = &e.keystroke.modifiers;
+        if m.control || m.alt || m.platform {
+            return false;
+        }
+        if e.keystroke.key.as_str() == "enter" {
+            if let Some((vw, vh)) = self.last_viewport {
+                self.tour_zoom_target(vw, vh);
+            }
+            return true;
+        }
+        match e.keystroke.key.as_str() {
+            "right" | "space" | "n" | "pagedown" => {
+                self.tour_next();
+                true
+            }
+            "left" | "p" | "pageup" => {
+                self.tour_prev();
+                true
+            }
+            "escape" => {
+                self.tour_stop();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Keyboard tab switching (bound in main.rs): Ctrl+Tab / Ctrl+Shift+Tab
@@ -1996,6 +2489,7 @@ impl TreemapView {
     /// `PaintItem` list + optional focused-leaf doc panel for the current
     /// frame; also kicks off queued bakes.
     fn paint_items(&mut self, vw: f64, vh: f64) -> crate::paint_model::PaintFrame {
+        let mut prof = crate::frame_profile::FrameProfile::begin();
         if let Some((tw, started)) = self.tween {
             let t = started.elapsed().as_secs_f64();
             self.camera = Some(tw.sample(t));
@@ -2011,8 +2505,17 @@ impl TreemapView {
         let camera = *self.camera.as_ref().unwrap();
         self.last_viewport = Some((vw, vh));
         let focus_id = self.focus.current.clone();
+        // Neighbor targets are a full-layout scan; while a layout morph is
+        // animating the rects are transient, so recomputing per frame both
+        // stutters and produces throwaway answers. Wait for it to settle.
         let stale = !matches!(&self.neighbors, Some((k, _)) if k == &focus_id);
-        if stale {
+        // Entering a graph tab: the scaffold is built later this frame, so
+        // computing neighbors now would scan the full treemap layout only
+        // to be thrown away. Wait for the scaffold.
+        let scaffold_pending = self.view_spec.space.kind
+            == outrider_view::spec::SpaceKind::Graph
+            && self.graph_scaffold.is_none();
+        if stale && self.layout_transition.is_none() && !scaffold_pending {
             let (nav_tree, nav_layout) = match &self.graph_scaffold {
                 Some(s) => (&s.tree, &s.layout),
                 None => (&self.tree, &self.layout),
@@ -2021,7 +2524,7 @@ impl TreemapView {
             let n = focus::neighbors(&focus_id, nav_layout, &index);
             self.neighbors = Some((focus_id.clone(), n));
         }
-        let (_, _neighbor_ids) = self.neighbors.clone().unwrap();
+        crate::frame_profile::profile_phase!(prof, "neighbors");
 
         let session = outrider_view::SessionState {
             focus: &focus_id,
@@ -2041,7 +2544,9 @@ impl TreemapView {
             repo_root: &self.tree.repo_root,
         };
         let dirty = std::mem::take(&mut self.view_dirty);
+        crate::frame_profile::profile_phase!(prof, "pre");
         let resolved = self.view_resolver.resolve(&self.view_spec, &ctx, dirty);
+        crate::frame_profile::profile_phase!(prof, "resolve");
         self.panels.sync(&resolved.panels);
         let ov = crate::view::paint_resolver::PaintOverrides::new(resolved);
 
@@ -2061,10 +2566,12 @@ impl TreemapView {
                     .graph_scaffold
                     .as_ref()
                     .map(|s| s.tree.root.children.len());
+                self.layout_generation += 1;
                 self.graph_scaffold = Some(crate::view::graph_scaffold::build(
                     &self.tree,
                     resolved,
                     self.view_spec.space.members.as_ref(),
+                    self.view_spec.space.direction == outrider_view::spec::GraphDirection::Lr,
                 ));
                 let new_count = self
                     .graph_scaffold
@@ -2073,6 +2580,7 @@ impl TreemapView {
                 scaffold_changed = old_count != new_count;
             }
         } else if self.graph_scaffold.take().is_some() {
+            self.layout_generation += 1;
             scaffold_changed = true;
         }
         let (active_tree, active_layout): (&SymbolTree, &PackLayout) =
@@ -2084,7 +2592,21 @@ impl TreemapView {
         // symbol if the new layout has it (frame it), else fall back to the
         // root fit. The base tab never rebuilds a scaffold, so the tab
         // switch flag is what drives treemap-side reframing.
-        let reframe = scaffold_changed || std::mem::take(&mut self.pending_focus_reframe);
+        // A queued tour move supersedes the tab-switch reframe (both can be
+        // armed by the same switch when the new tab auto-starts its tour).
+        if self.pending_tour_camera.is_some() {
+            self.pending_focus_reframe = false;
+        }
+        // While a tour is playing, any scaffold growth (async edges arriving)
+        // re-enacts the live step's target rather than focus-framing: the
+        // step said where to look.
+        if scaffold_changed && self.pending_tour_camera.is_none() {
+            if let Some((target, _)) = self.tour.live_target() {
+                self.pending_tour_camera = Some(target);
+            }
+        }
+        let reframe = (scaffold_changed || std::mem::take(&mut self.pending_focus_reframe))
+            && self.pending_tour_camera.is_none();
         let camera = if reframe {
             let root_rect = active_layout
                 .rects
@@ -2093,21 +2615,38 @@ impl TreemapView {
                 .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
             let home = Camera::fit(root_rect, vw, vh);
             self.home_zoom = home.zoom;
+            // A view that declares `camera.frame` (a set) or `camera.focus`
+            // (a symbol) is stating where it wants the reader to look — an
+            // authored view's framing wins over the retained focus. Without
+            // either, keep the focused symbol if the new layout has it.
+            let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+            let declared_frame: Option<Rect> = match &self.view_spec.camera.frame {
+                Some(outrider_view::spec::SetRef::Name(name)) => resolved
+                    .sets
+                    .get(name)
+                    .and_then(|s| outrider_view::camera::union_rect(s.ids.iter(), active_layout)),
+                _ => None,
+            };
+            let declared_focus: Option<Rect> = self
+                .view_spec
+                .camera
+                .focus
+                .as_deref()
+                .and_then(|w| outrider_view::symbol_id::parse_wire(w).ok())
+                .and_then(|id| active_layout.rects.get(&id).copied());
             let focus_rect = if self.focus.current != active_tree.root.id {
                 active_layout.rects.get(&self.focus.current).copied()
             } else {
                 None
             };
-            let target = match focus_rect {
-                Some(r) => camera::frame_rect(
-                    r,
-                    vw,
-                    vh,
-                    camera::FOCUS_FRACTION,
-                    (self.home_zoom * 0.5).min(camera::MAX_ZOOM),
-                    camera::MAX_ZOOM,
-                ),
-                None => home,
+            let target = if let Some(r) = declared_frame {
+                camera::frame_rect(r, vw, vh, camera::FRAME_FRACTION, min_zoom, camera::MAX_ZOOM)
+            } else if let Some(r) = declared_focus {
+                camera::frame_rect(r, vw, vh, camera::FOCUS_FRACTION, min_zoom, camera::MAX_ZOOM)
+            } else if let Some(r) = focus_rect {
+                camera::frame_rect(r, vw, vh, camera::FOCUS_FRACTION, min_zoom, camera::MAX_ZOOM)
+            } else {
+                home
             };
             // Snap on scaffold change (layout is discontinuous); tween when
             // only the tab's framing changed within the same layout.
@@ -2120,6 +2659,80 @@ impl TreemapView {
                 let tw = match self.tween.take() {
                     Some((tw, started)) => tw.retarget(started.elapsed().as_secs_f64(), target),
                     None => CameraTween::new(camera, target),
+                };
+                self.camera = Some(tw.from);
+                self.tween = Some((tw, std::time::Instant::now()));
+                camera
+            }
+        } else {
+            camera
+        };
+
+        // Tour step camera: enacted here (not in tour_goto) because frame
+        // targets need this frame's resolved sets. A tour move supersedes
+        // the tab-switch reframe above when both fire on the same frame.
+        // In graph mode the map is narrower by the tour panel: frame into
+        // the remaining width so the callout and panel don't cover the target.
+        let camera = if let Some(target) = self.pending_tour_camera.take() {
+            let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
+            let usable_w = (vw - crate::view::tour_panel::PANEL_W as f64).max(vw * 0.5);
+            let rect: Option<(Rect, f64)> = match &target {
+                outrider_view::spec::StepTarget::Frame(outrider_view::spec::SetRef::Name(name)) => {
+                    resolved.sets.get(name).and_then(|s| {
+                        outrider_view::camera::union_rect(s.ids.iter(), active_layout)
+                    })
+                    .map(|r| (r, camera::FRAME_FRACTION))
+                }
+                outrider_view::spec::StepTarget::Frame(_) => None,
+                outrider_view::spec::StepTarget::Focus(wire) => {
+                    outrider_view::symbol_id::parse_wire(wire)
+                        .ok()
+                        .and_then(|id| active_layout.rects.get(&id).copied())
+                        .map(|r| (r, camera::FOCUS_FRACTION))
+                }
+                outrider_view::spec::StepTarget::Home(_) => None,
+            };
+            let to = match rect {
+                Some((r, frac)) => {
+                    // Frame within the left `usable_w` pixels, then shift the
+                    // center so the rect sits in that band.
+                    let mut c = camera::frame_rect(r, usable_w, vh, frac, min_zoom, camera::MAX_ZOOM);
+                    // frame_rect centers on `usable_w/2`; the real viewport is
+                    // `vw` wide, so shift world-center right by the slack.
+                    c.center_x += (vw - usable_w) / 2.0 / c.zoom;
+                    c
+                }
+                None => {
+                    let root_rect = active_layout
+                        .rects
+                        .get(&active_tree.root.id)
+                        .copied()
+                        .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
+                    let mut c = Camera::fit(root_rect, usable_w, vh);
+                    c.center_x += (vw - usable_w) / 2.0 / c.zoom;
+                    c
+                }
+            };
+            if scaffold_changed {
+                // The layout is discontinuous (new tab / graph rebuilt):
+                // snap rather than tween from unrelated coordinates.
+                self.camera = Some(to);
+                self.tween = None;
+                self.home_zoom = Camera::fit(
+                    active_layout
+                        .rects
+                        .get(&active_tree.root.id)
+                        .copied()
+                        .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }),
+                    vw,
+                    vh,
+                )
+                .zoom;
+                to
+            } else {
+                let tw = match self.tween.take() {
+                    Some((tw, started)) => tw.retarget(started.elapsed().as_secs_f64(), to),
+                    None => CameraTween::new(camera, to),
                 };
                 self.camera = Some(tw.from);
                 self.tween = Some((tw, std::time::Instant::now()));
@@ -2154,15 +2767,33 @@ impl TreemapView {
         if let Some(textures) = self.textures.as_mut() {
             textures.begin_visibility_frame();
         }
+        crate::frame_profile::profile_phase!(prof, "scaffold+camera");
         // In graph mode boxes are text-only UML nodes: report no thumbnails
         // so member subtrees are never pruned behind a code texture.
-        let items = world::visible_nodes(active_tree, active_layout, &camera, vw, vh, |id| {
+        let pre = world::PreorderRects::for_generation(
+            self.preorder_rects.take(),
+            active_tree,
+            active_layout,
+            self.layout_generation,
+        );
+        let items = world::visible_nodes_cached(active_tree, &pre, &camera, vw, vh, |id| {
             !graph_mode
                 && self
                     .textures
                     .as_ref()
                     .is_some_and(|textures| textures.contains(id))
         });
+        self.preorder_rects = Some(pre);
+        crate::frame_profile::profile_phase!(prof, "visible_nodes");
+        let n_items = items.len();
+        let n_dots = if prof.is_some() {
+            items
+                .iter()
+                .filter(|i| matches!(i.draw, Draw::Leaf(LeafDraw::Dot) | Draw::Container(Rung::Dot)))
+                .count()
+        } else {
+            0
+        };
         let mut out = Vec::with_capacity(items.len());
         let mut focused_paint_idx = None;
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
@@ -2181,6 +2812,53 @@ impl TreemapView {
                 .unwrap_or(item.px.y);
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
             let is_focused = item.node.id == focus_id;
+
+            // Fast path: a Dot is a sub-label fill with no text, texture,
+            // note, or badge — at a wide zoom thousands of them dominate the
+            // item list, so build their PaintItem with the minimum lookups.
+            if matches!(item.draw, Draw::Leaf(LeafDraw::Dot) | Draw::Container(Rung::Dot))
+                && !is_focused
+            {
+                let Some((clip_y, clip_h)) =
+                    descendant_paint_clip(item.px.y, item.px.h, ancestor_stack_bottom)
+                else {
+                    continue;
+                };
+                let box_kind = theme::node_box_kind(is_leaf, &item.node.id.kind);
+                let tint = theme::node_box_tint(item.node);
+                let base_fill = theme::box_fill(box_kind, item.level, tint);
+                let light = ov.light(&item.node.id);
+                let effective_fill = if item.level == 0 {
+                    base_fill
+                } else {
+                    ov.fill(&item.node.id).unwrap_or(base_fill)
+                };
+                out.push(PaintItem {
+                    x: item.px.x as f32,
+                    y: item.px.y as f32,
+                    w: item.px.w as f32,
+                    h: item.px.h as f32,
+                    clip_y: clip_y as f32,
+                    clip_h: clip_h as f32,
+                    fill: theme::dim_toward(effective_fill, light),
+                    border: theme::dim_toward(theme::border_for(effective_fill), light),
+                    stripe: ov.stripe(&item.node.id).map(|c| theme::dim_toward(c, light)),
+                    focused: false,
+                    deferred_overlay: false,
+                    neighbor: ov.is_neighbor(&item.node.id),
+                    light,
+                    body_font_px: FONT_PX as f32,
+                    header_bg_h: 0.0,
+                    header_bg_y: item.px.y as f32,
+                    body_opacity: light,
+                    tex_opacity: light,
+                    name: None,
+                    body: Vec::new(),
+                    tex: None,
+                    badge: None,
+                });
+                continue;
+            }
             let box_kind = theme::node_box_kind(is_leaf, &item.node.id.kind);
             let tint = theme::node_box_tint(item.node);
             let fill = theme::box_fill(box_kind, item.level, tint);
@@ -2374,11 +3052,10 @@ impl TreemapView {
                     }
                 }
             }
-            // In graph mode the root is a synthetic canvas, not a symbol:
-            // keep the neutral container fill so metric colors on it don't
-            // wash out the whole diagram background.
-            let is_graph_canvas = graph_mode && item.level == 0;
-            let effective_fill = if is_graph_canvas {
+            // The root container is the canvas, not a datum: a metric colour
+            // on it carries no information and washes out everything inside.
+            // Keep it neutral in both treemap and graph modes.
+            let effective_fill = if item.level == 0 {
                 fill
             } else {
                 ov.fill(&item.node.id).unwrap_or(fill)
@@ -2409,6 +3086,7 @@ impl TreemapView {
                 name,
                 body,
                 tex,
+                badge: ov.badge(&item.node.id),
             });
             if is_focused && is_leaf && expanded_w > 0.0 {
                 focused_paint_idx = Some(out.len() - 1);
@@ -2418,11 +3096,16 @@ impl TreemapView {
             let focused = out.remove(index);
             out.push(focused);
         }
+        crate::frame_profile::profile_phase!(prof, "items");
         let doc_panel = panel_doc.and_then(|(notes, fx, fy, fw, fh)| {
             crate::view::note_pass::build_doc_panel(&notes, fx, fy, fw, fh)
         });
         self.bake_pending = if let Some(textures) = self.textures.as_mut() {
-            if textures.has_queued() {
+            if textures.has_queued() && !textures.has_bake_work() {
+                // Only disk bookkeeping outstanding: pump it without the
+                // per-frame index and closures a bake batch would need.
+                textures.process_requests_grouped(|_| None, |_, _| None)
+            } else if textures.has_queued() {
                 let index = TreeIndex::new(&self.tree);
                 let direct_child_bytes: HashMap<_, _> = textures
                     .next_request_ids()
@@ -2483,6 +3166,7 @@ impl TreemapView {
         } else {
             false
         };
+        crate::frame_profile::profile_phase!(prof, "textures");
         let cg_scrim = self.call_graph.is_some();
         let edge_frame = crate::view::edge_pass::aggregate(
             &resolved.edges,
@@ -2491,11 +3175,120 @@ impl TreemapView {
             vw,
             vh,
         );
+        // Guided-tour callout: narration anchored to the live step's target.
+        let live = self.tour.live_target();
+        let tour_step_rect: Option<Rect> = match (self.tour.step, &live) {
+            (Some(si), Some((target, _))) => {
+                // Key includes the part so moving within a step recomputes.
+                let key = (
+                    si * 1000 + self.tour.part.map(|p| p + 1).unwrap_or(0),
+                    active_layout.rects.len(),
+                    self.view_tabs.active_index(),
+                );
+                match &self.tour_target_cache {
+                    Some((k, r)) if *k == key => *r,
+                    _ => {
+                        let rect = match target {
+                            outrider_view::spec::StepTarget::Frame(
+                                outrider_view::spec::SetRef::Name(n),
+                            ) => resolved.sets.get(n).and_then(|s| {
+                                outrider_view::camera::union_rect(s.ids.iter(), active_layout)
+                            }),
+                            outrider_view::spec::StepTarget::Frame(_) => None,
+                            outrider_view::spec::StepTarget::Focus(w) => {
+                                outrider_view::symbol_id::parse_wire(w)
+                                    .ok()
+                                    .and_then(|id| active_layout.rects.get(&id).copied())
+                            }
+                            outrider_view::spec::StepTarget::Home(_) => {
+                                active_layout.rects.get(&active_tree.root.id).copied()
+                            }
+                        };
+                        self.tour_target_cache = Some((key, rect));
+                        rect
+                    }
+                }
+            }
+            _ => {
+                self.tour_target_cache = None;
+                None
+            }
+        };
+        let tour_callout = self.tour.step.and_then(|si| {
+            let (_, note) = live.as_ref()?;
+            let note = note.as_deref().unwrap_or("");
+            let r = tour_step_rect?;
+            let (sx, sy) = camera.world_to_screen(r.x, r.y, vw, vh);
+            let target = (
+                sx as f32,
+                sy as f32,
+                (r.w * camera.zoom) as f32,
+                (r.h * camera.zoom) as f32,
+            );
+            let total = self.tour.steps.len();
+            let label = match self.tour.part {
+                Some(p) => format!(
+                    "Step {} of {} \u{00B7} {}/{}",
+                    si + 1,
+                    total,
+                    p + 1,
+                    self.tour.part_count()
+                ),
+                None if self.tour.part_count() > 0 => format!(
+                    "Step {} of {} \u{00B7} overview ({} parts)",
+                    si + 1,
+                    total,
+                    self.tour.part_count()
+                ),
+                None => format!("Step {} of {}", si + 1, total),
+            };
+            crate::view::note_pass::build_tour_callout(
+                crate::view::tour::headline(note),
+                crate::view::tour::body(note),
+                target,
+                (vw - crate::view::tour_panel::PANEL_W as f64 - 16.0).max(vw * 0.5) as f32,
+                vh as f32,
+                &label,
+            )
+        });
+        crate::frame_profile::profile_phase!(prof, "edges+callout");
+        if let Some(p) = prof {
+            let mut slow: Vec<&(String, u128)> = self
+                .view_resolver
+                .last_timings
+                .iter()
+                .filter(|(n, us)| *us > 2000 || n.starts_with("maskmiss"))
+                .collect();
+            slow.sort_by(|a, b| b.1.cmp(&a.1));
+            let slow: Vec<String> = slow
+                .into_iter()
+                .take(6)
+                .map(|(n, us)| format!("{n}={us}us"))
+                .collect();
+            p.finish(&format!(
+                "items={n_items} dots={n_dots} rects={} dirty={:?} graph={} lt={} tween={} slow[{}]",
+                active_layout.rects.len(),
+                dirty,
+                graph_mode,
+                self.layout_transition.is_some(),
+                self.tween.is_some(),
+                slow.join(" ")
+            ));
+        }
+        let (tour_callout, callout_minimized) = match tour_callout {
+            Some((co, minimized)) => (Some(co), minimized),
+            None => (None, false),
+        };
+        self.tour_callout_minimized = callout_minimized;
+        self.tour_callout_hit = tour_callout
+            .as_ref()
+            .map(|co| ((co.x, co.y, co.w, co.h), co.anchor));
         crate::paint_model::PaintFrame {
             items: out,
             doc_panel,
             cg_scrim,
             edges: edge_frame,
+            tour_callout,
         }
     }
 
@@ -2742,6 +3535,22 @@ impl TreemapView {
         let Some(origin) = self.press_origin.take() else {
             return;
         };
+        // Click on the tour callout (or its anchor dot): act on the item the
+        // note references — select it and zoom the camera onto it.
+        if self.tour.is_active() {
+            if let Some(((cx_, cy_, cw, ch), (ax, ay))) = self.tour_callout_hit {
+                let (mx, my) = (f64::from(e.position.x) as f32, f64::from(e.position.y) as f32);
+                let in_card =
+                    mx >= cx_ && mx <= cx_ + cw && my >= cy_ && my <= cy_ + ch;
+                let near_anchor = (mx - ax).abs() <= 10.0 && (my - ay).abs() <= 10.0;
+                if in_card || near_anchor {
+                    let (vw, vh) = Self::map_viewport(window);
+                    self.tour_zoom_target(vw, vh);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let slop = f64::from(e.position.x - origin.x)
             .abs()
             .max(f64::from(e.position.y - origin.y).abs());
@@ -2966,8 +3775,51 @@ impl TreemapView {
             self.on_cmd_palette_key(e, window, cx);
             return;
         }
+        // Comment composer captures all keys while open.
+        if self.comment_draft.is_some() {
+            match e.keystroke.key.as_str() {
+                "escape" => self.comment_draft = None,
+                "enter" if e.keystroke.modifiers.shift => {
+                    if let Some(d) = &mut self.comment_draft {
+                        d.input.push('\n');
+                    }
+                }
+                "enter" => self.commit_comment(),
+                "backspace" => {
+                    if let Some(d) = &mut self.comment_draft {
+                        d.input.pop();
+                    }
+                }
+                _ => {
+                    if let Some(ch) = e.keystroke.key_char.as_ref().and_then(|s| {
+                        let mut chars = s.chars();
+                        let c = chars.next()?;
+                        if chars.next().is_none() { Some(c) } else { None }
+                    }) {
+                        if let Some(d) = &mut self.comment_draft {
+                            d.input.push(ch);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if self.on_tour_key(e) {
+            cx.notify();
+            return;
+        }
         if self.panels.is_open() {
             self.on_panel_key(e, window, cx);
+            return;
+        }
+        // `c`: comment on the current selection. After the tour handler (so
+        // tour keys win nothing here — the tour ignores `c`) and after open
+        // panels, whose search inputs need the character.
+        let m = &e.keystroke.modifiers;
+        if e.keystroke.key.as_str() == "c" && !m.control && !m.alt && !m.platform && !m.shift {
+            self.open_comment_composer();
+            cx.notify();
             return;
         }
         self.on_nav_key(e, window, cx);
@@ -3618,6 +4470,9 @@ impl TreemapView {
     }
 
     fn advance_layout_transition(&mut self, now: Instant) -> bool {
+        if self.layout_transition.is_some() {
+            self.layout_generation += 1;
+        }
         let Some(transition) = self.layout_transition.take() else {
             return false;
         };
@@ -3627,7 +4482,12 @@ impl TreemapView {
             self.layout_transition = Some(transition);
         }
         self.camera = None;
-        self.neighbors = None;
+        // Recomputing arrow neighbors is a full-layout scan; doing it on
+        // every animation frame makes the morph stutter. Keep the stale
+        // targets while rects are in flight and rebuild once, at the end.
+        if complete {
+            self.neighbors = None;
+        }
         self.hover_id = None;
         true
     }
@@ -3730,7 +4590,10 @@ impl TreemapView {
         self.context_menu = None;
         self.close_all_panels();
         self.tree = tree;
+        self.comments = crate::view::comments::CommentList::load(&self.tree.repo_root);
+        self.comment_draft = None;
         self.layout = layout;
+        self.layout_generation += 1;
         self.layout_transition = None;
         self.packing_target_layout = Some(self.layout.clone());
         self.view_dirty |= outrider_view::Deps::TREE;
@@ -3755,6 +4618,7 @@ impl TreemapView {
         if !self.loader.accepts(generation) {
             return;
         }
+        self.layout_generation += 1;
         self.packing_geometry().apply_snapshot(layout, now);
     }
 
@@ -3762,7 +4626,17 @@ impl TreemapView {
         if !self.loader.accepts(generation) {
             return;
         }
+        self.layout_generation += 1;
         self.packing_geometry().finish(layout);
+        // Final geometry is in: an authored view's declared framing can now
+        // be honoured against real rects (earlier passes saw the skeleton).
+        // A running tour re-enacts its live step instead (the step's target
+        // wins over the view-level frame).
+        if let Some((target, _)) = self.tour.live_target() {
+            self.pending_tour_camera = Some(target);
+        } else if self.view_tabs.active_index() != crate::view::tabs::BASE_TAB {
+            self.pending_focus_reframe = true;
+        }
     }
 
     fn fail_packing(&mut self, generation: u64, message: String, preview_delivered: bool) {
@@ -3929,6 +4803,575 @@ impl TreemapView {
         };
 
         Some(menu_div)
+    }
+
+    /// Right-hand guided-tour panel: step list, live narration, controls.
+    /// The tour block of the right column (header, step list, optional
+    /// narration, controls). None when no tour is active.
+    fn render_tour_sections(&self, vh: f64, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let step_index = self.tour.step?;
+        let steps = &self.tour.steps;
+        if steps.is_empty() {
+            return None;
+        }
+        let title = self
+            .view_tabs
+            .tabs()
+            .get(self.tour.origin_tab)
+            .map(|t| t.label.clone())
+            .unwrap_or_default();
+        let mut m =
+            crate::view::tour_panel::build_model(&title, steps, step_index, self.tour.part);
+        if self.tour_callout_minimized {
+            if let Some((_, Some(note))) = self.tour.live_target() {
+                m.headline = crate::view::tour::headline(&note).to_string();
+                m.paragraphs =
+                    crate::view::tour_panel::md_paragraphs(crate::view::tour::body(&note));
+            }
+        }
+        use crate::view::tour_panel::RowState;
+
+        let sans = theme::FONT_FAMILY_SANS;
+        let label = |text: String, size: f32, color: u32| {
+            div()
+                .text_size(px(size))
+                .font_family(sans)
+                .text_color(rgb(color))
+                .child(text)
+        };
+
+        // Header: view title + "Step i of n".
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .pb(px(10.0))
+            .border_b_1()
+            .border_color(rgb(theme::NARRATION_BORDER))
+            .child(label(m.view_title.clone(), 11.0, theme::TEXT_SECONDARY))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(label("Guided tour".into(), 15.0, theme::NARRATION_TEXT))
+                    .child(label(
+                        format!("{} / {}", m.step_index + 1, m.total),
+                        12.0,
+                        theme::TEXT_SECONDARY,
+                    )),
+            );
+
+        // Step list: scrolls inside a bounded height so the controls below
+        // are always reachable however many steps/parts a tour has.
+        let list_max_h = (vh as f32 - 48.0 - 64.0 - 150.0).max(120.0);
+        let mut list = div()
+            .id("tour-step-list")
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .py(px(8.0))
+            .max_h(px(list_max_h))
+            .overflow_y_scroll();
+        for row in &m.rows {
+            let (bg, fg, marker) = match row.state {
+                RowState::Done => (rgba(0x00000000), theme::TEXT_SECONDARY, "\u{2713}"),
+                RowState::Current => (rgba(0x2a3040ff), theme::NARRATION_TEXT, "\u{25B6}"),
+                RowState::Upcoming => (rgba(0x00000000), theme::TEXT_SECONDARY, "\u{00B7}"),
+            };
+            let i = row.index;
+            list = list.child(
+                div()
+                    .id(("tour-step", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(4.0))
+                    .bg(bg)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgb(0x232a38_u32)))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .text_size(px(11.0))
+                            .font_family(sans)
+                            .text_color(rgb(fg))
+                            .child(marker),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_family(sans)
+                                    .text_color(rgb(fg))
+                                    .child(format!("{}. {}", i + 1, row.title)),
+                            )
+                            .children(row.tab.clone().map(|t| {
+                                div()
+                                    .text_size(px(10.0))
+                                    .font_family(sans)
+                                    .text_color(rgb(theme::DOC_COLOR))
+                                    .child(format!("\u{21B3} {t}"))
+                            })),
+                    )
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.press_origin = None;
+                        this.drag_last = None;
+                        this.tour_goto(i);
+                        cx.notify();
+                    })),
+            );
+            // Sub-steps of the live step, indented under it.
+            if row.state == RowState::Current {
+                for part in &m.parts {
+                    let (pbg, pfg, pmark) = if part.current {
+                        (rgba(0x2a3040ff), theme::NARRATION_TEXT, "\u{25B8}")
+                    } else if part.done {
+                        (rgba(0x00000000), theme::TEXT_SECONDARY, "\u{2713}")
+                    } else {
+                        (rgba(0x00000000), theme::TEXT_SECONDARY, "\u{00B7}")
+                    };
+                    let pi = part.index;
+                    list = list.child(
+                        div()
+                            .id(("tour-part", pi))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pl(px(30.0))
+                            .pr(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .bg(pbg)
+                            .cursor_pointer()
+                            .hover(|el| el.bg(rgb(0x232a38_u32)))
+                            .child(
+                                div()
+                                    .w(px(12.0))
+                                    .text_size(px(10.0))
+                                    .font_family(sans)
+                                    .text_color(rgb(pfg))
+                                    .child(pmark),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_family(sans)
+                                    .text_color(rgb(pfg))
+                                    .child(format!("{}.{} {}", i + 1, pi + 1, part.title)),
+                            )
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.press_origin = None;
+                                this.drag_last = None;
+                                this.tour_goto_part(Some(pi));
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+        }
+
+        // Controls.
+        let button = |id: &'static str, text: &'static str, enabled: bool| {
+            div()
+                .id(id)
+                .px(px(12.0))
+                .py(px(6.0))
+                .rounded(px(4.0))
+                .bg(if enabled { rgb(0x2a3040_u32) } else { rgb(0x1c1f26_u32) })
+                .text_size(px(12.0))
+                .font_family(sans)
+                .text_color(rgb(if enabled { theme::TEXT_PRIMARY } else { 0x55585f }))
+                .cursor_pointer()
+                .child(text)
+        };
+        let controls = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .pt(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(6.0))
+                    .child(
+                        button("tour-prev", "\u{2190} Prev", m.has_prev)
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.press_origin = None;
+                                this.tour_prev();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button("tour-next", "Next \u{2192}", m.has_next)
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.press_origin = None;
+                                this.tour_next();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                button("tour-exit", "Exit", true)
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.press_origin = None;
+                        this.tour_stop();
+                        cx.notify();
+                    })),
+            )
+            .child(label("\u{2190} \u{2192} keys \u{00B7} Esc".into(), 10.0, theme::TEXT_SECONDARY));
+
+        // When the in-view card collapsed to a pill (it would have covered
+        // the target), the panel carries the narration instead.
+        let narration = self.tour_callout_minimized.then(|| {
+            let mut n = div()
+                .id("tour-panel-narration")
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .pt(px(10.0))
+                .max_h(px(220.0))
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(rgb(theme::NARRATION_BORDER))
+                .child(label(m.headline.clone(), 13.5, theme::NARRATION_TEXT));
+            for para in &m.paragraphs {
+                n = n.child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_family(sans)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .line_height(px(17.0))
+                        .child(para.clone()),
+                );
+            }
+            n
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(list)
+                .children(narration)
+                .child(controls),
+        )
+    }
+
+    /// The right-hand column: tour navigator (when a tour is active) and
+    /// the comment list / composer (when comments exist or one is being
+    /// written). None when there is nothing to show.
+    fn render_right_column(&self, vh: f64, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let tour_block = self.render_tour_sections(vh, cx);
+        let comments_block = self.render_comments_section(tour_block.is_some(), cx);
+        if tour_block.is_none() && comments_block.is_none() {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .top(px(48.0))
+                .right(px(8.0))
+                .w(px(crate::view::tour_panel::PANEL_W))
+                .max_h(px((vh - 64.0).max(200.0) as f32))
+                .flex()
+                .flex_col()
+                .p(px(14.0))
+                .rounded(px(6.0))
+                .bg(rgba(0x1c1b1ef0))
+                .border_1()
+                .border_color(rgb(theme::NARRATION_BORDER))
+                .shadow_lg()
+                .overflow_hidden()
+                // Swallow map interaction under the panel.
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .children(tour_block)
+                .children(comments_block),
+        )
+    }
+
+    /// The accumulated comment list with per-row delete, Clear all, and
+    /// the Copy-prompt button that turns the list into an agent prompt.
+    fn render_comments_section(
+        &self,
+        below_tour: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        if self.comments.is_empty() {
+            return None;
+        }
+        let sans = theme::FONT_FAMILY_SANS;
+        let label = |text: String, size: f32, color: u32| {
+            div()
+                .text_size(px(size))
+                .font_family(sans)
+                .text_color(rgb(color))
+                .child(text)
+        };
+        let n = self.comments.comments.len();
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .pb(px(6.0))
+            .when(below_tour, |el| {
+                el.pt(px(12.0)).border_t_1().border_color(rgb(theme::NARRATION_BORDER))
+            })
+            .child(label(format!("Comments ({n})"), 13.0, theme::NARRATION_TEXT))
+            .child(
+                div()
+                    .id("comments-clear")
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .text_size(px(11.0))
+                    .font_family(sans)
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgb(0x232a38_u32)).text_color(rgb(theme::TEXT_PRIMARY)))
+                    .child("Clear all")
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.press_origin = None;
+                        this.comments.clear();
+                        this.comments.save(&this.tree.repo_root);
+                        cx.notify();
+                    })),
+            );
+        let mut list = div()
+            .id("comments-list")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .max_h(px(220.0))
+            .overflow_y_scroll();
+        for (i, c) in self.comments.comments.iter().enumerate() {
+            let cid = c.id;
+            let target = c.target.clone();
+            let clickable = target.is_some();
+            let title = if c.target.is_some() {
+                c.target_label.clone()
+            } else {
+                format!("General \u{00B7} {}", c.view)
+            };
+            list = list.child(
+                div()
+                    .id(("comment-row", i))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(4.0))
+                    .when(clickable, |el| el.cursor_pointer())
+                    .hover(|el| el.bg(rgb(0x232a38_u32)))
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(label(title, 11.5, theme::NARRATION_TEXT))
+                            .children(
+                                crate::view::tour_panel::md_paragraphs(&c.text).into_iter().map(
+                                    |para| {
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_family(sans)
+                                            .text_color(rgb(theme::TEXT_SECONDARY))
+                                            .line_height(px(15.0))
+                                            .child(para)
+                                    },
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("comment-del", i))
+                            .px(px(5.0))
+                            .rounded(px(3.0))
+                            .text_size(px(11.0))
+                            .font_family(sans)
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .cursor_pointer()
+                            .hover(|el| el.text_color(rgb(theme::TEXT_PRIMARY)))
+                            .child("\u{2715}")
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.press_origin = None;
+                                this.comments.remove(cid);
+                                this.comments.save(&this.tree.repo_root);
+                                cx.notify();
+                            })),
+                    )
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.press_origin = None;
+                        this.drag_last = None;
+                        if let Some(wire) = &target {
+                            let rect = this.select_wire(wire);
+                            if let (Some(r), Some((vw, vh))) = (rect, this.last_viewport) {
+                                this.frame_rect_beside_panel(r, vw, vh);
+                            }
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        let footer = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .pt(px(8.0))
+            .child(
+                div()
+                    .id("comments-copy-prompt")
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(0x2a3040_u32))
+                    .text_size(px(12.0))
+                    .font_family(sans)
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgb(0x353d50_u32)))
+                    .child("Copy prompt")
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.press_origin = None;
+                        let prompt = this.build_comment_prompt();
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(prompt));
+                        this.notifications.push(Notification::info(
+                            "Prompt copied \u{2014} paste it to your agent.",
+                        ));
+                        cx.notify();
+                    })),
+            )
+            .child(label("c = comment".into(), 10.0, theme::TEXT_SECONDARY));
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(list)
+                .child(footer),
+        )
+    }
+
+    /// The floating comment composer (opened with `c` on a selection).
+    /// Anchored beside the selected item's on-screen rect — right of it
+    /// when there is room before the panel band, otherwise left — and
+    /// re-anchored every frame so it tracks camera motion. Supports
+    /// multi-line input (Shift+Enter inserts a newline).
+    fn render_comment_composer_overlay(&self, vw: f64, vh: f64) -> Option<gpui::Div> {
+        let d = self.comment_draft.as_ref()?;
+        const W: f64 = 300.0;
+        let camera = self.camera;
+        let layout = match &self.graph_scaffold {
+            Some(s) => &s.layout,
+            None => &self.layout,
+        };
+        let rect = layout.rects.get(&self.focus.current).copied();
+        let (bx, by) = match (rect, camera) {
+            (Some(r), Some(c)) => {
+                let (sx0, sy0) = c.world_to_screen(r.x, r.y, vw, vh);
+                let (sx1, _) = c.world_to_screen(r.x + r.w, r.y + r.h, vw, vh);
+                // The tour/comments panel owns the far right edge; prefer
+                // the gap right of the item, fall back to its left.
+                let panel_edge = vw - f64::from(crate::view::tour_panel::PANEL_W) - 16.0;
+                let x = if sx1 + 12.0 + W <= panel_edge {
+                    sx1 + 12.0
+                } else {
+                    (sx0 - 12.0 - W).max(8.0)
+                };
+                (x.min(panel_edge - W).max(8.0), sy0)
+            }
+            // General comment or item without a rect: near the top center.
+            _ => ((vw - W) / 2.0, 80.0),
+        };
+        let by = by.clamp(8.0, (vh - 180.0).max(8.0));
+        let sans = theme::FONT_FAMILY_SANS;
+        let mut input_box = div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(4.0))
+            .bg(rgb(0x14161c_u32))
+            .border_1()
+            .border_color(rgb(0x2a3040_u32))
+            .min_h(px(48.0))
+            .max_h(px(220.0))
+            .flex()
+            .flex_col()
+            .text_size(px(12.0))
+            .font_family(sans)
+            .text_color(rgb(theme::TEXT_PRIMARY))
+            .line_height(px(16.0));
+        let lines: Vec<&str> = d.input.split('\n').collect();
+        let last = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter().enumerate() {
+            let shown = if i == last {
+                format!("{line}\u{258F}")
+            } else if line.is_empty() {
+                "\u{00A0}".to_string()
+            } else {
+                (*line).to_string()
+            };
+            input_box = input_box.child(div().child(shown));
+        }
+        Some(
+            div()
+                .absolute()
+                .left(px(bx as f32))
+                .top(px(by as f32))
+                .w(px(W as f32))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .p(px(10.0))
+                .rounded(px(6.0))
+                .bg(rgba(0x1c1b1ef0))
+                .border_1()
+                .border_color(rgb(theme::NARRATION_BORDER))
+                .shadow_lg()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_family(sans)
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(format!("Comment on {}", d.target_label)),
+                )
+                .child(input_box)
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_family(sans)
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(
+                            "Enter to save \u{00B7} Shift+Enter for newline \u{00B7} Esc to cancel",
+                        ),
+                ),
+        )
     }
 
     /// Top-center view tab strip. Hidden while only the base tab exists.
@@ -4972,6 +6415,7 @@ impl Render for TreemapView {
             crate::paint_model::PaintFrame {
                 items: Vec::new(),
                 doc_panel: None,
+                tour_callout: None,
                 cg_scrim: false,
                 edges: crate::view::edge_pass::EdgeFrame { edges: Vec::new() },
             }
@@ -4999,13 +6443,27 @@ impl Render for TreemapView {
             .as_ref()
             .is_some_and(|cg| cg.scroll.is_animating());
         let scanning = self.pre_scanner.is_scanning();
-        if self.tween.is_some()
+        let wants_frame = self.tween.is_some()
             || self.bake_pending
             || is_loading
             || self.cg_resolver.is_active()
             || cg_animating
-            || scanning
-        {
+            || scanning;
+        if let Some(mut p) = crate::frame_profile::FrameProfile::begin() {
+            p.phase("overlays");
+            let tex_state = self
+                .textures
+                .as_ref()
+                .map(|t| t.queue_state())
+                .unwrap_or_default();
+            p.finish(&format!(
+                "RENDER wants_frame={wants_frame} tween={} bake={} loading={is_loading} cg={} scan={scanning} notify={needs_notify} tex[{tex_state}]",
+                self.tween.is_some(),
+                self.bake_pending,
+                self.cg_resolver.is_active(),
+            ));
+        }
+        if wants_frame {
             window.request_animation_frame();
         }
 
@@ -5048,6 +6506,12 @@ impl Render for TreemapView {
         let file_menu_overlay = self.render_file_menu(cx);
         let tab_bar_overlay =
             (!has_overlays && self.map_interaction_enabled()).then(|| self.render_tab_bar(vw, cx));
+        let tour_overlay = (!has_overlays && self.map_interaction_enabled())
+            .then(|| self.render_right_column(vh, cx))
+            .flatten();
+        let composer_overlay = (!has_overlays && self.map_interaction_enabled())
+            .then(|| self.render_comment_composer_overlay(vw, vh))
+            .flatten();
 
         // Build the call graph overlay.
         let call_graph_overlay = self.render_call_graph(vw, vh, cx);
@@ -5510,6 +6974,77 @@ impl Render for TreemapView {
                                 }
                             }
                         }
+                        // Pass 2c2: structural/agent mark rings and corner
+                        // badges (hotspot, custom labels, agent flags).
+                        if !frame.cg_scrim {
+                            for item in &frame.items {
+                                let Some(badge) = item.badge.as_ref() else { continue };
+                                if item.w < 28.0 || item.h < 14.0 {
+                                    continue;
+                                }
+                                let b = Bounds::new(
+                                    point(origin.x + px(item.x), origin.y + px(item.y)),
+                                    size(px(item.w), px(item.h)),
+                                );
+                                window.with_content_mask(
+                                    Some(item_content_mask(item)),
+                                    |window| {
+                                        window.paint_quad(quad(
+                                            b,
+                                            px(theme::CORNER_RADIUS),
+                                            transparent_black(),
+                                            px(1.5),
+                                            rgba((badge.color << 8) | 0xcc),
+                                            BorderStyle::default(),
+                                        ));
+                                    },
+                                );
+                                // Tag at the top-right corner, only when the box
+                                // is wide enough to read it.
+                                if item.w >= 72.0 && item.h >= 22.0 {
+                                    let font_px = 10.0f32;
+                                    let text_w = badge.text.chars().count() as f32 * font_px * 0.62 + 10.0;
+                                    let tag_w = text_w.min(item.w - 8.0);
+                                    let tag_h = 14.0f32;
+                                    let tx = item.x + item.w - tag_w - 4.0;
+                                    let ty = item.y + 3.0;
+                                    let tb = Bounds::new(
+                                        point(origin.x + px(tx), origin.y + px(ty)),
+                                        size(px(tag_w), px(tag_h)),
+                                    );
+                                    window.paint_quad(quad(
+                                        tb,
+                                        px(3.0),
+                                        rgba((badge.color << 8) | 0xe0),
+                                        px(0.),
+                                        transparent_black(),
+                                        BorderStyle::default(),
+                                    ));
+                                    let run = TextRun {
+                                        len: badge.text.len(),
+                                        font: gpui::font(theme::FONT_FAMILY_SANS),
+                                        color: rgb(0x0c0c0e).into(),
+                                        background_color: None,
+                                        underline: None,
+                                        strikethrough: None,
+                                    };
+                                    let line = window.text_system().shape_line(
+                                        badge.text.clone().into(),
+                                        px(font_px),
+                                        &[run],
+                                        None,
+                                    );
+                                    let _ = line.paint(
+                                        point(origin.x + px(tx + 5.0), origin.y + px(ty + 1.0)),
+                                        px(font_px * 1.2),
+                                        TextAlign::Left,
+                                        None,
+                                        window,
+                                        _cx,
+                                    );
+                                }
+                            }
+                        }
                         // Pass 2d: selected leaf surface and text above every
                         // regular box, texture, body row, header, and neighbor.
                         if let Some(item) = frame.items.iter().find(|item| item.deferred_overlay) {
@@ -5584,6 +7119,82 @@ impl Render for TreemapView {
                             }
                         }
 
+                        // Pass 5: guided-tour callout — narration card + leader
+                        // line to the step's target. Above everything on the map.
+                        if let Some(co) = frame.tour_callout.as_ref() {
+                            // Leader line from the card's nearest edge midpoint to
+                            // the target anchor.
+                            let card_cx = co.x + co.w / 2.0;
+                            let card_cy = co.y + co.h / 2.0;
+                            let (ax, ay) = co.anchor;
+                            // Start the leader at the card edge facing the anchor.
+                            let (lx, ly) = if (ay - card_cy).abs() * co.w > (ax - card_cx).abs() * co.h {
+                                (card_cx, if ay < card_cy { co.y } else { co.y + co.h })
+                            } else {
+                                (if ax < card_cx { co.x } else { co.x + co.w }, card_cy)
+                            };
+                            let mut leader = PathBuilder::stroke(px(1.5));
+                            leader.move_to(point(origin.x + px(lx), origin.y + px(ly)));
+                            leader.line_to(point(origin.x + px(ax), origin.y + px(ay)));
+                            if let Ok(path) = leader.build() {
+                                window.paint_path(path, rgba((theme::NARRATION_BORDER << 8) | 0xff));
+                            }
+                            // Anchor dot.
+                            let dot = Bounds::new(
+                                point(origin.x + px(ax - 3.0), origin.y + px(ay - 3.0)),
+                                size(px(6.0), px(6.0)),
+                            );
+                            window.paint_quad(quad(
+                                dot,
+                                px(3.0),
+                                rgb(theme::NARRATION_TEXT),
+                                px(0.),
+                                transparent_black(),
+                                BorderStyle::default(),
+                            ));
+                            // Card.
+                            let cb = Bounds::new(
+                                point(origin.x + px(co.x), origin.y + px(co.y)),
+                                size(px(co.w), px(co.h)),
+                            );
+                            window.paint_quad(quad(
+                                cb,
+                                px(theme::CORNER_RADIUS),
+                                rgba((theme::NARRATION_BG << 8) | 0xf2),
+                                px(1.0),
+                                rgb(theme::NARRATION_BORDER),
+                                BorderStyle::default(),
+                            ));
+                            let note_run = |len: usize, color: u32| TextRun {
+                                len,
+                                font: gpui::font(theme::FONT_FAMILY_SANS),
+                                color: rgb(color).into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            for bt in &co.rows {
+                                let runs: Vec<TextRun> = bt
+                                    .runs
+                                    .iter()
+                                    .map(|&(len, color)| note_run(len, color))
+                                    .collect();
+                                let line = window.text_system().shape_line(
+                                    bt.text.clone().into(),
+                                    px(FONT_PX as f32),
+                                    &runs,
+                                    None,
+                                );
+                                let _ = line.paint(
+                                    point(origin.x + px(bt.x), origin.y + px(bt.y)),
+                                    px(FONT_PX as f32 * 1.3),
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    _cx,
+                                );
+                            }
+                        }
                         // Pass 4: focused-leaf doc panel (floats to the right).
                         // Skipped in call-graph mode.
                         if let Some(dp) = frame.doc_panel.as_ref().filter(|_| !frame.cg_scrim) {
@@ -5635,6 +7246,8 @@ impl Render for TreemapView {
             )
             .children(toolbar_overlay)
             .children(tab_bar_overlay)
+            .children(tour_overlay)
+            .children(composer_overlay)
             .children(panels_overlay)
             .children(cmd_palette_overlay)
             .children(settings_overlay)
@@ -5670,7 +7283,7 @@ mod tests {
             ordinal: 0,
         };
         PackLayout {
-            rects: BTreeMap::from([(
+            rects: std::collections::HashMap::from([(
                 id,
                 Rect {
                     x,
@@ -6644,7 +8257,7 @@ mod tests {
         let mid = named(SymbolKind::Folder, "r/m", "mid", vec![anon]);
         let mid_id = mid.id.clone();
         let root = named(SymbolKind::Folder, "r", "root", vec![mid]);
-        let mut rects = BTreeMap::new();
+        let mut rects = std::collections::HashMap::new();
         rects.insert(
             root.id.clone(),
             Rect {
@@ -6783,6 +8396,49 @@ mod tests {
     #[test]
     fn wrap_doc_returns_nothing_when_no_room() {
         assert!(wrap_doc("anything", 13.0, 12.0).is_empty());
+    }
+
+    #[test]
+    fn format_note_rows_lists_and_code_spans() {
+        use crate::paint_model::format_note_rows;
+        let text = "Intro line.\n\n- first item\n- second `code` item\n\nOutro.";
+        let rows = format_note_rows(text, 400.0, 12.0, 0xffffff);
+        let texts: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Intro line.",
+                "",
+                "- first item",
+                "- second code item",
+                "",
+                "Outro."
+            ]
+        );
+        // The `code` span is recolored and the backticks are gone.
+        let (_, runs) = &rows[3];
+        assert!(runs.iter().any(|(_, c)| *c == crate::theme::CODE_SPAN));
+        assert_eq!(runs.iter().map(|(l, _)| l).sum::<usize>(), rows[3].0.len());
+    }
+
+    #[test]
+    fn format_note_rows_hanging_indent_on_wrapped_items() {
+        use crate::paint_model::format_note_rows;
+        let text = "1. a numbered item whose text is long enough to wrap onto more rows";
+        let rows = format_note_rows(text, 200.0, 12.0, 0xffffff);
+        assert!(rows.len() >= 2);
+        assert!(rows[0].0.starts_with("1. "));
+        assert!(rows[1].0.starts_with("   "), "continuation is indented: {:?}", rows[1].0);
+    }
+
+    #[test]
+    fn md_paragraphs_splits_items_and_strips_backticks() {
+        use crate::view::tour_panel::md_paragraphs;
+        let body = "First para\ncontinues.\n\n- item `one`\n- item two\n\nLast.";
+        assert_eq!(
+            md_paragraphs(body),
+            vec!["First para continues.", "- item one", "- item two", "Last."]
+        );
     }
 
     #[test]

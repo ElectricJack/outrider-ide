@@ -442,11 +442,12 @@ pub fn parse_c_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(
+    Ok(collect_items_with_doc(
         tree.root_node(),
         source,
         &kind_fn,
         &c_item_name,
+        Some(&c_line_comment_doc),
     ))
 }
 
@@ -530,11 +531,12 @@ pub fn parse_cpp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(
+    Ok(collect_items_with_doc(
         tree.root_node(),
         source,
         &kind_fn,
         &cpp_item_name,
+        Some(&c_line_comment_doc),
     ))
 }
 
@@ -657,11 +659,12 @@ pub fn parse_ts_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let tree = parser
         .parse(source, None)
         .context("tree-sitter parse failed")?;
-    Ok(collect_items(
+    Ok(collect_items_with_doc(
         tree.root_node(),
         source,
         &ts_kind_fn,
         &js_item_name,
+        Some(&c_line_comment_doc),
     ))
 }
 
@@ -674,11 +677,12 @@ pub fn parse_tsx_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let tree = parser
         .parse(source, None)
         .context("tree-sitter parse failed")?;
-    Ok(collect_items(
+    Ok(collect_items_with_doc(
         tree.root_node(),
         source,
         &ts_kind_fn,
         &js_item_name,
+        Some(&c_line_comment_doc),
     ))
 }
 
@@ -691,11 +695,12 @@ pub fn parse_js_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
     let tree = parser
         .parse(source, None)
         .context("tree-sitter parse failed")?;
-    Ok(collect_items(
+    Ok(collect_items_with_doc(
         tree.root_node(),
         source,
         &js_kind_fn,
         &js_item_name,
+        Some(&c_line_comment_doc),
     ))
 }
 
@@ -719,11 +724,12 @@ pub fn parse_csharp_items(source: &[u8]) -> anyhow::Result<Vec<RawItem>> {
             _ => None,
         }
     };
-    Ok(collect_items(
+    Ok(collect_items_with_doc(
         tree.root_node(),
         source,
         &kind_fn,
         &item_name_default,
+        Some(&c_line_comment_doc),
     ))
 }
 
@@ -792,7 +798,8 @@ fn collect_shader_items(node: Node, src: &[u8], language: ShaderLanguage) -> Vec
                     },
                     name,
                     signature: item_signature(child, src),
-                    doc: item_doc(src, child.byte_range().start),
+                    doc: item_doc(src, child.byte_range().start)
+                        .or_else(|| c_line_doc_above(src, child.byte_range().start)),
                     byte_range: child.byte_range(),
                     line_count: (child.end_position().row - child.start_position().row + 1) as u64,
                     visibility: None,
@@ -894,7 +901,7 @@ fn scan_hlsl_cbuffers(src: &[u8]) -> Vec<RawItem> {
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" "),
-                doc: item_doc(src, start),
+                doc: item_doc(src, start).or_else(|| c_line_doc_above(src, start)),
                 byte_range: range,
                 line_count: text[start..end].lines().count() as u64,
                 visibility: None,
@@ -1024,6 +1031,100 @@ fn item_doc(src: &[u8], item_start: usize) -> Option<String> {
     } else {
         collected.reverse();
         Some(collected.join("\n"))
+    }
+}
+
+/// True for a comment line that is pure decoration — a banner rule such as
+/// `// ------` or `// ****` — after the `//` marker is stripped.
+fn is_comment_decoration(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty() && t.chars().all(|c| "-=*~_#+/<>".contains(c))
+}
+
+/// Fallback doc extractor for C-family languages, where the convention is a
+/// plain `//` comment block directly above the item (no `///` marker).
+/// Decoration lines (banner rules) are dropped; otherwise the same shape as
+/// `item_doc`: scan backwards, allow blank lines only between the block and
+/// the item, join top-down.
+fn c_line_comment_doc(node: Node, src: &[u8]) -> Option<String> {
+    c_line_doc_above(src, node.byte_range().start)
+}
+
+fn c_line_doc_above(src: &[u8], item_start: usize) -> Option<String> {
+    let mut collected: Vec<String> = Vec::new();
+    let mut end = item_start;
+    loop {
+        let start = src[..end]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |p| p + 1);
+        let line = String::from_utf8_lossy(&src[start..end]);
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("//") {
+            // Also absorbs `///`+ markers so mixed styles read as one block.
+            let rest = rest.trim_start_matches('/');
+            let text = rest.strip_prefix(' ').unwrap_or(rest);
+            if !is_comment_decoration(text) {
+                collected.push(text.to_string());
+            }
+        } else {
+            let gap = t.is_empty();
+            if !collected.is_empty() || !gap {
+                break;
+            }
+        }
+        if start == 0 {
+            break;
+        }
+        end = start - 1;
+    }
+    while collected.first().is_some_and(|l| l.trim().is_empty()) {
+        collected.remove(0);
+    }
+    while collected.last().is_some_and(|l| l.trim().is_empty()) {
+        collected.pop();
+    }
+    if collected.is_empty() {
+        None
+    } else {
+        collected.reverse();
+        Some(collected.join("\n"))
+    }
+}
+
+/// Leading `//` block of a C-family file: the file's banner comment. Blank
+/// lines before the block are skipped, decoration rules inside it dropped,
+/// and the block ends at the first non-comment line. None when the file
+/// doesn't open with a comment.
+pub fn c_file_doc(source: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(source);
+    let mut lines: Vec<String> = Vec::new();
+    let mut started = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if !started && t.is_empty() {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("//") else {
+            break;
+        };
+        started = true;
+        let rest = rest.trim_start_matches('/');
+        let s = rest.strip_prefix(' ').unwrap_or(rest);
+        if !is_comment_decoration(s) {
+            lines.push(s.to_string());
+        }
+    }
+    while lines.first().is_some_and(|l| l.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
     }
 }
 
@@ -1337,6 +1438,33 @@ struct Point {
         let items = parse_rust_items(src).unwrap();
         assert_eq!(items[0].signature, "fn multi( a: i32, b: i32, ) -> i32");
         assert_eq!(items[1].signature, "struct Unit");
+    }
+
+    #[test]
+    fn cpp_plain_comment_blocks_attach_as_docs() {
+        let src = b"// Normalize raw bytes to the canonical format\n// so lookups match host keys.\nstatic int normalize(int x) { return x; }\n\nint bare(void) { return 0; }\n\n// ---------------------------------------\n// Banner-wrapped: the one route back.\n// ---------------------------------------\nstruct DslState { int x; };\n";
+        let items = parse_cpp_items(src).unwrap();
+        assert_eq!(
+            items[0].doc.as_deref(),
+            Some("Normalize raw bytes to the canonical format\nso lookups match host keys.")
+        );
+        assert_eq!(items[1].doc, None);
+        assert_eq!(
+            items[2].doc.as_deref(),
+            Some("Banner-wrapped: the one route back.")
+        );
+    }
+
+    #[test]
+    fn cpp_file_banner_becomes_file_doc() {
+        use super::c_file_doc;
+        let src = b"// ---------------------------------------\n// src/dsl_bindings.cpp\n//\n// The QuickJS bridge. Every native global\n// is registered here.\n// ---------------------------------------\n#include \"dsl.h\"\n";
+        assert_eq!(
+            c_file_doc(src).as_deref(),
+            Some("src/dsl_bindings.cpp\n\nThe QuickJS bridge. Every native global\nis registered here.")
+        );
+        assert_eq!(c_file_doc(b"#include \"x.h\"\n// later comment\n"), None);
+        assert_eq!(c_file_doc(b"// ----\n// ----\nint x;\n"), None);
     }
 
     #[test]

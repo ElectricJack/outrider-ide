@@ -72,6 +72,19 @@ pub struct SpaceSpec {
     /// Omitted = show all members. `{"show": []}` hides members entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub members: Option<MembersSpec>,
+    /// Graph space only: layout flow. `tb` (default) stacks layers top to
+    /// bottom with parents above; `lr` flows left to right with
+    /// parents/roots on the left — natural for pipelines.
+    #[serde(default)]
+    pub direction: GraphDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphDirection {
+    #[default]
+    Tb,
+    Lr,
 }
 
 /// Member filter for graph-space node boxes.
@@ -85,6 +98,10 @@ pub struct MembersSpec {
     /// Member kind labels to include (e.g. "fn", "field"). None = all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<String>>,
+    /// Cap on member rows per box; extras collapse into a "+n more" row.
+    /// Default 24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -108,6 +125,7 @@ impl Default for SpaceSpec {
             exclude: None,
             pack: None,
             members: None,
+            direction: GraphDirection::default(),
         }
     }
 }
@@ -674,6 +692,26 @@ pub struct Step {
     pub push: Vec<LayerSpec>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub pop: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Switch to another view tab for this step (by `meta.title` or file
+    /// stem). The tour keeps playing from the originating view; layer
+    /// push/pop accumulate only within a run of steps on the same tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<String>,
+    /// Sub-steps: finer-grained stops within this step (each its own camera
+    /// target + note). They inherit the step's tab and layer stack. → / ←
+    /// walk through parts before moving to the next/previous step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<StepPart>,
+}
+
+/// A sub-step inside a `Step`: a camera target and a note, nothing else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepPart {
+    #[serde(flatten)]
+    pub target: StepTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }

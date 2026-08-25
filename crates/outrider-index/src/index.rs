@@ -351,6 +351,16 @@ fn materialize_file(
                     Some(SourceLanguage::Python) => {
                         parsed.doc = crate::parse::python_file_doc(&bytes)
                     }
+                    Some(
+                        SourceLanguage::C
+                        | SourceLanguage::Cpp
+                        | SourceLanguage::JavaScript
+                        | SourceLanguage::TypeScript
+                        | SourceLanguage::Tsx
+                        | SourceLanguage::CSharp
+                        | SourceLanguage::Glsl
+                        | SourceLanguage::Hlsl,
+                    ) => parsed.doc = crate::parse::c_file_doc(&bytes),
                     _ => {}
                 }
                 if let Some(p) = progress {

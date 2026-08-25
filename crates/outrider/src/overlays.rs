@@ -13,6 +13,7 @@ pub(crate) struct ContextMenu {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NotificationLevel {
     Warning,
+    Info,
 }
 
 /// User-visible recoverable feedback.
@@ -27,6 +28,13 @@ impl Notification {
         Self {
             message: message.into(),
             level: NotificationLevel::Warning,
+        }
+    }
+
+    pub(crate) fn info(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            level: NotificationLevel::Info,
         }
     }
 }
@@ -58,6 +66,10 @@ impl Notifications {
 /// Build the visual shell for the currently visible notification. Event
 /// handling remains at the `TreemapView` composition boundary.
 pub(crate) fn notification_element(notification: &Notification) -> gpui::Stateful<gpui::Div> {
+    let (bg, border) = match notification.level {
+        NotificationLevel::Warning => (0x3a2020_u32, 0xff8a80_u32),
+        NotificationLevel::Info => (0x1f2a38_u32, 0x6aa1e0_u32),
+    };
     div()
         .id("notification")
         .absolute()
@@ -66,9 +78,9 @@ pub(crate) fn notification_element(notification: &Notification) -> gpui::Statefu
         .right(px(12.0))
         .px(px(12.0))
         .py(px(8.0))
-        .bg(rgb(0x3a2020_u32))
+        .bg(rgb(bg))
         .border_1()
-        .border_color(rgb(0xff8a80_u32))
+        .border_color(rgb(border))
         .rounded(px(4.0))
         .text_size(px(12.0))
         .font_family(theme::FONT_FAMILY_SANS)

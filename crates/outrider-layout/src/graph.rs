@@ -37,6 +37,9 @@ pub struct GraphConfig {
     pub cluster_gap: f64,
     /// Margin around the whole graph inside the root rect.
     pub margin: f64,
+    /// Flow left-to-right (layers become columns, roots on the left)
+    /// instead of top-to-bottom.
+    pub left_to_right: bool,
 }
 
 impl Default for GraphConfig {
@@ -50,6 +53,7 @@ impl Default for GraphConfig {
             v_gap: 96.0,
             cluster_gap: 120.0,
             margin: 64.0,
+            left_to_right: false,
         }
     }
 }
@@ -87,15 +91,19 @@ pub fn layout_graph(nodes: &[GraphNode], edges: &[(usize, usize)], cfg: &GraphCo
         };
     }
 
-    // Adjacency: parents[i] = nodes i points at (its "to" ends).
+    // Adjacency. Top-to-bottom: `to` is the parent (placed above) — the
+    // inheritance convention, arrows pointing up at the base. Left-to-right:
+    // `from` is the root (placed left) — the data-flow convention, arrows
+    // pointing right along the pipeline.
     let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     for &(from, to) in edges {
         if from >= n || to >= n || from == to {
             continue;
         }
-        parents[from].push(to);
-        children[to].push(from);
+        let (child, parent) = if cfg.left_to_right { (to, from) } else { (from, to) };
+        parents[child].push(parent);
+        children[parent].push(child);
     }
 
     // Connected components (undirected), BFS.
@@ -291,37 +299,71 @@ fn layout_component(
         }
     }
 
-    // Coordinates: rows stacked top to bottom, each row centered on the
-    // widest row, then shifted so the cluster's min x is 0.
-    let row_w = |row: &[usize]| -> f64 {
-        row.iter().map(|&i| node_w(i)).sum::<f64>() + cfg.h_gap * row.len().saturating_sub(1) as f64
-    };
-    let cluster_w = rows.iter().map(|r| row_w(r)).fold(0.0, f64::max);
     let mut placed: BTreeMap<usize, Rect> = BTreeMap::new();
-    let mut y = 0.0;
-    for row in &rows {
-        if row.is_empty() {
-            continue;
+    let (cluster_w, cluster_h) = if cfg.left_to_right {
+        // Layers become columns left to right (roots on the left); each
+        // column's boxes stack vertically, centred on the tallest column.
+        let col_h = |col: &[usize]| -> f64 {
+            col.iter().map(|&i| node_h(i)).sum::<f64>()
+                + cfg.h_gap * col.len().saturating_sub(1) as f64
+        };
+        let cluster_h = rows.iter().map(|c| col_h(c)).fold(0.0, f64::max);
+        let mut x = 0.0;
+        for col in &rows {
+            if col.is_empty() {
+                continue;
+            }
+            let ch = col_h(col);
+            let cw = col.iter().map(|&i| node_w(i)).fold(0.0, f64::max);
+            let mut y = (cluster_h - ch) / 2.0;
+            for &i in col {
+                let h = node_h(i);
+                placed.insert(
+                    i,
+                    Rect {
+                        x,
+                        y,
+                        w: node_w(i),
+                        h,
+                    },
+                );
+                y += h + cfg.h_gap;
+            }
+            x += cw + cfg.v_gap;
         }
-        let rw = row_w(row);
-        let rh = row.iter().map(|&i| node_h(i)).fold(0.0, f64::max);
-        let mut x = (cluster_w - rw) / 2.0;
-        for &i in row {
-            let w = node_w(i);
-            placed.insert(
-                i,
-                Rect {
-                    x,
-                    y,
-                    w,
-                    h: node_h(i),
-                },
-            );
-            x += w + cfg.h_gap;
+        (x - cfg.v_gap, cluster_h)
+    } else {
+        // Rows stacked top to bottom, each row centred on the widest row.
+        let row_w = |row: &[usize]| -> f64 {
+            row.iter().map(|&i| node_w(i)).sum::<f64>()
+                + cfg.h_gap * row.len().saturating_sub(1) as f64
+        };
+        let cluster_w = rows.iter().map(|r| row_w(r)).fold(0.0, f64::max);
+        let mut y = 0.0;
+        for row in &rows {
+            if row.is_empty() {
+                continue;
+            }
+            let rw = row_w(row);
+            let rh = row.iter().map(|&i| node_h(i)).fold(0.0, f64::max);
+            let mut x = (cluster_w - rw) / 2.0;
+            for &i in row {
+                let w = node_w(i);
+                placed.insert(
+                    i,
+                    Rect {
+                        x,
+                        y,
+                        w,
+                        h: node_h(i),
+                    },
+                );
+                x += w + cfg.h_gap;
+            }
+            y += rh + cfg.v_gap;
         }
-        y += rh + cfg.v_gap;
-    }
-    let cluster_h = y - cfg.v_gap;
+        (cluster_w, y - cfg.v_gap)
+    };
 
     let rects: Vec<Rect> = members.iter().map(|i| placed[i]).collect();
     Cluster {
@@ -447,6 +489,21 @@ mod tests {
                 assert!(!overlaps(&g.rects[i], &g.rects[j]), "{i} overlaps {j}");
             }
         }
+    }
+
+    #[test]
+    fn left_to_right_flows_from_source_to_sink() {
+        // Data flow 0 -> 1 -> 2 and 1 -> 3: in LR mode the source (0) is
+        // leftmost, sinks rightmost, and same-column boxes do not overlap.
+        let cfg = GraphConfig {
+            left_to_right: true,
+            ..GraphConfig::default()
+        };
+        let g = layout_graph(&nodes(&[5, 5, 5, 5]), &[(0, 1), (1, 2), (1, 3)], &cfg);
+        assert!(g.rects[0].x < g.rects[1].x);
+        assert!(g.rects[1].x < g.rects[2].x);
+        assert!((g.rects[2].x - g.rects[3].x).abs() < 1e-9);
+        assert!(!overlaps(&g.rects[2], &g.rects[3]));
     }
 
     #[test]

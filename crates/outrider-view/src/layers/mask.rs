@@ -14,47 +14,63 @@ use crate::set::ResolvedSet;
 use crate::spec::{MaskSpec, SetRef};
 
 /// The resolved result of one or more (AND-combined) mask layers.
-#[derive(Debug, Clone, Default)]
+///
+/// Stored as a baseline light plus per-symbol exceptions. A `dimExcept`
+/// mask dims almost the whole tree, so storing the dimmed nodes would
+/// clone tens of thousands of ids per resolve; storing the (few) lit
+/// exceptions against a dimmed baseline keeps resolution proportional to
+/// the spotlit set instead of the tree.
+#[derive(Debug, Clone)]
 pub struct MaskTable {
-    /// Per-symbol light value in `0..=1`. Only nodes with `light < 1.0` are
-    /// present; an absent node is fully lit (`1.0`).
+    /// Per-symbol light values in `0..=1` that differ from the baseline.
     light: HashMap<SymbolId, f32>,
+    /// Light for every symbol not listed in `light`.
+    default_light: f32,
     pub deps: Deps,
     /// Whether any mask layer is present (even if it dims nothing, e.g.
     /// `strength: 0`).
     pub active: bool,
 }
 
+impl Default for MaskTable {
+    fn default() -> Self {
+        MaskTable {
+            light: HashMap::new(),
+            default_light: 1.0,
+            deps: Deps::NONE,
+            active: false,
+        }
+    }
+}
+
 impl MaskTable {
-    /// The light value for a symbol: `1.0` (fully lit) unless dimmed.
+    /// The light value for a symbol: the baseline unless listed.
     #[inline]
     pub fn light(&self, id: &SymbolId) -> f32 {
-        self.light.get(id).copied().unwrap_or(1.0)
+        self.light.get(id).copied().unwrap_or(self.default_light)
     }
 
     /// True when this table dims nothing at all.
     pub fn is_noop(&self) -> bool {
-        self.light.is_empty()
-    }
-
-    /// Number of symbols with a light value below 1.0.
-    pub fn dimmed_count(&self) -> usize {
-        self.light.len()
+        self.light.is_empty() && self.default_light >= 1.0
     }
 
     /// Combine two mask tables by ANDing their light values
-    /// (`final_light = light1 * light2`). A node absent from both stays lit.
+    /// (`final_light = light1 * light2`). A node absent from both gets the
+    /// product of the baselines.
     pub fn and(&self, other: &MaskTable) -> MaskTable {
-        let mut light: HashMap<SymbolId, f32> = self.light.clone();
-        for (id, &v) in &other.light {
-            let entry = light.entry(id.clone()).or_insert(1.0);
-            *entry *= v;
+        let default_light = self.default_light * other.default_light;
+        let mut light: HashMap<SymbolId, f32> =
+            HashMap::with_capacity(self.light.len() + other.light.len());
+        for id in self.light.keys().chain(other.light.keys()) {
+            let v = self.light(id) * other.light(id);
+            if v != default_light {
+                light.insert(id.clone(), v);
+            }
         }
-        // A product landing back at (or above, from fp error) 1.0 should not
-        // be treated as "dimmed".
-        light.retain(|_, v| *v < 1.0);
         MaskTable {
             light,
+            default_light,
             deps: self.deps.union(other.deps),
             active: self.active || other.active,
         }
@@ -72,6 +88,7 @@ fn walk(
     set: &HashSet<SymbolId>,
     dim_except: bool,
     strength: f32,
+    default_light: f32,
     out: &mut HashMap<SymbolId, f32>,
 ) -> f32 {
     let member = inherited || set.contains(&node.id);
@@ -83,7 +100,15 @@ fn walk(
 
     let mut desc_max = 0.0f32;
     for c in &node.children {
-        desc_max = desc_max.max(walk(c, member, set, dim_except, strength, out));
+        desc_max = desc_max.max(walk(
+            c,
+            member,
+            set,
+            dim_except,
+            strength,
+            default_light,
+            out,
+        ));
     }
 
     let g = if node.children.is_empty() {
@@ -92,7 +117,8 @@ fn walk(
         f.max(0.5 * desc_max)
     };
 
-    if g < 1.0 {
+    // Only exceptions to the baseline are stored (see `MaskTable`).
+    if g != default_light {
         out.insert(node.id.clone(), g);
     }
 
@@ -153,11 +179,31 @@ pub fn resolve_mask(
         0.0
     };
 
+    // Baseline: whichever value covers more of the tree, so the exception
+    // map stays small. `dim` always lists the dimmed set. `dimExcept`
+    // usually dims the world and lists the lit spotlight — but when the
+    // spotlight itself is most of the tree (e.g. "everything but the
+    // attic"), a lit baseline listing the dimmed remainder is far smaller.
+    let spotlight_is_majority = resolved_set.ids.len() > 8192;
+    let default_light = if dim_except && !spotlight_is_majority {
+        1.0 - strength
+    } else {
+        1.0
+    };
     let mut light = HashMap::new();
-    walk(&tree.root, false, &resolved_set.ids, dim_except, strength, &mut light);
+    walk(
+        &tree.root,
+        false,
+        &resolved_set.ids,
+        dim_except,
+        strength,
+        default_light,
+        &mut light,
+    );
 
     MaskTable {
         light,
+        default_light,
         deps: resolved_set.deps,
         active: true,
     }
@@ -342,7 +388,7 @@ mod tests {
         for id in [&root_id, &a_id, &foo_id, &b_id] {
             assert!((table.light(id) - 0.2).abs() < 1e-6, "{id:?}");
         }
-        assert_eq!(table.dimmed_count(), 4);
+        assert!(!table.is_noop());
     }
 
     #[test]

@@ -41,6 +41,8 @@ pub const CODE_BG: u32 = 0x101014;
 /// from the window background.
 pub const DIM: u32 = 0x0c0c0e;
 pub const NARRATION_TEXT: u32 = 0xe8dcc0;
+/// Inline `code` spans inside notes, docs, and narration text.
+pub const CODE_SPAN: u32 = 0x9ecf7a;
 pub const NARRATION_BG: u32 = 0x1c1b1e;
 pub const NARRATION_BORDER: u32 = 0x5a5560;
 pub const NARRATION_MARK: &str = "✎ ";

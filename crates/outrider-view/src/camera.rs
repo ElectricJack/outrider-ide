@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn empty_iterator_returns_none() {
         let layout = PackLayout {
-            rects: BTreeMap::new(),
+            rects: std::collections::HashMap::new(),
         };
         assert!(union_rect(std::iter::empty(), &layout).is_none());
     }
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn missing_ids_returns_none() {
         let layout = PackLayout {
-            rects: BTreeMap::new(),
+            rects: std::collections::HashMap::new(),
         };
         let ids = vec![sid("a.rs")];
         assert!(union_rect(ids.iter(), &layout).is_none());
@@ -107,7 +107,7 @@ mod tests {
             w: 100.0,
             h: 50.0,
         };
-        let mut rects = BTreeMap::new();
+        let mut rects = std::collections::HashMap::new();
         rects.insert(a.clone(), r);
         let layout = PackLayout { rects };
         let u = union_rect([&a], &layout).unwrap();
@@ -121,7 +121,7 @@ mod tests {
     fn two_ids_returns_envelope() {
         let a = sid("a.rs");
         let b = sid("b.rs");
-        let mut rects = BTreeMap::new();
+        let mut rects = std::collections::HashMap::new();
         rects.insert(
             a.clone(),
             Rect {
@@ -152,7 +152,7 @@ mod tests {
     fn skips_ids_without_rects() {
         let a = sid("a.rs");
         let b = sid("b.rs");
-        let mut rects = BTreeMap::new();
+        let mut rects = std::collections::HashMap::new();
         rects.insert(
             a.clone(),
             Rect {
@@ -190,6 +190,8 @@ mod tests {
             push,
             pop,
             note: None,
+            tab: None,
+            parts: Vec::new(),
         }
     }
 

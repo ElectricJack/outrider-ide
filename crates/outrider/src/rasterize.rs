@@ -1025,7 +1025,21 @@ impl TextureCache {
     /// Start a new visibility pass. Queued work remains available, but its
     /// old screen-area scores no longer outrank nodes in the current view.
     pub fn begin_visibility_frame(&mut self) {
+        // Requests that were already at zero priority were not re-requested
+        // by the previous frame's visible set: they scrolled away. Drop them
+        // so the queue tracks what's on screen and `has_queued()` can go
+        // false when the view is fully baked. (A node that comes back into
+        // view simply re-queues via `get`.)
+        self.queue.retain(|_, priority| *priority > 0.0);
         self.queue.values_mut().for_each(|priority| *priority = 0.0);
+        // Same pruning for disk waiters: an entry still at zero priority
+        // scrolled away without being re-requested. Keep it only while a
+        // load is actually in flight — otherwise it pins `has_queued()`
+        // true and the frame loop never goes idle. A node that comes back
+        // into view re-enters via `get`.
+        let inflight = &self.disk_inflight;
+        self.waiting_disk
+            .retain(|id, priority| *priority > 0.0 || inflight.contains(id));
         self.waiting_disk
             .values_mut()
             .for_each(|priority| *priority = 0.0);
@@ -1142,29 +1156,72 @@ impl TextureCache {
         self.apply_disk_results();
         self.dispatch_clear_request();
         self.dispatch_disk_loads();
-        let mut queue: Vec<_> = std::mem::take(&mut self.queue).into_iter().collect();
-        queue.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut selected = Vec::with_capacity(BAKES_PER_FRAME);
-        while selected.len() < BAKES_PER_FRAME && !queue.is_empty() {
-            let first = queue.remove(0);
+        if self.queue.is_empty() {
+            return self.has_queued();
+        }
+        // Pick the highest-priority request, then fill the batch with the
+        // best visible (priority > 0) mates from the same source group, then
+        // the next-best overall. Each pick is one linear scan (k is tiny), so
+        // a queue of thousands costs O(k·n) instead of a full sort per frame.
+        let mut selected: Vec<(SymbolId, f64)> = Vec::with_capacity(BAKES_PER_FRAME);
+        let pop_max = |queue: &mut HashMap<SymbolId, f64>,
+                       pred: &mut dyn FnMut(&SymbolId, f64) -> bool|
+         -> Option<(SymbolId, f64)> {
+            let best = queue
+                .iter()
+                .filter(|(id, p)| pred(id, **p))
+                .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(id, p)| (id.clone(), *p))?;
+            queue.remove(&best.0);
+            Some(best)
+        };
+        if let Some(first) = pop_max(&mut self.queue, &mut |_, _| true) {
             let group = group_fn(&first.0);
             selected.push(first);
-            let Some(group) = group else { continue };
+            if let Some(group) = group {
+                while selected.len() < BAKES_PER_FRAME {
+                    let Some(mate) = pop_max(&mut self.queue, &mut |id, p| {
+                        p > 0.0 && group_fn(id).as_deref() == Some(group.as_str())
+                    }) else {
+                        break;
+                    };
+                    selected.push(mate);
+                }
+            }
             while selected.len() < BAKES_PER_FRAME {
-                let Some(index) = queue.iter().position(|(id, priority)| {
-                    *priority > 0.0 && group_fn(id).as_deref() == Some(group.as_str())
-                }) else {
+                let Some(next) = pop_max(&mut self.queue, &mut |_, _| true) else {
                     break;
                 };
-                selected.push(queue.remove(index));
+                selected.push(next);
             }
         }
-        self.queue.extend(queue);
         for (id, _) in selected {
             let tex = bake_fn(&id, &mut self.raster).unwrap_or_else(NodeTexture::empty);
             self.insert(id, tex);
         }
         self.has_queued()
+    }
+
+    /// True when there is bake work to do this frame (as opposed to only
+    /// background disk bookkeeping). Callers use this to skip building
+    /// per-frame lookup structures when nothing will be rasterised.
+    pub fn has_bake_work(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Compact summary of why `has_queued()` is true (profiling aid).
+    pub fn queue_state(&self) -> String {
+        format!(
+            "q={} wd={} di={} ws={} ps={} cp={} ci={} sv={}",
+            self.queue.len(),
+            self.waiting_disk.len(),
+            self.disk_inflight.len(),
+            self.disk_worker_starting,
+            self.pending_disk_start.is_some(),
+            self.clear_disk_pending,
+            self.clear_disk_inflight,
+            self.pending_disk_saves,
+        )
     }
 
     /// Insert a texture while preserving disk and memory-cache invariants.
@@ -1382,6 +1439,10 @@ impl TextureCache {
         let mut failed = Vec::new();
         for (id, _) in candidates.into_iter().take(BAKES_PER_FRAME) {
             let Some(key) = self.disk_key(&id) else {
+                // No stable key any more (the node changed under us):
+                // this waiter can never be served from disk. Re-route it
+                // to the bake queue instead of skipping it forever.
+                failed.push(id);
                 continue;
             };
             match worker.commands.try_send(DiskCommand::Load {

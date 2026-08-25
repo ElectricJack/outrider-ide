@@ -319,6 +319,36 @@ fn run(cli: cli::Cli) -> Result<(), ExitCode> {
             }
         },
         cli::Command::Query { action } => match action {
+            cli::QueryAction::Symbols { query, kind, limit } => {
+                let mut params = json!({"query": query});
+                if let Some(k) = kind {
+                    params["kind"] = json!(k);
+                }
+                if let Some(l) = limit {
+                    params["limit"] = json!(l);
+                }
+                let result = call_or_fail(&mut client, "query.symbols", params, is_json)?;
+                if is_json {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                } else if let Some(syms) = result.get("symbols").and_then(|r| r.as_array()) {
+                    for s in syms {
+                        let id = s.get("id").and_then(|t| t.as_str()).unwrap_or("?");
+                        let sig = s
+                            .get("signature")
+                            .and_then(|t| t.as_str())
+                            .map(|t| format!("   {t}"))
+                            .unwrap_or_default();
+                        println!("{id}{sig}");
+                    }
+                    let total = result.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+                    if total as usize > syms.len() {
+                        println!("({} of {} shown; use --limit)", syms.len(), total);
+                    }
+                    if syms.is_empty() {
+                        println!("(no symbols match)");
+                    }
+                }
+            }
             cli::QueryAction::Metrics { symbol } => {
                 let result = call_or_fail(
                     &mut client,
@@ -459,6 +489,79 @@ fn run(cli: cli::Cli) -> Result<(), ExitCode> {
                 )?;
                 if !is_json {
                     println!("ok · follow mode: {mode}");
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                }
+            }
+        },
+        cli::Command::Comments { action } => match action {
+            cli::CommentsAction::List => {
+                let result = call_or_fail(&mut client, "comments.list", json!({}), is_json)?;
+                if is_json {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                } else {
+                    let comments = result
+                        .get("comments")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if comments.is_empty() {
+                        println!("no comments");
+                    } else {
+                        for c in &comments {
+                            let id = c.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let label = c
+                                .get("label")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let target = c
+                                .get("target")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("(general)");
+                            let text = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            println!("[{id}] {label} \u{2014} {target}");
+                            for line in text.lines() {
+                                println!("    {line}");
+                            }
+                        }
+                        println!(
+                            "\nuse `comments prompt` for the ready-to-paste agent prompt"
+                        );
+                    }
+                }
+            }
+            cli::CommentsAction::Prompt => {
+                let result = call_or_fail(&mut client, "comments.list", json!({}), is_json)?;
+                match result.get("prompt").and_then(|v| v.as_str()) {
+                    Some(p) => println!("{p}"),
+                    None => println!("no comments"),
+                }
+            }
+            cli::CommentsAction::Remove { id } => {
+                let result =
+                    call_or_fail(&mut client, "comments.remove", json!({"id": id}), is_json)?;
+                if !is_json {
+                    let removed = result
+                        .get("removed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    println!(
+                        "{}",
+                        if removed {
+                            format!("ok \u{00B7} removed comment {id}")
+                        } else {
+                            format!("no comment with id {id}")
+                        }
+                    );
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                }
+            }
+            cli::CommentsAction::Clear => {
+                let result = call_or_fail(&mut client, "comments.clear", json!({}), is_json)?;
+                if !is_json {
+                    let n = result.get("cleared").and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!("ok \u{00B7} cleared {n} comment(s)");
                 } else {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
                 }
