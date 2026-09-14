@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Outrider field notes</title>
+    <link>https://electricjack.github.io/outrider-ide/blog/</link>
+    <description>Field notes on reading systems, tracing change and seeing a codebase whole.</description>
+    <language>en</language>
+    <lastBuildDate>Thu, 10 Sep 2026 00:00:00 GMT</lastBuildDate>
+    <atom:link href="https://electricjack.github.io/outrider-ide/blog/rss.xml" rel="self" type="application/rss+xml"/>
+    <item>
+      <title>Reading change in context</title>
+      <link>https://electricjack.github.io/outrider-ide/blog/reading-change-in-context/</link>
+      <guid isPermaLink="true">https://electricjack.github.io/outrider-ide/blog/reading-change-in-context/</guid>
+      <description>A diff tells you what moved. A codebase view tells you what that movement can reach.</description>
+      <pubDate>Thu, 10 Sep 2026 00:00:00 GMT</pubDate>
+      <dc:creator>Outrider team</dc:creator>
+      <category>code navigation</category>
+      <category>change review</category>
+    </item>
+  </channel>
+</rss>
