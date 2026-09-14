@@ -3752,7 +3752,7 @@ dependencies = [
 
 [[package]]
 name = "outrider"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cosmic-text",
  "dirs",
@@ -3771,7 +3771,7 @@ dependencies = [
 
 [[package]]
 name = "outrider-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dirs",
@@ -3782,7 +3782,7 @@ dependencies = [
 
 [[package]]
 name = "outrider-index"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3810,14 +3810,14 @@ dependencies = [
 
 [[package]]
 name = "outrider-layout"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "outrider-index",
 ]
 
 [[package]]
 name = "outrider-view"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "globset",
  "outrider-index",
