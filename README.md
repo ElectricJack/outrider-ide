@@ -4,7 +4,13 @@
 interactive treemap where every file and every symbol is a real, readable box of
 source. Navigate it, search it, and watch what changes.
 
-![A 44,000-file C++ engine, framed whole, with an agent-authored guided tour running](docs/images/guided-tour.png)
+**Website: [electricjack.github.io/outrider-ide](https://electricjack.github.io/outrider-ide/)** ·
+[Download for Windows](https://github.com/ElectricJack/outrider-ide/releases/latest/download/outrider.exe) ·
+[All releases](https://github.com/ElectricJack/outrider-ide/releases)
+
+[![Matter Engine, a 363,000-line C++ voxel and ray-tracing engine, drawn as one map with git churn painted red](docs/images/churn-map.png)](https://electricjack.github.io/outrider-ide/)
+
+![The same engine framed whole, with an agent-authored guided tour running](docs/images/guided-tour.png)
 
 ## Why
 
