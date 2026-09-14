@@ -354,6 +354,8 @@ mod tests {
             header: 10.0,
             container_header: 14.0,
             bottom_pad: 3.0,
+            short_leaf_lines: 3,
+            short_leaf_header: 4.0,
             gap: 4.0,
             aspect: 1.6,
             max_display_lines: None,

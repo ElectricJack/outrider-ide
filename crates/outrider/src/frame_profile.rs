@@ -4,7 +4,15 @@
 //! disabled beyond one atomic load per `phase()` call.
 
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
+
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Milliseconds since the first profiled frame (wall clock, for pacing).
+fn epoch_ms() -> u128 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+}
 
 static ENABLED: AtomicU8 = AtomicU8::new(2); // 2 = unknown, 1 = on, 0 = off
 
@@ -59,7 +67,7 @@ impl FrameProfile {
         else {
             return;
         };
-        let mut line = format!("total={total}us");
+        let mut line = format!("t={} total={total}us", epoch_ms());
         for (name, us) in &self.phases {
             line.push_str(&format!(" {name}={us}"));
         }
@@ -69,6 +77,23 @@ impl FrameProfile {
         }
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// Append a diagnostic line to `%TEMP%/outrider-debug.log` when profiling
+/// is enabled. The message closure only runs when enabled.
+pub(crate) fn debug_log(msg: impl FnOnce() -> String) {
+    use std::io::Write;
+    if !enabled() {
+        return;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("outrider-debug.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(f, "t={} {}", epoch_ms(), msg());
 }
 
 /// Helper: time a phase on an optional profile.

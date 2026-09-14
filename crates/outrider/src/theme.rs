@@ -337,6 +337,24 @@ pub const NEIGHBOR_BORDER: u32 = 0xffffff80;
 
 /// Syntax palette for Full-rung code: one color per HighlightKind,
 /// legible on BG (0x1a1a1c). Default falls back to TEXT_PRIMARY.
+/// Opacity of procedural line bars: half-transparent so a wall of bars
+/// sits at the same visual weight as baked pages instead of popping.
+pub const BAR_ALPHA: f32 = 0.5;
+
+/// Tint of a procedural line bar (see `line_bars`): muted relatives of the
+/// syntax palette, so a wall of bars reads as code texture rather than as a
+/// wall of highlighted text.
+pub fn bar_color(class: crate::line_bars::LineClass) -> u32 {
+    use crate::line_bars::LineClass;
+    match class {
+        LineClass::Blank => CODE_BG,
+        LineClass::Code => 0x8e8e96,
+        LineClass::Comment => 0x4f7a45,
+        LineClass::Directive => 0x8f6a94,
+        LineClass::Punct => 0x5a5a62,
+    }
+}
+
 pub fn syntax_color(kind: HighlightKind) -> u32 {
     match kind {
         HighlightKind::Keyword => 0xc586c0,

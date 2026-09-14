@@ -492,6 +492,7 @@ mod tests {
                 ids,
                 ranges: BTreeMap::new(),
                 deps: Deps::TREE,
+                revision: 0,
             },
         );
 
@@ -551,6 +552,7 @@ mod tests {
                 ids,
                 ranges: BTreeMap::new(),
                 deps: Deps::TREE,
+                revision: 0,
             },
         );
 
@@ -595,6 +597,7 @@ mod tests {
                 ids,
                 ranges: BTreeMap::new(),
                 deps: Deps::TREE,
+                revision: 0,
             },
         );
 
@@ -660,6 +663,7 @@ mod tests {
                 ids: [src_id].into_iter().collect(),
                 ranges: BTreeMap::new(),
                 deps: Deps::TREE,
+                revision: 0,
             },
         );
 
@@ -706,6 +710,7 @@ mod tests {
                 ranges: BTreeMap::new(),
                 // Deliberately include SELECTION in the source set's deps.
                 deps: Deps::TREE.union(Deps::SELECTION),
+                revision: 0,
             },
         );
 

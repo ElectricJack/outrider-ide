@@ -154,6 +154,13 @@ pub struct ViewResolver {
     /// spec. `ResolvedView` only stores the merged mask, so reusing an
     /// individual layer across resolves needs this side table.
     mask_layers: Vec<(crate::spec::MaskSpec, crate::layers::mask::MaskTable)>,
+    /// Definition-keyed memo of resolved fill layers, kept across spec
+    /// changes so a fill a tour step pushes again is not recomputed.
+    fill_layers: Vec<(crate::spec::FillSpec, ResolvedFill)>,
+    /// A `spec_cache` snapshot owed for this spec, taken lazily by
+    /// `idle_work` rather than on the frame that changed the spec: the
+    /// deep clone of a resolution costs ~15ms on a large tree.
+    pending_snapshot: Option<ViewSpec>,
     /// Recently resolved views keyed by their full spec (MRU, bounded).
     /// Lets a switch back to a previously shown view (tab switches, tour
     /// runs across tabs) start from that view's own resolution instead of
@@ -165,6 +172,8 @@ pub struct ViewResolver {
 
 /// Cap for `ViewResolver::spec_cache` (one entry per distinct spec).
 const SPEC_CACHE_CAP: usize = 4;
+/// Distinct fill definitions remembered across spec changes.
+const FILL_MEMO_CAP: usize = 8;
 
 /// Every session-data dependency bit — what a spec-cache restore must
 /// treat as dirty, since we don't track session changes per cache entry.
@@ -208,6 +217,8 @@ impl ViewResolver {
             last_spec: None,
             last_timings: Vec::new(),
             mask_layers: Vec::new(),
+            fill_layers: Vec::new(),
+            pending_snapshot: None,
             spec_cache: Vec::new(),
         }
     }
@@ -217,6 +228,7 @@ impl ViewResolver {
         self.cached = None;
         self.last_spec = None;
         self.mask_layers.clear();
+        self.fill_layers.clear();
         self.spec_cache.clear();
     }
 
@@ -234,6 +246,7 @@ impl ViewResolver {
         let path_index = self.path_index.as_ref().unwrap();
         let mut warnings = Vec::new();
         let prof = profiling();
+        let t_start = std::time::Instant::now();
         let mut timings: Vec<(String, u128)> = Vec::new();
 
         let sctx = SetCtx {
@@ -262,6 +275,7 @@ impl ViewResolver {
         };
         if prev.is_none() {
             self.mask_layers.clear();
+            self.fill_layers.clear();
             self.spec_cache.clear();
         }
         let mut prev = prev;
@@ -350,7 +364,7 @@ impl ViewResolver {
                 None => {
                     let t0 = prof.then(std::time::Instant::now);
                     let mut stack = Vec::new();
-                    let set = resolve_set_expr(
+                    let mut set = resolve_set_expr(
                         expr,
                         &resolved_sets,
                         &ctx.session,
@@ -361,6 +375,7 @@ impl ViewResolver {
                         ctx.tree,
                         &sctx,
                     );
+                    set.stamp();
                     if let Some(t0) = t0 {
                         timings.push((format!("set:{name}"), t0.elapsed().as_micros()));
                     }
@@ -368,6 +383,9 @@ impl ViewResolver {
                 }
             };
             resolved_sets.insert(name.clone(), set);
+        }
+        if prof {
+            timings.push(("sets_phase".to_string(), t_start.elapsed().as_micros()));
         }
 
         // 2. Resolve layers
@@ -382,6 +400,7 @@ impl ViewResolver {
         let mut all_deps = Deps::NONE;
         let mut new_mask_layers: Vec<(crate::spec::MaskSpec, crate::layers::mask::MaskTable)> =
             Vec::new();
+        let mut new_fill_layers: Vec<(crate::spec::FillSpec, ResolvedFill)> = Vec::new();
 
         for (layer_idx, layer) in spec.layers.iter().enumerate() {
             let lt0 = prof.then(std::time::Instant::now);
@@ -411,6 +430,20 @@ impl ViewResolver {
                         (def_unchanged && domain_clean && !c.deps.intersects(data_dirty))
                             .then(|| c.clone())
                     });
+                    // Not in the previous resolution: a fill layer pushed
+                    // by a tour step (or another tab) may still be in the
+                    // definition-keyed memo from an earlier visit — a full
+                    // fill walks every node (~20ms on a 30k-node tree).
+                    let cached = cached.or_else(|| {
+                        (domain_clean)
+                            .then(|| {
+                                self.fill_layers.iter().find(|(s, f)| {
+                                    s == fill_spec && !f.deps.intersects(data_dirty)
+                                })
+                            })
+                            .flatten()
+                            .map(|(_, f)| f.clone())
+                    });
                     let resolved = match cached {
                         Some(c) => Some(c),
                         None => {
@@ -425,6 +458,7 @@ impl ViewResolver {
                         }
                     };
                     if let Some(resolved) = resolved {
+                        new_fill_layers.push((fill_spec.clone(), resolved.clone()));
                         all_deps = all_deps.union(resolved.deps);
                         match fill_spec.channel {
                             FillChannel::Fill => fill = Some(resolved),
@@ -561,6 +595,24 @@ impl ViewResolver {
             }
         }
 
+        if prof {
+            timings.push(("layers_phase".to_string(), t_start.elapsed().as_micros()));
+        }
+        // Keep fills from other recent specs alive (same policy as masks
+        // below): new results shadow same-definition entries.
+        {
+            let mut kept: Vec<(crate::spec::FillSpec, ResolvedFill)> = new_fill_layers;
+            for (s, f) in std::mem::take(&mut self.fill_layers) {
+                if kept.len() >= FILL_MEMO_CAP {
+                    break;
+                }
+                if !kept.iter().any(|(ks, _)| *ks == s) {
+                    kept.push((s, f));
+                }
+            }
+            self.fill_layers = kept;
+        }
+
         // Merge set deps
         for set in resolved_sets.values() {
             all_deps = all_deps.union(set.deps);
@@ -590,11 +642,22 @@ impl ViewResolver {
         if dirty.intersects(Deps::SPEC)
             && !self.spec_cache.iter().any(|(s, _)| s.sets == spec.sets)
         {
-            self.spec_cache.insert(0, (spec.clone(), resolved.clone()));
-            self.spec_cache.truncate(SPEC_CACHE_CAP);
+            // Defer the clone to an idle frame (see `idle_work`). A later
+            // resolve of the same sets is an equally valid snapshot; a
+            // resolve with different sets abandons this one.
+            self.pending_snapshot = Some(spec.clone());
+        } else if self
+            .pending_snapshot
+            .as_ref()
+            .is_some_and(|p| p.sets != spec.sets)
+        {
+            self.pending_snapshot = None;
         }
         self.cached = Some(resolved);
         self.last_spec = Some(spec.clone());
+        if prof {
+            timings.push(("resolve_total".to_string(), t_start.elapsed().as_micros()));
+        }
         self.last_timings = timings;
         // Keep mask results from other recent specs alive so a tab switch
         // back doesn't rebuild them; new results shadow same-spec entries.
@@ -612,6 +675,57 @@ impl ViewResolver {
 
     pub fn current(&self) -> Option<&ResolvedView> {
         self.cached.as_ref()
+    }
+
+    /// Deferred, bounded work for a frame in which nothing is animating:
+    /// take the owed `spec_cache` snapshot, or warm the fill memo with one
+    /// of `warm_fills` (fill definitions a tour is going to push) so the
+    /// step that pushes it doesn't pay a full-tree walk. Does at most one
+    /// unit of work per call; returns true when it did something.
+    pub fn idle_work(&mut self, ctx: &ResolveCtx, warm_fills: &[crate::spec::FillSpec]) -> bool {
+        if let Some(spec) = self.pending_snapshot.take() {
+            let Some(resolved) = self.cached.as_ref() else {
+                return false;
+            };
+            if self.spec_cache.iter().any(|(s, _)| s.sets == spec.sets) {
+                return false;
+            }
+            self.spec_cache.insert(0, (spec, resolved.clone()));
+            self.spec_cache.truncate(SPEC_CACHE_CAP);
+            return true;
+        }
+        let Some(cached) = self.cached.as_ref() else {
+            return false;
+        };
+        for fill_spec in warm_fills {
+            if self.fill_layers.iter().any(|(s, _)| s == fill_spec) {
+                continue;
+            }
+            // A domain set must already be resolved under the current spec;
+            // fills over sets this tab doesn't define wait for their tab.
+            let domain = match &fill_spec.domain {
+                Some(SetRef::Name(n)) => match cached.sets.get(n) {
+                    Some(s) => Some(s),
+                    None => continue,
+                },
+                Some(_) => continue,
+                None => None,
+            };
+            let mut warnings = Vec::new();
+            let Some(resolved) = crate::layers::fill::resolve_fill(
+                fill_spec,
+                ctx.metrics,
+                ctx.tree,
+                domain,
+                &mut warnings,
+            ) else {
+                continue;
+            };
+            self.fill_layers.insert(0, (fill_spec.clone(), resolved));
+            self.fill_layers.truncate(FILL_MEMO_CAP);
+            return true;
+        }
+        false
     }
 
     pub fn needs_git(&self) -> bool {

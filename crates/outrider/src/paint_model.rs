@@ -40,6 +40,83 @@ pub(crate) struct TexQuad {
     pub(crate) image: Arc<RenderImage>,
 }
 
+/// Procedural line bars for a leaf whose code is not shown as text or as a
+/// resident texture: the geometry of its line area (unclipped screen px)
+/// plus the cached row silhouettes. `rows` is `None` until the file has
+/// been scanned; uniform bars stand in for that frame.
+pub(crate) struct BarStrip {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    /// Vertical distance between consecutive source lines at this scale.
+    pub(crate) pitch: f32,
+    /// Horizontal advance per source column at this scale.
+    pub(crate) char_w: f32,
+    pub(crate) rows: Option<crate::line_bars::Profile>,
+    pub(crate) n_lines: u32,
+}
+
+/// Cap on bar quads per frame: past it, remaining strips fall back to the
+/// box fill. ~40k quads is well under a millisecond of CPU inside a paint
+/// layer and keeps the GPU instance count bounded at whole-repo zoom.
+pub(crate) const MAX_BAR_QUADS: usize = 40_000;
+
+impl BarStrip {
+    /// Drawn bars: source lines are grouped so no bar is denser than one
+    /// per two pixel rows (a bar row and a gap row).
+    pub(crate) fn lines_per_bar(&self) -> usize {
+        if self.pitch >= 2.0 {
+            1
+        } else {
+            (2.0 / self.pitch.max(0.01)).ceil() as usize
+        }
+    }
+
+    pub(crate) fn bar_step(&self) -> f32 {
+        self.pitch * self.lines_per_bar() as f32
+    }
+
+    pub(crate) fn bar_h(&self) -> f32 {
+        if self.pitch >= 2.0 {
+            (self.pitch * 0.6).clamp(1.0, 10.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Number of bars that intersect the vertical band `[y0, y1)`.
+    pub(crate) fn bars_in_band(&self, y0: f32, y1: f32) -> usize {
+        let step = self.bar_step();
+        if step <= 0.0 || self.n_lines == 0 {
+            return 0;
+        }
+        let n_bars = (self.n_lines as usize).div_ceil(self.lines_per_bar());
+        let first = ((y0 - self.y) / step).floor().max(0.0) as usize;
+        let last = (((y1 - self.y) / step).ceil().max(0.0) as usize).min(n_bars);
+        last.saturating_sub(first)
+    }
+
+    /// Silhouette of bar `b`: (indent, len, class) — the longest non-blank
+    /// line of the group, or `None` when every line in it is blank.
+    pub(crate) fn bar_silhouette(
+        &self,
+        b: usize,
+    ) -> Option<(u8, u8, crate::line_bars::LineClass)> {
+        let lpb = self.lines_per_bar();
+        let Some(rows) = &self.rows else {
+            // Unknown yet: a plain, uniform bar (real rows land next frame).
+            return Some((1, 28, crate::line_bars::LineClass::Code));
+        };
+        let start = b * lpb;
+        let end = (start + lpb).min(rows.len());
+        rows.get(start..end)?
+            .iter()
+            .filter(|r| r.class != crate::line_bars::LineClass::Blank)
+            .max_by_key(|r| r.len)
+            .map(|r| (r.indent, r.len, r.class))
+    }
+}
+
 pub(crate) struct DocPanel {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -80,6 +157,8 @@ pub(crate) struct PaintItem {
     pub(crate) name: Option<NameRow>,
     pub(crate) body: Vec<BodyText>,
     pub(crate) tex: Option<TexQuad>,
+    /// Line bars for a leaf with no text rows and no resident texture.
+    pub(crate) bars: Option<BarStrip>,
     /// Structural/agent mark: draw an accent ring and, if present, a small
     /// corner badge with this text (custom mark label, or the kind name).
     pub(crate) badge: Option<MarkBadge>,

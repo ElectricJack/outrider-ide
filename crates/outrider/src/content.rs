@@ -23,10 +23,51 @@ pub const MIN_TEXT_FONT_PX: f64 = 4.0;
 
 pub use outrider_index::is_leaf_item;
 
+/// Item leaves with at most this many source lines paint no name row: the
+/// declaration already contains the identifier (plus its type, initializer
+/// and trailing comment), so the header would only duplicate the less
+/// informative half. Reclaiming it roughly doubles the pixels the code
+/// line gets, so it clears `MIN_TEXT_FONT_PX` at a much wider zoom.
+pub const SHORT_LEAF_LINES: u64 = 3;
+/// Top padding above the first code row of a header-less short leaf.
+pub const SHORT_LEAF_TOP_PAD: f64 = 4.0;
+
+/// Whether a leaf paints a pinned name row above its code.
+pub fn leaf_has_header(node: &SymbolNode) -> bool {
+    !outrider_layout::is_short_leaf(node, SHORT_LEAF_LINES)
+}
+
+/// Height of the band above a leaf's first code row at natural size.
+pub fn leaf_header_px(node: &SymbolNode) -> f64 {
+    if leaf_has_header(node) {
+        HEADER
+    } else {
+        SHORT_LEAF_TOP_PAD
+    }
+}
+
+/// Screen offset (relative to the leaf's unclipped top) of its first code
+/// row at `scale`. A name row never shrinks below its natural height (it
+/// is painted at the fixed UI font); a short leaf's pad scales with the
+/// page so the code stays anchored to the box.
+pub fn leaf_content_y0(node: &SymbolNode, scale: f64) -> f64 {
+    if leaf_has_header(node) {
+        HEADER.max(HEADER * scale)
+    } else {
+        SHORT_LEAF_TOP_PAD * scale
+    }
+}
+
 /// Natural pixel height of a leaf item's box: header + signature row +
-/// one row per code line + bottom pad.
+/// one row per code line + bottom pad — or, for a short leaf, pad + one
+/// row per code line + bottom pad. Must agree with the layout's
+/// `leaf_natural_h` under `world::pack_config` (tested in `world`).
 pub fn natural_px(node: &SymbolNode) -> f64 {
-    HEADER + (1.0 + node.measure as f64) * LINE_STEP + BOTTOM_PAD
+    if leaf_has_header(node) {
+        HEADER + (1.0 + node.measure as f64) * LINE_STEP + BOTTOM_PAD
+    } else {
+        SHORT_LEAF_TOP_PAD + node.measure as f64 * LINE_STEP + BOTTOM_PAD
+    }
 }
 
 // Body lines, inventory strings, and related helpers are no longer rendered
@@ -313,7 +354,7 @@ mod tests {
 
     #[test]
     fn natural_px_arithmetic() {
-        // HEADER 20.8 + (1 + measure)·15.6 + BOTTOM_PAD 6
+        // Short item leaf (≤ SHORT_LEAF_LINES): TOP_PAD 4 + measure·15.6 + BOTTOM_PAD 6
         let three = node(
             SymbolKind::Item { label: "fn".into() },
             "a.rs::f",
@@ -324,7 +365,34 @@ mod tests {
             None,
             vec![],
         );
-        assert!((natural_px(&three) - 89.2).abs() < 1e-9);
+        assert!(!leaf_has_header(&three));
+        assert!((natural_px(&three) - 56.8).abs() < 1e-9);
+        // HEADER 20.8 + (1 + measure)·15.6 + BOTTOM_PAD 6
+        let four = node(
+            SymbolKind::Item { label: "fn".into() },
+            "a.rs::f4",
+            4,
+            0.0,
+            0,
+            Some("fn f4()"),
+            None,
+            vec![],
+        );
+        assert!(leaf_has_header(&four));
+        assert!((natural_px(&four) - 104.8).abs() < 1e-9);
+        // A short *file* keeps its header: the file name is not in its text.
+        let short_file = node(
+            SymbolKind::File,
+            "README",
+            2,
+            0.0,
+            0,
+            None,
+            None,
+            vec![],
+        );
+        assert!(leaf_has_header(&short_file));
+        assert!((natural_px(&short_file) - 73.6).abs() < 1e-9);
         let long = node(
             SymbolKind::Item { label: "fn".into() },
             "a.rs::g",

@@ -63,7 +63,7 @@ use crate::layout_transition::LayoutTransition;
 use crate::navigation::NavigationHistory;
 use crate::overlays::{ContextMenu, Notification, Notifications};
 use crate::paint_model::{
-    code_line, runs_from_spans, truncate_to_width, wrap_code_line, BodyText,
+    code_line, runs_from_spans, truncate_to_width, wrap_code_line, BarStrip, BodyText,
     NameRow, PaintItem, RowStyle, TexQuad,
 };
 
@@ -548,6 +548,11 @@ pub struct TreemapView {
     tween: Option<(CameraTween, std::time::Instant)>,
     focus_handle: FocusHandle,
     buffers: BufferManager,
+    /// Line-bar profiles (see `line_bars`): the no-bake code representation.
+    line_profiles: crate::line_bars::LineProfiles,
+    /// Profiles were scanned this frame (items drew placeholder bars) or
+    /// scans are still outstanding: paint again next frame.
+    bars_pending: bool,
     file_symbols: BTreeMap<String, Vec<(SymbolId, usize)>>,
     textures: Option<TextureCache>,
     bake_pending: bool,
@@ -606,6 +611,20 @@ pub struct TreemapView {
     layout_generation: u64,
     /// Pre-order rect cache for the active scaffold (see world::PreorderRects).
     preorder_rects: Option<crate::world::PreorderRects>,
+    /// Bumped only when `tree` itself is replaced (not on layout morphs), so
+    /// the structural index below survives layout transitions.
+    tree_generation: u64,
+    /// Owned structural index of `tree` (see world::TreeShape); replaces the
+    /// per-frame `TreeIndex::new` rebuilds on the paint path.
+    tree_shape: Option<crate::world::TreeShape>,
+    /// When the last frame was built; a frame that arrives long after it
+    /// is an idle one, where deferred cache work can run without being
+    /// noticed (see `ViewResolver::idle_work`).
+    last_paint_at: Option<Instant>,
+    /// Union rect of a named set: name -> (set revision, layout generation,
+    /// rect). A tour frame over a 20k-id set costs ~8ms to union; the tour
+    /// camera and its callout both need it on the same frame.
+    set_rect_cache: HashMap<String, (u64, u64, Option<Rect>)>,
     /// Screen geometry of the last painted tour callout: card rect and
     /// anchor point. Lets clicks on the card/anchor act on the referenced
     /// item even though the callout is canvas-painted, not a GPUI element.
@@ -937,7 +956,7 @@ fn leaf_text_body(
     let font = (FONT_PX * scale) as f32;
     let step = LINE_STEP * scale;
     let x = (left + BODY_PAD * scale) as f32;
-    let content_y0 = HEADER.max(HEADER * scale);
+    let content_y0 = content::leaf_content_y0(node, scale);
     let mut out = Vec::new();
     let mut display_row = 0usize;
     let rel = BufferManager::file_path_of(&node.id.qualified_path).to_string();
@@ -1051,13 +1070,40 @@ fn max_line_chars(
 /// so the Text↔Texture crossfade is seamless.
 fn leaf_tex_rect(node: &SymbolNode, left: f64, top: f64, full_h: f64) -> (f64, f64, f64, f64) {
     let scale = full_h / content::natural_px(node);
-    let content_y0 = HEADER.max(HEADER * scale);
+    let content_y0 = content::leaf_content_y0(node, scale);
     (
         left,
         top + content_y0,
         world::PAGE_W * scale,
         node.measure as f64 * LINE_STEP * scale,
     )
+}
+
+/// Line-bar geometry for a leaf: the same line area a texture would cover
+/// (so bars → texture → text stay registered), one bar per source line at
+/// the page's uniform scale. Below this many unclipped pixels a box cannot
+/// hold even one bar row and keeps its flat fill.
+const MIN_BAR_BOX_PX: f64 = 3.0;
+
+fn leaf_bar_strip(
+    node: &SymbolNode,
+    left: f64,
+    top: f64,
+    full_h: f64,
+    rows: Option<crate::line_bars::Profile>,
+) -> BarStrip {
+    let scale = full_h / content::natural_px(node);
+    let (x, y, w, _) = leaf_tex_rect(node, left, top, full_h);
+    let pad = BODY_PAD * scale;
+    BarStrip {
+        x: (x + pad) as f32,
+        y: y as f32,
+        w: (w - 2.0 * pad).max(1.0) as f32,
+        pitch: (LINE_STEP * scale) as f32,
+        char_w: (FONT_PX * 0.62 * scale) as f32,
+        rows,
+        n_lines: node.measure as u32,
+    }
 }
 
 /// Texture painting only needs the quad to intersect the viewport. GPU image
@@ -1109,6 +1155,11 @@ struct ContainerHeaderLayout {
 /// Computes pinned-header geometry within the clipped container. `zoom` is a
 /// positive [`Camera`] zoom. Card-or-higher headers require one complete line
 /// after ancestor stacking and never extend past the container's trailing edge.
+/// Canvas pixels covered by the menu button and tab strip overlays at the
+/// top of the window. A header pinned to the viewport top would sit under
+/// them, so pinned headers start here instead.
+pub(crate) const HEADER_TOP_INSET: f64 = 44.0;
+
 fn container_header_layout(
     rung: Rung,
     clipped_y: f64,
@@ -1116,7 +1167,14 @@ fn container_header_layout(
     stack_bottom: f64,
     zoom: f64,
 ) -> Option<ContainerHeaderLayout> {
-    let pin_y = clipped_y.max(stack_bottom);
+    // Pinned (box top scrolled past the viewport top): keep clear of the
+    // toolbar overlays. A box that simply starts near the top is left alone.
+    let pinned = clipped_y <= 0.0;
+    let pin_y = if pinned {
+        clipped_y.max(stack_bottom).max(HEADER_TOP_INSET.min(clipped_y + clipped_h))
+    } else {
+        clipped_y.max(stack_bottom)
+    };
     match rung {
         Rung::Dot => None,
         Rung::Label if clipped_h >= 14.0 => Some(ContainerHeaderLayout {
@@ -1314,7 +1372,8 @@ impl TreemapView {
     ) -> Self {
         let root_id = tree.root.id.clone();
         let file_symbols = collect_file_symbols(&tree);
-        let buffers = BufferManager::new(tree.repo_root.clone());
+        let buffers = BufferManager::with_background_loading(tree.repo_root.clone());
+        let line_profiles = crate::line_bars::LineProfiles::new(tree.repo_root.clone());
         let show_welcome = settings.show_welcome;
         let mut notifications = Notifications::default();
         if let Some(message) = settings_notification {
@@ -1338,6 +1397,8 @@ impl TreemapView {
             tween: None,
             focus_handle: cx.focus_handle(),
             buffers,
+            line_profiles,
+            bars_pending: false,
             file_symbols,
             textures,
             bake_pending: false,
@@ -1366,6 +1427,10 @@ impl TreemapView {
             tour_callout_minimized: false,
             layout_generation: 1,
             preorder_rects: None,
+            tree_generation: 1,
+            tree_shape: None,
+            last_paint_at: None,
+            set_rect_cache: HashMap::new(),
             view_resolver: outrider_view::ViewResolver::new(),
             view_dirty: outrider_view::Deps::SPEC,
             metrics: outrider_view::metric::MetricRegistry::builtin(),
@@ -2485,6 +2550,31 @@ impl TreemapView {
         })
     }
 
+    /// Take the cached structural index of `tree`, building it if the tree
+    /// changed. Callers put it back via `self.tree_shape = Some(..)`.
+    fn ensure_tree_shape(&mut self) -> world::TreeShape {
+        world::TreeShape::for_generation(self.tree_shape.take(), &self.tree, self.tree_generation)
+    }
+
+    /// Union rect of a resolved set over `layout`, memoized per set revision
+    /// and layout generation (see `set_rect_cache`).
+    fn set_union_rect(
+        cache: &mut HashMap<String, (u64, u64, Option<Rect>)>,
+        name: &str,
+        set: &outrider_view::set::ResolvedSet,
+        layout: &PackLayout,
+        layout_generation: u64,
+    ) -> Option<Rect> {
+        if let Some((rev, gen, rect)) = cache.get(name) {
+            if *rev == set.revision && *gen == layout_generation {
+                return *rect;
+            }
+        }
+        let rect = outrider_view::camera::union_rect(set.ids.iter(), layout);
+        cache.insert(name.to_string(), (set.revision, layout_generation, rect));
+        rect
+    }
+
     /// Advance the tween, materialize buffers/textures, and build the
     /// `PaintItem` list + optional focused-leaf doc panel for the current
     /// frame; also kicks off queued bakes.
@@ -2516,12 +2606,32 @@ impl TreemapView {
             == outrider_view::spec::SpaceKind::Graph
             && self.graph_scaffold.is_none();
         if stale && self.layout_transition.is_none() && !scaffold_pending {
-            let (nav_tree, nav_layout) = match &self.graph_scaffold {
-                Some(s) => (&s.tree, &s.layout),
-                None => (&self.tree, &self.layout),
+            let n = match &self.graph_scaffold {
+                Some(s) => {
+                    // Diagram scaffolds are small: a throwaway index is cheap.
+                    let index = TreeIndex::new(&s.tree);
+                    focus::neighbors(&focus_id, &s.layout, &index)
+                }
+                None => {
+                    // The base tree is large (30k+ nodes): scan the cached
+                    // pre-order structure instead of hashing every rect.
+                    let shape = self.ensure_tree_shape();
+                    let pre = world::PreorderRects::for_generation(
+                        self.preorder_rects.take(),
+                        &self.tree,
+                        &self.layout,
+                        self.layout_generation,
+                    );
+                    let found = focus::neighbors_by_position(&focus_id, &shape, &pre)
+                        .map(|slots| {
+                            slots.map(|p| p.and_then(|p| shape.node_at(&self.tree, p)).map(|n| n.id.clone()))
+                        })
+                        .unwrap_or([None, None, None, None]);
+                    self.preorder_rects = Some(pre);
+                    self.tree_shape = Some(shape);
+                    found
+                }
             };
-            let index = TreeIndex::new(nav_tree);
-            let n = focus::neighbors(&focus_id, nav_layout, &index);
             self.neighbors = Some((focus_id.clone(), n));
         }
         crate::frame_profile::profile_phase!(prof, "neighbors");
@@ -2544,10 +2654,36 @@ impl TreemapView {
             repo_root: &self.tree.repo_root,
         };
         let dirty = std::mem::take(&mut self.view_dirty);
+        // Idle frame (nothing animating, no frame in the last 40ms — a
+        // wheel zoom or drag repaints far more often): let the resolver
+        // take its deferred snapshot or pre-warm a fill the tour will
+        // push, one unit per frame, so tour steps don't pay for it.
+        let idle = self.tween.is_none()
+            && self.layout_transition.is_none()
+            && dirty.is_none()
+            && self
+                .last_paint_at
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(40));
+        if idle {
+            let warm: Vec<outrider_view::spec::FillSpec> = self
+                .tour
+                .steps
+                .iter()
+                .filter(|s| s.tab.is_none())
+                .flat_map(|s| s.push.iter())
+                .filter_map(|l| match l {
+                    outrider_view::spec::LayerSpec::Fill(f) => Some(f.clone()),
+                    _ => None,
+                })
+                .collect();
+            self.view_resolver.idle_work(&ctx, &warm);
+        }
+        self.last_paint_at = Some(Instant::now());
         crate::frame_profile::profile_phase!(prof, "pre");
         let resolved = self.view_resolver.resolve(&self.view_spec, &ctx, dirty);
         crate::frame_profile::profile_phase!(prof, "resolve");
         self.panels.sync(&resolved.panels);
+        crate::frame_profile::profile_phase!(prof, "panels");
         let ov = crate::view::paint_resolver::PaintOverrides::new(resolved);
 
         // Maintain the graph scaffold when the spec requests graph space.
@@ -2621,10 +2757,17 @@ impl TreemapView {
             // either, keep the focused symbol if the new layout has it.
             let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
             let declared_frame: Option<Rect> = match &self.view_spec.camera.frame {
-                Some(outrider_view::spec::SetRef::Name(name)) => resolved
-                    .sets
-                    .get(name)
-                    .and_then(|s| outrider_view::camera::union_rect(s.ids.iter(), active_layout)),
+                Some(outrider_view::spec::SetRef::Name(name)) => {
+                    resolved.sets.get(name).and_then(|s| {
+                        Self::set_union_rect(
+                            &mut self.set_rect_cache,
+                            name,
+                            s,
+                            active_layout,
+                            self.layout_generation,
+                        )
+                    })
+                }
                 _ => None,
             };
             let declared_focus: Option<Rect> = self
@@ -2673,15 +2816,25 @@ impl TreemapView {
         // the tab-switch reframe above when both fire on the same frame.
         // In graph mode the map is narrower by the tour panel: frame into
         // the remaining width so the callout and panel don't cover the target.
+        crate::frame_profile::profile_phase!(prof, "scaffold");
         let camera = if let Some(target) = self.pending_tour_camera.take() {
             let min_zoom = (self.home_zoom * 0.5).min(camera::MAX_ZOOM);
             let usable_w = (vw - crate::view::tour_panel::PANEL_W as f64).max(vw * 0.5);
             let rect: Option<(Rect, f64)> = match &target {
                 outrider_view::spec::StepTarget::Frame(outrider_view::spec::SetRef::Name(name)) => {
-                    resolved.sets.get(name).and_then(|s| {
-                        outrider_view::camera::union_rect(s.ids.iter(), active_layout)
-                    })
-                    .map(|r| (r, camera::FRAME_FRACTION))
+                    resolved
+                        .sets
+                        .get(name)
+                        .and_then(|s| {
+                            Self::set_union_rect(
+                                &mut self.set_rect_cache,
+                                name,
+                                s,
+                                active_layout,
+                                self.layout_generation,
+                            )
+                        })
+                        .map(|r| (r, camera::FRAME_FRACTION))
                 }
                 outrider_view::spec::StepTarget::Frame(_) => None,
                 outrider_view::spec::StepTarget::Focus(wire) => {
@@ -2764,10 +2917,15 @@ impl TreemapView {
                 Some(start_line..end_line)
             });
 
+        crate::frame_profile::profile_phase!(prof, "tour_cam");
+        // Buffers materialized on the worker since last frame become
+        // visible now, so a leaf that painted bars while waiting gets its
+        // text this frame.
+        let buffers_arrived = self.buffers.poll();
         if let Some(textures) = self.textures.as_mut() {
             textures.begin_visibility_frame();
         }
-        crate::frame_profile::profile_phase!(prof, "scaffold+camera");
+        crate::frame_profile::profile_phase!(prof, "begin_vis");
         // In graph mode boxes are text-only UML nodes: report no thumbnails
         // so member subtrees are never pruned behind a code texture.
         let pre = world::PreorderRects::for_generation(
@@ -2781,7 +2939,7 @@ impl TreemapView {
                 && self
                     .textures
                     .as_ref()
-                    .is_some_and(|textures| textures.contains(id))
+                    .is_some_and(|textures| textures.has_image(id))
         });
         self.preorder_rects = Some(pre);
         crate::frame_profile::profile_phase!(prof, "visible_nodes");
@@ -2797,6 +2955,11 @@ impl TreemapView {
         let mut out = Vec::with_capacity(items.len());
         let mut focused_paint_idx = None;
         let mut header_stack: Vec<(u8, f64)> = Vec::new();
+        // Levels of Label-rung containers on the current DFS path: a
+        // Label-rung child (or Label-tier leaf) of a Label-rung container
+        // draws no name — both names would be centered in nearly the same
+        // box and collide; the parent's coarser name wins at this zoom.
+        let mut label_stack: Vec<u8> = Vec::new();
         let mut panel_doc: Option<(Vec<outrider_view::layers::notes::ResolvedNote>, f32, f32, f32, f32)> = None;
         for item in items {
             while let Some(&(lvl, _)) = header_stack.last() {
@@ -2810,6 +2973,14 @@ impl TreemapView {
                 .last()
                 .map(|&(_, bottom)| bottom)
                 .unwrap_or(item.px.y);
+            while label_stack.last().is_some_and(|&lvl| lvl >= item.level) {
+                label_stack.pop();
+            }
+            let parent_is_label = label_stack.last() == Some(&item.level.saturating_sub(1))
+                && item.level > 0;
+            if matches!(item.draw, Draw::Container(Rung::Label)) {
+                label_stack.push(item.level);
+            }
             let is_leaf = matches!(item.draw, Draw::Leaf(_));
             let is_focused = item.node.id == focus_id;
 
@@ -2833,6 +3004,57 @@ impl TreemapView {
                 } else {
                     ov.fill(&item.node.id).unwrap_or(base_fill)
                 };
+                // Never a flat box where code can be shown: a resident
+                // image (real text, GPU-scaled) if there is one — no load or
+                // bake is queued at this tier — else line bars for a leaf.
+                let mut tex: Option<TexQuad> = None;
+                let mut bars: Option<BarStrip> = None;
+                if item.full_h >= MIN_BAR_BOX_PX && !graph_mode {
+                    if is_leaf {
+                        let (tx, ty, tw, th) =
+                            leaf_tex_rect(item.node, item.left, item.top, item.full_h);
+                        if let Some(img) = self
+                            .textures
+                            .as_mut()
+                            .and_then(|t| t.peek_image(&item.node.id))
+                        {
+                            tex = Some(TexQuad {
+                                x: tx as f32,
+                                y: ty as f32,
+                                w: tw as f32,
+                                h: th as f32,
+                                image: img,
+                            });
+                        } else if item.node.measure > 0 {
+                            let rows = self.line_profiles.get(&item.node.id);
+                            if rows.is_none() {
+                                self.line_profiles
+                                    .request(&item.node.id, item.label_w * item.full_h);
+                            }
+                            bars = Some(leaf_bar_strip(
+                                item.node,
+                                item.left,
+                                item.top,
+                                item.full_h,
+                                rows,
+                            ));
+                        }
+                    } else if !item.node.children.is_empty() {
+                        if let Some(img) = self
+                            .textures
+                            .as_mut()
+                            .and_then(|t| t.peek_image(&item.node.id))
+                        {
+                            tex = Some(TexQuad {
+                                x: item.left as f32,
+                                y: item.top as f32,
+                                w: item.label_w as f32,
+                                h: item.full_h as f32,
+                                image: img,
+                            });
+                        }
+                    }
+                }
                 out.push(PaintItem {
                     x: item.px.x as f32,
                     y: item.px.y as f32,
@@ -2854,7 +3076,8 @@ impl TreemapView {
                     tex_opacity: light,
                     name: None,
                     body: Vec::new(),
-                    tex: None,
+                    tex,
+                    bars,
                     badge: None,
                 });
                 continue;
@@ -2870,6 +3093,7 @@ impl TreemapView {
             let mut name = None;
             let mut body = Vec::new();
             let mut tex: Option<TexQuad> = None;
+            let mut bars: Option<BarStrip> = None;
             let mut focused_extra_h = 0.0f64;
             let mut expanded_w = 0.0f32;
             match item.draw {
@@ -2881,12 +3105,16 @@ impl TreemapView {
                         ancestor_stack_bottom,
                         camera.zoom,
                     ) {
-                        name = Self::pinned_name(
-                            &item,
-                            rung == Rung::Label,
-                            header.pin_y,
-                            rung != Rung::Label,
-                        );
+                        name = if rung == Rung::Label && parent_is_label {
+                            None
+                        } else {
+                            Self::pinned_name(
+                                &item,
+                                rung == Rung::Label,
+                                header.pin_y,
+                                rung != Rung::Label,
+                            )
+                        };
                         body = container_body(
                             item.node,
                             rung,
@@ -2933,11 +3161,24 @@ impl TreemapView {
                     let scale = item.full_h / content::natural_px(item.node);
                     let font = FONT_PX * scale;
                     body_font_px = (FONT_PX * scale) as f32;
-                    if tier != LeafDraw::Dot && item.px.h >= 14.0 {
-                        name = Self::pinned_name(&item, false, item.px.y, false);
+                    if tier != LeafDraw::Dot
+                        && item.px.h >= 14.0
+                        && content::leaf_has_header(item.node)
+                        && !(tier == LeafDraw::Label && parent_is_label)
+                    {
+                        let pin_y = if item.px.y <= 0.0 {
+                            item.px
+                                .y
+                                .max(HEADER_TOP_INSET.min(item.px.y + item.px.h - 14.0))
+                        } else {
+                            item.px.y
+                        };
+                        name = Self::pinned_name(&item, false, pin_y, false);
                     }
-                    let use_text =
-                        font >= content::MIN_TEXT_FONT_PX && item.label_w >= world::CODE_MIN_W;
+                    // The tier already encodes the font/width gates
+                    // (`world::leaf_draw`); a second, stricter gate here
+                    // would send legible short members to the texture path.
+                    let use_text = tier == LeafDraw::Text;
                     if use_text {
                         let effective_label_w = if is_focused {
                             let max_chars =
@@ -2979,14 +3220,19 @@ impl TreemapView {
                                 )
                             });
                             if refreshed {
-                                let index = TreeIndex::new(&self.tree);
-                                let mut parent = index.parent(&item.node.id);
-                                while let Some(id) = parent {
+                                // Field-level borrows only: `items` still
+                                // borrows the tree.
+                                let shape = world::TreeShape::for_generation(
+                                    self.tree_shape.take(),
+                                    &self.tree,
+                                    self.tree_generation,
+                                );
+                                for id in shape.ancestor_ids(&self.tree, &item.node.id) {
                                     if let Some(textures) = self.textures.as_mut() {
-                                        textures.invalidate(id);
+                                        textures.invalidate(&id);
                                     }
-                                    parent = index.parent(id);
                                 }
+                                self.tree_shape = Some(shape);
                             }
                         }
                     } else {
@@ -3006,6 +3252,23 @@ impl TreemapView {
                                         body_opacity = 0.0;
                                     }
                                 }
+                            }
+                            // Texture not resident (queued, loading, baking
+                            // or evicted): draw the code as line bars now
+                            // rather than leaving the body blank.
+                            if tex.is_none() && item.node.measure > 0 {
+                                let rows = self.line_profiles.get(&item.node.id);
+                                if rows.is_none() {
+                                    self.line_profiles
+                                        .request(&item.node.id, item.label_w * item.full_h);
+                                }
+                                bars = Some(leaf_bar_strip(
+                                    item.node,
+                                    item.left,
+                                    item.top,
+                                    item.full_h,
+                                    rows,
+                                ));
                             }
                         }
                     }
@@ -3086,6 +3349,7 @@ impl TreemapView {
                 name,
                 body,
                 tex,
+                bars,
                 badge: ov.badge(&item.node.id),
             });
             if is_focused && is_leaf && expanded_w > 0.0 {
@@ -3097,6 +3361,37 @@ impl TreemapView {
             out.push(focused);
         }
         crate::frame_profile::profile_phase!(prof, "items");
+        let n_bars = if prof.is_some() {
+            out.iter().filter(|i| i.bars.is_some()).count()
+        } else {
+            0
+        };
+        // Scan source files for the line-bar profiles this frame asked for,
+        // largest on-screen area first, within a wall-clock slice.
+        self.bars_pending = false;
+        if self.line_profiles.has_work() {
+            let shape = world::TreeShape::for_generation(
+                self.tree_shape.take(),
+                &self.tree,
+                self.tree_generation,
+            );
+            let tree = &self.tree;
+            let budget = if self.tween.is_some() {
+                crate::line_bars::SCAN_BUDGET_TWEEN
+            } else {
+                crate::line_bars::SCAN_BUDGET_IDLE
+            };
+            let scanned = self.line_profiles.process(budget, &self.file_symbols, &|id| {
+                shape.node(tree, id).map(|n| n.measure)
+            });
+            self.tree_shape = Some(shape);
+            // Items drew placeholder bars this frame: repaint with real
+            // rows, and keep going while requests are still outstanding.
+            self.bars_pending = scanned > 0;
+        }
+        // Same for source buffers still materializing in the background.
+        self.bars_pending |= buffers_arrived > 0 || self.buffers.has_pending();
+        crate::frame_profile::profile_phase!(prof, "line_bars");
         let doc_panel = panel_doc.and_then(|(notes, fx, fy, fw, fh)| {
             crate::view::note_pass::build_doc_panel(&notes, fx, fy, fw, fh)
         });
@@ -3104,14 +3399,22 @@ impl TreemapView {
             if textures.has_queued() && !textures.has_bake_work() {
                 // Only disk bookkeeping outstanding: pump it without the
                 // per-frame index and closures a bake batch would need.
-                textures.process_requests_grouped(|_| None, |_, _| None)
+                // This must not bake: a disk miss collected here lands in
+                // the bake queue for the next frame.
+                textures.pump_disk()
             } else if textures.has_queued() {
-                let index = TreeIndex::new(&self.tree);
+                let shape = world::TreeShape::for_generation(
+                    self.tree_shape.take(),
+                    &self.tree,
+                    self.tree_generation,
+                );
+                let tree = &self.tree;
+                crate::frame_profile::profile_phase!(prof, "tex_index");
                 let direct_child_bytes: HashMap<_, _> = textures
                     .next_request_ids()
                     .into_iter()
                     .filter_map(|id| {
-                        let node = index.node(&id)?;
+                        let node = shape.node(tree, &id)?;
                         (!content::is_leaf_item(node))
                             .then(|| (id, textures.direct_child_bytes(node)))
                     })
@@ -3119,31 +3422,76 @@ impl TreemapView {
                 let buffers = &mut self.buffers;
                 let file_symbols = &self.file_symbols;
                 let layout = &self.layout;
-                textures.process_requests_grouped(
+                // Leaves whose source is still materializing on the worker:
+                // put back on the queue after the batch rather than caching
+                // an empty texture.
+                let deferred: std::cell::RefCell<Vec<(outrider_index::SymbolId, f64)>> =
+                    std::cell::RefCell::new(Vec::new());
+                // Leaves whose lines were handed to the bake worker this
+                // batch: marked in flight after the batch returns.
+                let submitted: std::cell::RefCell<Vec<outrider_index::SymbolId>> =
+                    std::cell::RefCell::new(Vec::new());
+                let bake_tx = textures.bake_sender();
+                // Bound main-thread bake time per frame: a tween frame gets a
+                // slice small enough to keep 60fps; a static frame can spend
+                // more since nothing else is moving.
+                let budget = if self.tween.is_some() {
+                    rasterize::BAKE_BUDGET_TWEEN
+                } else {
+                    rasterize::BAKE_BUDGET_IDLE
+                };
+                let pending = textures.process_requests_grouped_within(
+                    budget,
                     |id| {
-                        index
-                            .node(id)
+                        shape
+                            .node(tree, id)
                             .filter(|node| content::is_leaf_item(node))
                             .map(|_| BufferManager::file_path_of(&id.qualified_path).to_string())
                     },
                     |id, rasterizer| {
-                        let node = index.node(id)?;
+                        let node = shape.node(tree, id)?;
                         if !content::is_leaf_item(node) {
                             let rect = layout.rects.get(id)?;
-                            let level = index.depth(id).unwrap_or(0) as u8;
+                            let level = shape.depth(id).unwrap_or(0) as u8;
+                            let children = direct_child_bytes.get(id);
+                            // Composite off-thread when the worker is up: a
+                            // 1024px thumbnail of a big folder is 10–15ms.
+                            if let Some(tx) = &bake_tx {
+                                let job = rasterize::ContainerBake {
+                                    node: node.clone(),
+                                    rect: *rect,
+                                    rects: rasterize::subtree_rects(node, layout),
+                                    level,
+                                    child_tex: children.cloned().unwrap_or_default(),
+                                };
+                                if tx.send((id.clone(), rasterize::BakeJob::Container(job))).is_ok() {
+                                    submitted.borrow_mut().push(id.clone());
+                                    return None;
+                                }
+                            }
                             let child_tex = |cid: &outrider_index::SymbolId| {
-                                direct_child_bytes
-                                    .get(id)
-                                    .and_then(|children| children.get(cid))
-                                    .cloned()
+                                children.and_then(|c| c.get(cid)).cloned()
                             };
                             return Some(rasterize::bake_container(
-                                node, *rect, layout, level, &child_tex,
+                                node, *rect, &layout.rects, level, &child_tex,
                             ));
                         }
                         let rel = BufferManager::file_path_of(&id.qualified_path).to_string();
                         let syms = file_symbols.get(&rel).map(|v| v.as_slice()).unwrap_or(&[]);
-                        let m = buffers.get(&rel, syms)?;
+                        let Some(m) = buffers.get(&rel, syms) else {
+                            if buffers.is_pending(&rel) {
+                                let area = layout
+                                    .rects
+                                    .get(id)
+                                    .map_or(1.0, |r| r.w * r.h);
+                                deferred.borrow_mut().push((id.clone(), area));
+                            } else {
+                                crate::frame_profile::debug_log(|| {
+                                    format!("bake: no buffer for {rel}")
+                                });
+                            }
+                            return None;
+                        };
                         let start = m.symbol_start_line(id)?;
                         let count =
                             (node.measure as usize).min(m.buffer.len_lines().saturating_sub(start));
@@ -3154,12 +3502,32 @@ impl TreemapView {
                             lines.push((text, runs));
                         }
                         if lines.is_empty() {
-                            None
-                        } else {
-                            Some(rasterizer.bake(&lines))
+                            return None;
                         }
+                        // Rasterize off-thread when the worker is up; the
+                        // leaf keeps its bars until the texture lands.
+                        let lines = match &bake_tx {
+                            Some(tx) => match tx.send((id.clone(), rasterize::BakeJob::Leaf(lines))) {
+                                Ok(()) => {
+                                    submitted.borrow_mut().push(id.clone());
+                                    return None;
+                                }
+                                Err(std::sync::mpsc::SendError((_, rasterize::BakeJob::Leaf(lines)))) => lines,
+                                Err(_) => return None,
+                            },
+                            None => lines,
+                        };
+                        Some(rasterizer.bake(&lines))
                     },
-                )
+                );
+                self.tree_shape = Some(shape);
+                for id in submitted.into_inner() {
+                    textures.mark_bake_inflight(id);
+                }
+                for (id, area) in deferred.into_inner() {
+                    textures.requeue(id, area);
+                }
+                pending || textures.has_queued()
             } else {
                 false
             }
@@ -3175,6 +3543,7 @@ impl TreemapView {
             vw,
             vh,
         );
+        crate::frame_profile::profile_phase!(prof, "edges");
         // Guided-tour callout: narration anchored to the live step's target.
         let live = self.tour.live_target();
         let tour_step_rect: Option<Rect> = match (self.tour.step, &live) {
@@ -3192,7 +3561,13 @@ impl TreemapView {
                             outrider_view::spec::StepTarget::Frame(
                                 outrider_view::spec::SetRef::Name(n),
                             ) => resolved.sets.get(n).and_then(|s| {
-                                outrider_view::camera::union_rect(s.ids.iter(), active_layout)
+                                Self::set_union_rect(
+                                    &mut self.set_rect_cache,
+                                    n,
+                                    s,
+                                    active_layout,
+                                    self.layout_generation,
+                                )
                             }),
                             outrider_view::spec::StepTarget::Frame(_) => None,
                             outrider_view::spec::StepTarget::Focus(w) => {
@@ -3251,22 +3626,23 @@ impl TreemapView {
                 &label,
             )
         });
-        crate::frame_profile::profile_phase!(prof, "edges+callout");
+        crate::frame_profile::profile_phase!(prof, "callout");
         if let Some(p) = prof {
             let mut slow: Vec<&(String, u128)> = self
                 .view_resolver
                 .last_timings
                 .iter()
-                .filter(|(n, us)| *us > 2000 || n.starts_with("maskmiss"))
+                .filter(|(n, us)| *us > 500 || n.starts_with("maskmiss"))
                 .collect();
             slow.sort_by(|a, b| b.1.cmp(&a.1));
             let slow: Vec<String> = slow
                 .into_iter()
-                .take(6)
+                .take(12)
                 .map(|(n, us)| format!("{n}={us}us"))
                 .collect();
             p.finish(&format!(
-                "items={n_items} dots={n_dots} rects={} dirty={:?} graph={} lt={} tween={} slow[{}]",
+                "items={n_items} dots={n_dots} bars={n_bars} profiles={} rects={} dirty={:?} graph={} lt={} tween={} slow[{}]",
+                self.line_profiles.len(),
                 active_layout.rects.len(),
                 dirty,
                 graph_mode,
@@ -4580,7 +4956,8 @@ impl TreemapView {
         } = project;
         debug_assert!(self.loader.accepts(generation));
         self.file_symbols = collect_file_symbols(&tree);
-        self.buffers = BufferManager::new(project_root.clone());
+        self.buffers = BufferManager::with_background_loading(project_root.clone());
+        self.line_profiles = crate::line_bars::LineProfiles::new(project_root.clone());
         let root_id = tree.root.id.clone();
         self.focus = Focus::new(root_id.clone());
         self.nav_history = NavigationHistory::new(root_id, 64);
@@ -4590,6 +4967,9 @@ impl TreemapView {
         self.context_menu = None;
         self.close_all_panels();
         self.tree = tree;
+        self.tree_generation += 1;
+        self.tree_shape = None;
+        self.set_rect_cache.clear();
         self.comments = crate::view::comments::CommentList::load(&self.tree.repo_root);
         self.comment_draft = None;
         self.layout = layout;
@@ -5552,12 +5932,17 @@ impl TreemapView {
         vh: f64,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
+        // Nothing to draw without an open call graph. This check must come
+        // before the column geometry below: it indexes the whole tree, and
+        // doing that on every frame (as it once did) cost ~24ms per frame
+        // on a 30k-node project — the single largest steady-state cost.
+        self.call_graph.as_ref()?;
         let col_w = 320.0_f32;
         let col_h = (vh as f32 - 96.0).max(200.0);
+        let shape = self.ensure_tree_shape();
         let column_lefts = self.camera.and_then(|camera| {
             let packed = *self.layout.rects.get(&self.focus.current)?;
-            let index = TreeIndex::new(&self.tree);
-            let node = index.node(&self.focus.current)?;
+            let node = shape.node(&self.tree, &self.focus.current)?;
             let expanded_w = if content::is_leaf_item(node) {
                 focused_width(max_line_chars(node, &mut self.buffers, &self.file_symbols))
             } else {
@@ -5571,6 +5956,7 @@ impl TreemapView {
                 col_w,
             ))
         });
+        self.tree_shape = Some(shape);
         let (callers_left, callees_left) = column_lefts.unwrap_or((12.0, vw as f32 - col_w - 12.0));
         let mode = self.call_graph.as_ref()?;
         let loading = mode.loading;
@@ -6443,8 +6829,22 @@ impl Render for TreemapView {
             .as_ref()
             .is_some_and(|cg| cg.scroll.is_animating());
         let scanning = self.pre_scanner.is_scanning();
+        // Outstanding disk-cache traffic (loads in flight, saves pending)
+        // has nothing for the main thread to do until the worker answers:
+        // poll it from the 50ms pump instead of re-rendering every frame —
+        // at a wide zoom each spun frame is a full paint of 10k items.
+        let disk_only = self.bake_pending
+            && self
+                .textures
+                .as_ref()
+                .is_some_and(|t| !t.has_bake_work());
+        if disk_only {
+            self.wake.raise();
+        }
         let wants_frame = self.tween.is_some()
-            || self.bake_pending
+            || (self.bake_pending && !disk_only)
+            || self.bars_pending
+            || self.buffers.has_pending()
             || is_loading
             || self.cg_resolver.is_active()
             || cg_animating
@@ -6457,21 +6857,25 @@ impl Render for TreemapView {
                 .map(|t| t.queue_state())
                 .unwrap_or_default();
             p.finish(&format!(
-                "RENDER wants_frame={wants_frame} tween={} bake={} loading={is_loading} cg={} scan={scanning} notify={needs_notify} tex[{tex_state}]",
+                "RENDER wants_frame={wants_frame} tween={} bake={} loading={is_loading} cg={} scan={scanning} notify={needs_notify} active={} tex[{tex_state}]",
                 self.tween.is_some(),
                 self.bake_pending,
                 self.cg_resolver.is_active(),
+                window.is_window_active(),
             ));
         }
         if wants_frame {
             window.request_animation_frame();
         }
+        let mut oprof = crate::frame_profile::FrameProfile::begin();
 
         // Build the panels overlay (palette + future docked panels).
         let panels_overlay = self.render_panels(vw);
+        crate::frame_profile::profile_phase!(oprof, "panels");
 
         // Build the command palette overlay.
         let cmd_palette_overlay = self.render_command_palette(vw);
+        crate::frame_profile::profile_phase!(oprof, "palette");
 
         // Build the settings overlay (needs cx for click listeners).
         let settings_overlay = self
@@ -6504,8 +6908,10 @@ impl Render for TreemapView {
         // Build the context menu overlay (needs cx for click listeners).
         let context_menu_overlay = self.render_context_menu(cx);
         let file_menu_overlay = self.render_file_menu(cx);
+        crate::frame_profile::profile_phase!(oprof, "menus");
         let tab_bar_overlay =
             (!has_overlays && self.map_interaction_enabled()).then(|| self.render_tab_bar(vw, cx));
+        crate::frame_profile::profile_phase!(oprof, "tab_bar");
         let tour_overlay = (!has_overlays && self.map_interaction_enabled())
             .then(|| self.render_right_column(vh, cx))
             .flatten();
@@ -6514,7 +6920,9 @@ impl Render for TreemapView {
             .flatten();
 
         // Build the call graph overlay.
+        crate::frame_profile::profile_phase!(oprof, "tour+composer");
         let call_graph_overlay = self.render_call_graph(vw, vh, cx);
+        crate::frame_profile::profile_phase!(oprof, "call_graph");
 
         // Build the delete-confirmation overlay.
         let delete_overlay = self.render_delete_confirm(vw, cx);
@@ -6555,7 +6963,11 @@ impl Render for TreemapView {
             ))
         });
 
+        crate::frame_profile::profile_phase!(oprof, "misc_overlays");
         window.set_window_title(&self.window_title());
+        if let Some(p) = oprof {
+            p.finish("OVERLAYS");
+        }
         let map = div()
             .size_full()
             .relative()
@@ -6720,6 +7132,7 @@ impl Render for TreemapView {
                 canvas(
                     |_bounds, _window, _cx: &mut App| {},
                     move |bounds, _prepaint, window, _cx: &mut App| {
+                        let paint_prof = crate::frame_profile::FrameProfile::begin();
                         let origin = bounds.origin;
                         let run = |len: usize, color: u32| TextRun {
                             len,
@@ -6735,6 +7148,7 @@ impl Render for TreemapView {
                                 size(px(item.w), px(item.clip_h)),
                             ),
                         };
+                        let bar_quads = std::cell::Cell::new(0usize);
                         let paint_surface = |item: &PaintItem, window: &mut Window| {
                             let b = Bounds::new(
                                 point(origin.x + px(item.x), origin.y + px(item.y)),
@@ -6748,6 +7162,62 @@ impl Render for TreemapView {
                                 rgb(item.border),
                                 BorderStyle::default(),
                             ));
+                            if let Some(strip) = &item.bars {
+                                // Bars stay inside the box's visible band, so
+                                // no content mask is needed for them.
+                                let x0 = item.x + 1.0;
+                                let x1 = item.x + item.w - 1.0;
+                                let y0 = item.y.max(item.clip_y) + 1.0;
+                                let y1 = (item.y + item.h).min(item.clip_y + item.clip_h) - 1.0;
+                                let wanted = strip.bars_in_band(y0, y1);
+                                if wanted > 0
+                                    && bar_quads.get() + wanted <= crate::paint_model::MAX_BAR_QUADS
+                                {
+                                    let step = strip.bar_step();
+                                    let bar_h = strip.bar_h();
+                                    let first = ((y0 - strip.y) / step).floor().max(0.0) as usize;
+                                    let mut drawn = 0usize;
+                                    for b in first..first + wanted {
+                                        let y = strip.y + b as f32 * step;
+                                        if y < y0 {
+                                            continue;
+                                        }
+                                        if y + bar_h > y1 {
+                                            break;
+                                        }
+                                        let Some((indent, len, class)) = strip.bar_silhouette(b)
+                                        else {
+                                            continue;
+                                        };
+                                        let bx = (strip.x + indent as f32 * strip.char_w).max(x0);
+                                        let bw = (len as f32 * strip.char_w).max(1.0);
+                                        let bx1 = (bx + bw).min(strip.x + strip.w).min(x1);
+                                        if bx1 <= bx {
+                                            continue;
+                                        }
+                                        // Half-transparent so bars read as
+                                        // distant text texture rather than
+                                        // popping against baked pages.
+                                        let color = rgba(theme::with_alpha(
+                                            theme::dim_toward(theme::bar_color(class), item.light),
+                                            theme::BAR_ALPHA,
+                                        ));
+                                        window.paint_quad(quad(
+                                            Bounds::new(
+                                                point(origin.x + px(bx), origin.y + px(y)),
+                                                size(px(bx1 - bx), px(bar_h)),
+                                            ),
+                                            px(0.),
+                                            color,
+                                            px(0.),
+                                            color,
+                                            BorderStyle::default(),
+                                        ));
+                                        drawn += 1;
+                                    }
+                                    bar_quads.set(bar_quads.get() + drawn);
+                                }
+                            }
                             if let Some(heat) = item.stripe {
                                 let sb = Bounds::new(
                                     point(origin.x + px(item.x + 1.0), origin.y + px(item.y + 1.0)),
@@ -6883,12 +7353,65 @@ impl Render for TreemapView {
                             }
                         };
                         // Pass 1: quads, stripes, texture quads (back to front).
-                        for item in &frame.items {
-                            if !item.deferred_overlay {
+                        //
+                        // Every primitive painted outside a layer costs a
+                        // bounds-tree insert in GPUI (an R-tree search for the
+                        // topmost overlapping order); at a wide zoom that is
+                        // ~10k inserts and ~14ms per frame. Runs of texture-
+                        // less items are painted inside one `paint_layer`, so
+                        // they share a single order (insertion order still
+                        // decides draw order within it — the item list is in
+                        // DFS order, so children stay above parents). Texture
+                        // items stay outside so their fade/dim quads keep
+                        // ordering against the image.
+                        let mut i = 0;
+                        let n_items = frame.items.len();
+                        while i < n_items {
+                            let item = &frame.items[i];
+                            if item.deferred_overlay {
+                                i += 1;
+                                continue;
+                            }
+                            if item.tex.is_some() {
                                 window.with_content_mask(Some(item_content_mask(item)), |window| {
                                     paint_surface(item, window)
                                 });
+                                i += 1;
+                                continue;
                             }
+                            let start = i;
+                            let (mut x0, mut y0, mut x1, mut y1) =
+                                (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                            while i < n_items {
+                                let it = &frame.items[i];
+                                if it.deferred_overlay || it.tex.is_some() {
+                                    break;
+                                }
+                                x0 = x0.min(it.x);
+                                y0 = y0.min(it.clip_y);
+                                x1 = x1.max(it.x + it.w);
+                                y1 = y1.max(it.clip_y + it.clip_h);
+                                i += 1;
+                            }
+                            let run = &frame.items[start..i];
+                            let layer_bounds = Bounds::new(
+                                point(origin.x + px(x0), origin.y + px(y0)),
+                                size(px((x1 - x0).max(0.0)), px((y1 - y0).max(0.0))),
+                            );
+                            window.paint_layer(layer_bounds, |window| {
+                                for item in run {
+                                    let clipped =
+                                        item.clip_y != item.y || item.clip_h != item.h;
+                                    if clipped {
+                                        window.with_content_mask(
+                                            Some(item_content_mask(item)),
+                                            |window| paint_surface(item, window),
+                                        );
+                                    } else {
+                                        paint_surface(item, window);
+                                    }
+                                }
+                            });
                         }
                         // Pass 2a: leaf / non-header text (rendered under
                         // pinned headers so code doesn't bleed through).
@@ -7239,6 +7762,9 @@ impl Render for TreemapView {
                                     _cx,
                                 );
                             }
+                        }
+                        if let Some(p) = paint_prof {
+                            p.finish("PAINT");
                         }
                     },
                 )
@@ -7829,8 +8355,11 @@ mod tests {
             body[0].runs.iter().map(|r| r.0).sum::<usize>(),
             body[0].text.len()
         );
-        // code row 0 at natural-y HEADER
-        assert!((f64::from(body[0].y) - HEADER).abs() < 1e-3);
+        // code row 0 at the leaf's natural content offset (a one-line item
+        // leaf has no name row: its code starts under the short-leaf pad)
+        let y0 = crate::content::leaf_content_y0(&leaf, 1.0);
+        assert!((y0 - crate::content::SHORT_LEAF_TOP_PAD).abs() < 1e-9);
+        assert!((f64::from(body[0].y) - y0).abs() < 1e-3);
     }
 
     #[test]
@@ -7885,7 +8414,8 @@ mod tests {
             None,
         );
         assert_eq!(body.len(), 1);
-        assert!((f64::from(body[0].y) - 2.0 * HEADER).abs() < 1e-3);
+        let y0 = crate::content::leaf_content_y0(&leaf, 2.0);
+        assert!((f64::from(body[0].y) - y0).abs() < 1e-3);
         // buffer unavailable → no body lines
         let mut broken = BufferManager::new(std::path::PathBuf::from("/nonexistent"));
         let (body, _extra) = leaf_text_body(
@@ -7930,7 +8460,7 @@ mod tests {
             0.0,
             natural,
             ten_chars_wide,
-            HEADER + 0.1,
+            crate::content::leaf_content_y0(&leaf, 1.0) + 0.1,
             &mut manager,
             &file_symbols,
             true,

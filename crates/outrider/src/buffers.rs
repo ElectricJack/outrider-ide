@@ -2,8 +2,9 @@
 //! `FileBuffer` objects with syntax highlighting, attaches per-symbol anchors
 //! for stable line lookup, and caches up to `MAX_BUFFERS` entries LRU-style.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use outrider_index::buffer::{AnchorId, FileBuffer};
 use outrider_index::{SymbolId, SymbolKind, SymbolNode, SymbolTree};
@@ -28,11 +29,56 @@ impl Materialized {
     }
 }
 
+/// Background materialization: the request channel to the loader thread
+/// and the results it sends back.
+struct Loader {
+    requests: mpsc::Sender<(String, Vec<(SymbolId, usize)>)>,
+    results: mpsc::Receiver<(String, Option<Materialized>)>,
+    inflight: HashSet<String>,
+}
+
 /// LRU cache of materialized buffers, keyed by relative file path.
 /// Most-recently-used entry is last (spec §4.1).
+///
+/// With background loading (`with_background_loading`) a miss in `get`
+/// queues the read + parse on a worker thread and returns `None`; the
+/// caller paints its no-buffer representation (line bars) and the entry
+/// arrives through `poll` a frame or so later. Parsing a large C++ file
+/// takes ~100ms, which is why it is never done on the frame thread.
 pub struct BufferManager {
     repo_root: PathBuf,
     entries: Vec<(String, Materialized)>,
+    loader: Option<Loader>,
+    /// Files that failed to read or parse: `get` answers `None` at once
+    /// instead of retrying every frame.
+    failed: HashSet<String>,
+}
+
+fn materialize(
+    repo_root: &std::path::Path,
+    rel_path: &str,
+    symbols: &[(SymbolId, usize)],
+) -> Option<Materialized> {
+    let full = repo_root.join(rel_path);
+    let text = match std::fs::read_to_string(&full) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::frame_profile::debug_log(|| format!("buffer read failed {}: {e}", full.display()));
+            return None;
+        }
+    };
+    let mut buffer = match FileBuffer::new(text, std::path::Path::new(rel_path)) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::frame_profile::debug_log(|| format!("buffer parse failed {rel_path}: {e:#}"));
+            return None;
+        }
+    };
+    let anchors = symbols
+        .iter()
+        .map(|(id, start)| (id.clone(), buffer.create_anchor(*start)))
+        .collect();
+    Some(Materialized { buffer, anchors })
 }
 
 /// Disk I/O, anchor creation, LRU management, and path helpers.
@@ -42,7 +88,77 @@ impl BufferManager {
         Self {
             repo_root,
             entries: Vec::new(),
+            loader: None,
+            failed: HashSet::new(),
         }
+    }
+
+    /// A manager whose misses materialize on a worker thread (see the type
+    /// docs). Falls back to synchronous loading if the thread cannot start.
+    pub fn with_background_loading(repo_root: PathBuf) -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<(String, Vec<(SymbolId, usize)>)>();
+        let (res_tx, res_rx) = mpsc::channel();
+        let root = repo_root.clone();
+        let spawned = std::thread::Builder::new()
+            .name("outrider-buffers".into())
+            .spawn(move || {
+                while let Ok((rel, symbols)) = req_rx.recv() {
+                    let m = materialize(&root, &rel, &symbols);
+                    if res_tx.send((rel, m)).is_err() {
+                        break;
+                    }
+                }
+            });
+        let loader = spawned.ok().map(|_| Loader {
+            requests: req_tx,
+            results: res_rx,
+            inflight: HashSet::new(),
+        });
+        Self {
+            repo_root,
+            entries: Vec::new(),
+            loader,
+            failed: HashSet::new(),
+        }
+    }
+
+    /// Whether `rel_path` is being materialized right now (background
+    /// loading only): a `None` from `get` will turn into a buffer later.
+    pub fn is_pending(&self, rel_path: &str) -> bool {
+        self.loader
+            .as_ref()
+            .is_some_and(|l| l.inflight.contains(rel_path))
+    }
+
+    /// Any materialization outstanding on the worker.
+    pub fn has_pending(&self) -> bool {
+        self.loader.as_ref().is_some_and(|l| !l.inflight.is_empty())
+    }
+
+    /// Collect finished background loads into the cache. Returns how many
+    /// arrived (callers repaint when > 0).
+    pub fn poll(&mut self) -> usize {
+        let Some(loader) = self.loader.as_mut() else {
+            return 0;
+        };
+        let mut arrived = 0;
+        while let Ok((rel, m)) = loader.results.try_recv() {
+            loader.inflight.remove(&rel);
+            match m {
+                Some(m) => {
+                    self.entries.retain(|(p, _)| p != &rel);
+                    self.entries.push((rel, m));
+                    if self.entries.len() > MAX_BUFFERS {
+                        self.entries.remove(0);
+                    }
+                }
+                None => {
+                    self.failed.insert(rel);
+                }
+            }
+            arrived += 1;
+        }
+        arrived
     }
 
     /// The file-path portion of a qualified_path: everything before the
@@ -60,18 +176,34 @@ impl BufferManager {
         if let Some(i) = self.entries.iter().position(|(p, _)| p == rel_path) {
             let e = self.entries.remove(i);
             self.entries.push(e);
-        } else {
-            let text = std::fs::read_to_string(self.repo_root.join(rel_path)).ok()?;
-            let mut buffer = FileBuffer::new(text, std::path::Path::new(rel_path)).ok()?;
-            let anchors = symbols
-                .iter()
-                .map(|(id, start)| (id.clone(), buffer.create_anchor(*start)))
-                .collect();
-            self.entries
-                .push((rel_path.to_string(), Materialized { buffer, anchors }));
-            if self.entries.len() > MAX_BUFFERS {
-                self.entries.remove(0);
+            return self.entries.last().map(|(_, m)| m);
+        }
+        if self.failed.contains(rel_path) {
+            return None;
+        }
+        if let Some(loader) = self.loader.as_mut() {
+            if !loader.inflight.contains(rel_path) {
+                let sent = loader
+                    .requests
+                    .send((rel_path.to_string(), symbols.to_vec()))
+                    .is_ok();
+                if sent {
+                    loader.inflight.insert(rel_path.to_string());
+                    return None;
+                }
+                // Worker gone: materialize inline below.
+                self.loader = None;
+            } else {
+                return None;
             }
+        }
+        let Some(m) = materialize(&self.repo_root, rel_path, symbols) else {
+            self.failed.insert(rel_path.to_string());
+            return None;
+        };
+        self.entries.push((rel_path.to_string(), m));
+        if self.entries.len() > MAX_BUFFERS {
+            self.entries.remove(0);
         }
         self.entries.last().map(|(_, m)| m)
     }
@@ -156,6 +288,33 @@ mod tests {
         // cache hit: delete from disk; a second get must NOT re-read
         std::fs::remove_file(dir.path().join("a.rs")).unwrap();
         assert!(mgr.get("a.rs", &[]).is_some());
+    }
+
+    #[test]
+    fn background_loading_answers_none_then_polls_the_buffer_in() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "a.rs", "fn one() {}\nfn two() {}\n");
+        let mut mgr = BufferManager::with_background_loading(dir.path().to_path_buf());
+        let syms = vec![(fn_id("a.rs::one"), 0), (fn_id("a.rs::two"), 12)];
+        assert!(mgr.get("a.rs", &syms).is_none());
+        assert!(mgr.is_pending("a.rs"));
+        assert!(mgr.has_pending());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while mgr.poll() == 0 {
+            assert!(std::time::Instant::now() < deadline, "loader never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!mgr.is_pending("a.rs"));
+        let m = mgr.get("a.rs", &syms).unwrap();
+        assert_eq!(m.symbol_start_line(&fn_id("a.rs::two")), Some(1));
+        // A missing file is reported once and then answered without retry.
+        assert!(mgr.get("nope.rs", &[]).is_none());
+        while mgr.has_pending() {
+            mgr.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(mgr.get("nope.rs", &[]).is_none());
+        assert!(!mgr.is_pending("nope.rs"));
     }
 
     #[test]

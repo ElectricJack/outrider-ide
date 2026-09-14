@@ -9,6 +9,7 @@ mod focus;
 mod frame_profile;
 mod interaction;
 mod layout_transition;
+mod line_bars;
 mod navigation;
 mod overlays;
 mod paint_model;

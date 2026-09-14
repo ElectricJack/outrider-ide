@@ -6,6 +6,7 @@
 //! See `docs/view-primitives/04-mask.md` for the full algorithm writeup.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use outrider_index::{SymbolId, SymbolNode, SymbolTree};
 
@@ -23,7 +24,10 @@ use crate::spec::{MaskSpec, SetRef};
 #[derive(Debug, Clone)]
 pub struct MaskTable {
     /// Per-symbol light values in `0..=1` that differ from the baseline.
-    light: HashMap<SymbolId, f32>,
+    /// Shared: a table can hold tens of thousands of entries and is cloned
+    /// into the layer memo, the spec cache and the combined mask each
+    /// resolve — those clones must not walk it.
+    light: Arc<HashMap<SymbolId, f32>>,
     /// Light for every symbol not listed in `light`.
     default_light: f32,
     pub deps: Deps,
@@ -35,7 +39,7 @@ pub struct MaskTable {
 impl Default for MaskTable {
     fn default() -> Self {
         MaskTable {
-            light: HashMap::new(),
+            light: Arc::new(HashMap::new()),
             default_light: 1.0,
             deps: Deps::NONE,
             active: false,
@@ -59,6 +63,27 @@ impl MaskTable {
     /// (`final_light = light1 * light2`). A node absent from both gets the
     /// product of the baselines.
     pub fn and(&self, other: &MaskTable) -> MaskTable {
+        // A no-op side contributes nothing: share the other table's map
+        // instead of re-walking it (the first layer always ANDs into the
+        // identity table).
+        let merged_deps = self.deps.union(other.deps);
+        let merged_active = self.active || other.active;
+        if self.is_noop() {
+            return MaskTable {
+                light: Arc::clone(&other.light),
+                default_light: other.default_light,
+                deps: merged_deps,
+                active: merged_active,
+            };
+        }
+        if other.is_noop() {
+            return MaskTable {
+                light: Arc::clone(&self.light),
+                default_light: self.default_light,
+                deps: merged_deps,
+                active: merged_active,
+            };
+        }
         let default_light = self.default_light * other.default_light;
         let mut light: HashMap<SymbolId, f32> =
             HashMap::with_capacity(self.light.len() + other.light.len());
@@ -69,10 +94,10 @@ impl MaskTable {
             }
         }
         MaskTable {
-            light,
+            light: Arc::new(light),
             default_light,
-            deps: self.deps.union(other.deps),
-            active: self.active || other.active,
+            deps: merged_deps,
+            active: merged_active,
         }
     }
 }
@@ -202,7 +227,7 @@ pub fn resolve_mask(
     );
 
     MaskTable {
-        light,
+        light: Arc::new(light),
         default_light,
         deps: resolved_set.deps,
         active: true,

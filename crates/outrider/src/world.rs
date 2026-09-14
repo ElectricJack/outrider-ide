@@ -38,6 +38,8 @@ pub fn pack_config(gap: f64, max_display_lines: Option<u64>) -> outrider_layout:
         header: content::HEADER,
         container_header: content::HEADER,
         bottom_pad: content::BOTTOM_PAD,
+        short_leaf_lines: content::SHORT_LEAF_LINES,
+        short_leaf_header: content::SHORT_LEAF_TOP_PAD,
         gap,
         aspect: PACK_ASPECT,
         max_display_lines,
@@ -98,22 +100,26 @@ pub enum LeafDraw {
     Text,
 }
 
-/// Leaf LOD ladder. `None` => merged away (below MERGE_PX). First match wins:
-/// tiny → Dot, short → Label (pinned name), then Text once the font clears
-/// MIN_TEXT_FONT_PX and the column clears CODE_MIN_W, else Minimap.
+/// Leaf LOD ladder. `None` => merged away (below MERGE_PX). Live text wins
+/// as soon as the on-screen font clears MIN_TEXT_FONT_PX — a box shorter
+/// than CARD_PX only needs LABEL_MIN_W of width (it holds few lines, so the
+/// shaping cost is bounded), a taller one needs a CODE_MIN_W column.
+/// Otherwise: tiny → Dot (line bars), short → Label (pinned name over
+/// bars/texture), else Minimap (texture, bars until it lands).
 pub fn leaf_draw(ph: f64, pw: f64, natural_px: f64) -> Option<LeafDraw> {
     if ph < MERGE_PX {
         return None;
+    }
+    let font = content::FONT_PX * ph / natural_px;
+    let min_w = if ph < CARD_PX { LABEL_MIN_W } else { CODE_MIN_W };
+    if font >= content::MIN_TEXT_FONT_PX && pw >= min_w {
+        return Some(LeafDraw::Text);
     }
     if pw < LABEL_MIN_W || ph < LABEL_PX {
         return Some(LeafDraw::Dot);
     }
     if ph < CARD_PX {
-        return Some(LeafDraw::Label);
-    }
-    let font = content::FONT_PX * ph / natural_px;
-    if font >= content::MIN_TEXT_FONT_PX && pw >= CODE_MIN_W {
-        Some(LeafDraw::Text)
+        Some(LeafDraw::Label)
     } else {
         Some(LeafDraw::Minimap)
     }
@@ -232,6 +238,141 @@ impl PreorderRects {
     }
 }
 
+impl PreorderRects {
+    /// Rect at pre-order position `pos` (None when the layout has none).
+    pub fn rect_at(&self, pos: usize) -> Option<outrider_layout::Rect> {
+        self.rects.get(pos).and_then(|(r, _)| *r)
+    }
+}
+
+/// Owned structural index of a tree: pre-order position per id plus depth,
+/// leaf flag, parent and subtree span per position. Building it is one
+/// hash insert per node (~15ms on a 30k-node tree), so it is built once per
+/// tree generation and reused by every per-frame consumer that used to
+/// construct a throwaway `TreeIndex` (bakes, neighbor scans, live-text
+/// refreshes) — those rebuilds were the largest single hitch during zooms.
+pub struct TreeShape {
+    pub generation: u64,
+    positions: std::collections::HashMap<outrider_index::SymbolId, u32>,
+    depth: Vec<u8>,
+    leaf: Vec<bool>,
+    /// Parent position; `u32::MAX` for the root.
+    parent: Vec<u32>,
+    /// Subtree size including self.
+    span: Vec<u32>,
+}
+
+impl TreeShape {
+    pub fn build(tree: &SymbolTree, generation: u64) -> Self {
+        let mut shape = TreeShape {
+            generation,
+            positions: std::collections::HashMap::new(),
+            depth: Vec::new(),
+            leaf: Vec::new(),
+            parent: Vec::new(),
+            span: Vec::new(),
+        };
+        fn walk(n: &SymbolNode, depth: u8, parent: u32, out: &mut TreeShape) -> u32 {
+            let my = out.depth.len() as u32;
+            out.positions.insert(n.id.clone(), my);
+            out.depth.push(depth);
+            out.leaf.push(content::is_leaf_item(n));
+            out.parent.push(parent);
+            out.span.push(1);
+            let mut size = 1;
+            for c in &n.children {
+                size += walk(c, depth.saturating_add(1), my, out);
+            }
+            out.span[my as usize] = size;
+            size
+        }
+        walk(&tree.root, 0, u32::MAX, &mut shape);
+        shape.positions.reserve(0);
+        shape
+    }
+
+    /// Reuse `cached` when its generation matches, else rebuild.
+    pub fn for_generation(cached: Option<TreeShape>, tree: &SymbolTree, generation: u64) -> TreeShape {
+        match cached {
+            Some(c) if c.generation == generation && !c.depth.is_empty() => c,
+            _ => TreeShape::build(tree, generation),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.depth.len()
+    }
+
+    pub fn position(&self, id: &outrider_index::SymbolId) -> Option<usize> {
+        self.positions.get(id).map(|&p| p as usize)
+    }
+
+    pub fn depth_at(&self, pos: usize) -> u8 {
+        self.depth[pos]
+    }
+
+    pub fn is_leaf_at(&self, pos: usize) -> bool {
+        self.leaf[pos]
+    }
+
+    pub fn parent_at(&self, pos: usize) -> Option<usize> {
+        let p = self.parent[pos];
+        (p != u32::MAX).then_some(p as usize)
+    }
+
+    pub fn depth(&self, id: &outrider_index::SymbolId) -> Option<u8> {
+        self.position(id).map(|p| self.depth_at(p))
+    }
+
+    /// Node at pre-order position `pos`, found by descending through
+    /// subtree spans (O(depth × siblings), no hashing). `tree` must be the
+    /// tree this shape was built from.
+    pub fn node_at<'a>(&self, tree: &'a SymbolTree, pos: usize) -> Option<&'a SymbolNode> {
+        if pos >= self.len() {
+            return None;
+        }
+        let mut node = &tree.root;
+        let mut cur = 0usize;
+        while cur != pos {
+            let mut child_pos = cur + 1;
+            let mut next = None;
+            for c in &node.children {
+                let span = self.span.get(child_pos).copied().unwrap_or(1) as usize;
+                if pos < child_pos + span {
+                    next = Some((c, child_pos));
+                    break;
+                }
+                child_pos += span;
+            }
+            let (c, p) = next?;
+            node = c;
+            cur = p;
+        }
+        Some(node)
+    }
+
+    pub fn node<'a>(&self, tree: &'a SymbolTree, id: &outrider_index::SymbolId) -> Option<&'a SymbolNode> {
+        self.node_at(tree, self.position(id)?)
+    }
+
+    /// Ids of the ancestors of `id`, nearest first.
+    pub fn ancestor_ids(
+        &self,
+        tree: &SymbolTree,
+        id: &outrider_index::SymbolId,
+    ) -> Vec<outrider_index::SymbolId> {
+        let mut out = Vec::new();
+        let mut pos = self.position(id).and_then(|p| self.parent_at(p));
+        while let Some(p) = pos {
+            if let Some(n) = self.node_at(tree, p) {
+                out.push(n.id.clone());
+            }
+            pos = self.parent_at(p);
+        }
+        out
+    }
+}
+
 /// `visible_nodes` driven by a pre-order rect cache: identical output, no
 /// per-node hashing. The cache must have been built for this exact tree.
 pub fn visible_nodes_cached<'a>(
@@ -329,7 +470,9 @@ fn walk_cached<'a>(
     });
     let this_has_thumb = has_thumbnail(&node.id);
     let prune = match draw {
-        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => this_has_thumb,
+        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => {
+            this_has_thumb && !children_are_labelable(pre, my_index, node, camera.zoom)
+        }
         _ => false,
     };
     if prune {
@@ -350,6 +493,37 @@ fn walk_cached<'a>(
             out,
         );
     }
+}
+
+/// Whether a child `ph` pixels tall would draw more than a sub-label
+/// speck: a container reaches the Label rung, a leaf reaches Label or its
+/// font clears MIN_TEXT_FONT_PX (the same tests `rung_for` / `leaf_draw`
+/// apply). A cached thumbnail replaces a subtree only while every child is
+/// below this: once one can carry its own name or live text, the composite
+/// (whose leaf rows are 3-pixel glyphs) is the worse picture.
+fn child_is_labelable(child: &SymbolNode, ph: f64) -> bool {
+    if ph >= LABEL_PX {
+        return true;
+    }
+    content::is_leaf_item(child)
+        && ph >= MERGE_PX
+        && content::FONT_PX * ph / content::natural_px(child) >= content::MIN_TEXT_FONT_PX
+}
+
+/// `child_is_labelable` over the direct children of the node at pre-order
+/// `pos`, read from the rect cache.
+fn children_are_labelable(pre: &PreorderRects, pos: usize, node: &SymbolNode, zoom: f64) -> bool {
+    let mut child_pos = pos + 1;
+    for child in &node.children {
+        let Some(&(rect, span)) = pre.rects.get(child_pos) else {
+            return false;
+        };
+        if rect.is_some_and(|r| child_is_labelable(child, r.h * zoom)) {
+            return true;
+        }
+        child_pos += span;
+    }
+    false
 }
 
 /// Recursive DFS helper for `visible_nodes`: project, cull, classify, clip.
@@ -413,8 +587,13 @@ fn walk<'a>(
     // Containers only prune their subtree when a folder thumbnail is cached,
     // so children stay visible until the thumbnail is ready to replace them.
     let this_has_thumb = has_thumbnail(&node.id);
+    let labelable_child = node.children.iter().any(|c| {
+        pack.rects
+            .get(&c.id)
+            .is_some_and(|r| child_is_labelable(c, r.h * camera.zoom))
+    });
     let prune = match draw {
-        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => this_has_thumb,
+        Draw::Container(Rung::Dot | Rung::Label | Rung::Card) => this_has_thumb && !labelable_child,
         _ => false,
     };
     if !prune {
@@ -551,6 +730,9 @@ mod tests {
             header: 20.8,
             container_header: 52.0,
             bottom_pad: 6.0,
+            // Fixture geometry predates header-less short leaves.
+            short_leaf_lines: 0,
+            short_leaf_header: 4.0,
             gap: 8.0,
             aspect: 1.6,
             max_display_lines: None,
@@ -583,7 +765,7 @@ mod tests {
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |_| false);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec!["", "a.rs", "b.rs", "f", "g"]);
-        use LeafDraw::{Label, Text};
+        use LeafDraw::Text;
         let draws: Vec<Draw> = items.iter().map(|i| i.draw).collect();
         assert_eq!(
             draws,
@@ -591,8 +773,8 @@ mod tests {
                 Draw::Container(Rung::Full),   // root 1670px
                 Draw::Container(Rung::Full),   // a.rs 1602px (no byte_range → container)
                 Draw::Container(Rung::Detail), // b.rs 332px
-                Draw::Leaf(Text),              // f: 198.4px page, font 12, wide
-                Draw::Leaf(Label),             // g: 58px page (< CARD_PX)
+                Draw::Leaf(Text), // f: 198.4px page, font 12, wide
+                Draw::Leaf(Text), // g: 58px page (< CARD_PX) but font 12 → live text
             ]
         );
         assert_eq!(
@@ -643,11 +825,27 @@ mod tests {
         assert!(names.contains(&"f"));
         assert!(matches!(items[0].draw, Draw::Container(Rung::Dot)));
 
-        // With a thumbnail cached for root, children are pruned.
+        // With a thumbnail cached for root, children are still walked
+        // here: a.rs is 48px tall at this zoom, big enough for its own name
+        // and bars, which beat the composite's 3-pixel glyph rows.
         let root_id = tree.root.id.clone();
         let items = visible_nodes(&tree, &p, &cam, 800.0, 600.0, |id| *id == root_id);
         let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
+        assert!(names.contains(&"a.rs"));
+
+        // Further out every child is a sub-label speck: the composite
+        // replaces the subtree.
+        let far = Camera {
+            center_x: 500.0,
+            center_y: 819.6,
+            zoom: 0.01,
+        };
+        let items = visible_nodes(&tree, &p, &far, 800.0, 600.0, |id| *id == root_id);
+        let names: Vec<&str> = items.iter().map(|i| i.node.name.as_str()).collect();
         assert_eq!(names, vec![""]);
+        let pre = PreorderRects::build(&tree, &p, 1);
+        let cached = visible_nodes_cached(&tree, &pre, &far, 800.0, 600.0, |id| *id == root_id);
+        assert_eq!(cached.len(), 1);
     }
 
     #[test]
@@ -712,9 +910,17 @@ mod tests {
         assert_eq!(leaf_draw(4.0, 400.0, 100.0), Some(Dot));
         assert_eq!(leaf_draw(19.9, 400.0, 100.0), Some(Dot));
         assert_eq!(leaf_draw(1000.0, 59.9, 100.0), Some(Dot));
-        // Label: [LABEL_PX, CARD_PX) height, wide enough
+        // Label: [LABEL_PX, CARD_PX) height, wide enough, font still sub-4
         assert_eq!(leaf_draw(20.0, 400.0, 100.0), Some(Label));
-        assert_eq!(leaf_draw(79.9, 400.0, 100.0), Some(Label));
+        assert_eq!(leaf_draw(79.9, 400.0, 300.0), Some(Label)); // font 3.2
+        // A short box goes to live text as soon as the font clears 4 —
+        // it only needs LABEL_MIN_W of width (few lines to shape).
+        assert_eq!(leaf_draw(79.9, 400.0, 100.0), Some(Text)); // font 9.6
+        assert_eq!(leaf_draw(79.9, 60.0, 100.0), Some(Text));
+        assert_eq!(leaf_draw(79.9, 59.9, 100.0), Some(Dot));
+        // A header-less one-line leaf (natural 25.6) is legible at 9px tall.
+        assert_eq!(leaf_draw(9.0, 400.0, 25.6), Some(Text)); // font 4.2
+        assert_eq!(leaf_draw(8.0, 400.0, 25.6), Some(Dot)); // font 3.75
         // Text: font ≥ 4 (ph/natural ≥ 4/12) AND pw ≥ CODE_MIN_W
         assert_eq!(leaf_draw(80.0, 400.0, 100.0), Some(Text)); // font 9.6
         assert_eq!(leaf_draw(80.0, 400.0, 200.0), Some(Text)); // font 4.8
@@ -741,7 +947,82 @@ mod tests {
         // natural ≤ ~137 → at CARD_PX height font already ≥ 7, so a short
         // leaf steps Label → Text with no Minimap tier.
         let natural = 100.0;
-        assert_eq!(leaf_draw(79.9, 400.0, natural), Some(Label));
+        assert_eq!(leaf_draw(33.0, 400.0, natural), Some(Label)); // font 3.96
+        assert_eq!(leaf_draw(34.0, 400.0, natural), Some(Text)); // font 4.08
         assert_eq!(leaf_draw(80.0, 400.0, natural), Some(Text));
+    }
+
+    #[test]
+    fn labelable_child_matches_the_leaf_ladder() {
+        let leaf = SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Item { label: "field".into() },
+                qualified_path: "a.rs::x".into(),
+                ordinal: 0,
+            },
+            name: "x".into(),
+            byte_range: Some(0..10),
+            signature: None,
+            doc: None,
+            measure: 1,
+            churn: 0.0,
+            churn_count: 0,
+            visibility: None,
+            diff_status: None,
+            diff_hunks: vec![],
+            deleted_lines: vec![],
+            children: vec![],
+        };
+        // A one-line leaf (natural 25.6) is legible text from 8.6px up,
+        // well under LABEL_PX — so a composite must not hide it there.
+        assert!(child_is_labelable(&leaf, 19.7));
+        assert!(child_is_labelable(&leaf, 9.0));
+        assert!(!child_is_labelable(&leaf, 8.0));
+        let mut folder = leaf.clone();
+        folder.id.kind = SymbolKind::Folder;
+        folder.byte_range = None;
+        assert!(child_is_labelable(&folder, 20.0));
+        assert!(!child_is_labelable(&folder, 19.9));
+    }
+
+    /// `content::natural_px` and the layout's `leaf_natural_h` must agree
+    /// under the app's pack config, or on-screen font derivation breaks.
+    #[test]
+    fn natural_px_matches_layout_leaf_height() {
+        let cfg = pack_config(4.0, None);
+        for (kind, measure) in [
+            (SymbolKind::Item { label: "fn".into() }, 1),
+            (SymbolKind::Item { label: "field".into() }, 3),
+            (SymbolKind::Item { label: "fn".into() }, 4),
+            (SymbolKind::Item { label: "fn".into() }, 200),
+            (SymbolKind::File, 1),
+            (SymbolKind::Chunk, 2),
+        ] {
+            let node = SymbolNode {
+                id: SymbolId {
+                    kind,
+                    qualified_path: "a.rs::x".into(),
+                    ordinal: 0,
+                },
+                name: "x".into(),
+                byte_range: Some(0..10),
+                signature: None,
+                doc: None,
+                measure,
+                churn: 0.0,
+                churn_count: 0,
+                visibility: None,
+                diff_status: None,
+                diff_hunks: vec![],
+                deleted_lines: vec![],
+                children: vec![],
+            };
+            let layout_h = outrider_layout::leaf_natural_h(&node, &cfg);
+            assert!(
+                (layout_h - content::natural_px(&node)).abs() < 1e-9,
+                "measure {measure}: layout {layout_h} vs content {}",
+                content::natural_px(&node)
+            );
+        }
     }
 }

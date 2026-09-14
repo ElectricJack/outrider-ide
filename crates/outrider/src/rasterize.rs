@@ -26,15 +26,25 @@ use crate::theme;
 use crate::treemap::BODY_PAD;
 use crate::world;
 
-/// Master texture line height, px.
-pub const MASTER_LINE_PX: f64 = 4.0;
-/// Master texture height cap; taller leaves stride rows to fit.
-pub const MAX_TEX_H: usize = 1024;
+/// Master texture line height, px. Chosen so the texture is never enlarged
+/// on screen before live text takes over: a tall leaf switches to text at a
+/// 5.6px font (CODE_MIN_W / PAGE_W · FONT_PX), and 7px rows carry a 5.4px
+/// font, so the crossfade happens at ~1:1 and the texture tier below it is
+/// always a downscale. (4px rows were being blown up 1.3–1.9× — the blur
+/// users saw while zooming in.)
+pub const MASTER_LINE_PX: f64 = 7.0;
+/// Master texture height cap; taller leaves stride rows to fit. 256 lines
+/// fit at full row height.
+pub const MAX_TEX_H: usize = 1792;
 /// Maximum pixel dimension (longer side) for a container thumbnail.
 const CONTAINER_TEX_MAX: f64 = 1024.0;
 /// Increment whenever rasterization semantics change incompatibly.
 // Version 4 includes shared file-type classification for line-chunk textures.
-pub const RENDER_SCHEMA_VERSION: u64 = 4;
+// Version 5: header-less short leaves change container layouts, and
+// composites are box-filtered into the leaf line area.
+// Version 6: 7px master rows (was 4px) so textures are not upscaled at
+// the text crossfade.
+pub const RENDER_SCHEMA_VERSION: u64 = 6;
 
 /// One source line: text plus colored runs (byte length, 0xRRGGBB).
 pub type Line = (String, Vec<(usize, u32)>);
@@ -93,7 +103,9 @@ impl Rasterizer {
         let stride = lines.len().div_ceil(MAX_TEX_H).max(1);
         let rows: Vec<&Line> = lines.iter().step_by(stride).collect();
         let l = MASTER_LINE_PX.min(MAX_TEX_H as f64 / rows.len() as f64);
-        let h = ((rows.len() as f64 * l).ceil() as u32).max(1);
+        // `rows · (MAX_TEX_H / rows)` can land a hair above MAX_TEX_H in
+        // floating point; the disk store rejects anything taller.
+        let h = ((rows.len() as f64 * l).ceil() as u32).clamp(1, MAX_TEX_H as u32);
         let w = ((world::PAGE_W / LINE_STEP * l).round() as u32).max(1);
         let pad = (BODY_PAD / LINE_STEP * l).round() as i32;
         let font_size = (l / 1.3) as f32;
@@ -180,7 +192,7 @@ fn ct_color(c: u32) -> Color {
 pub fn bake_container(
     node: &SymbolNode,
     container_rect: Rect,
-    layout: &PackLayout,
+    rects: &HashMap<SymbolId, Rect>,
     base_level: u8,
     child_tex: &impl Fn(&SymbolId) -> Option<(u32, u32, Vec<u8>)>,
 ) -> NodeTexture {
@@ -206,7 +218,7 @@ pub fn bake_container(
     container_fill(
         node,
         &container_rect,
-        layout,
+        rects,
         sx,
         sy,
         tw,
@@ -234,7 +246,7 @@ pub fn bake_container(
 fn container_fill(
     node: &SymbolNode,
     root: &Rect,
-    layout: &PackLayout,
+    rects: &HashMap<SymbolId, Rect>,
     sx: f64,
     sy: f64,
     tw: u32,
@@ -244,7 +256,7 @@ fn container_fill(
     child_tex: &impl Fn(&SymbolId) -> Option<(u32, u32, Vec<u8>)>,
 ) {
     for child in &node.children {
-        let Some(r) = layout.rects.get(&child.id) else {
+        let Some(r) = rects.get(&child.id) else {
             continue;
         };
         let px = ((r.x - root.x) * sx) as i32;
@@ -277,14 +289,18 @@ fn container_fill(
         }
 
         if let Some((sw, sh, src_bgra)) = child_tex(&child.id) {
-            composite_bgra(
-                &src_bgra, sw, sh, pw as u32, ph as u32, px, py, tw, th, rgba,
-            );
+            if content::is_leaf_item(child) {
+                composite_leaf(child, &src_bgra, sw, sh, px, py, pw, ph, sy, tw, th, rgba);
+            } else {
+                composite_bgra(
+                    &src_bgra, sw, sh, pw as u32, ph as u32, px, py, tw, th, rgba,
+                );
+            }
         } else if !child.children.is_empty() {
             container_fill(
                 child,
                 root,
-                layout,
+                rects,
                 sx,
                 sy,
                 tw,
@@ -311,8 +327,178 @@ fn container_fill(
     }
 }
 
-/// Nearest-neighbor scale BGRA source into destination RGBA buffer via
-/// src-over blend. Insets by 1px to avoid overwriting borders.
+/// Above this enlargement of a leaf texture's rows a composite draws the
+/// rows as line bars instead of scaling 3-pixel glyphs up into blobs.
+const COMPOSITE_MAX_UPSCALE: f64 = 1.5;
+
+/// Composite a leaf's line texture into its box inside a container
+/// thumbnail. `(px, py, pw, ph)` is the leaf's whole box in thumbnail
+/// pixels; the texture covers only the line area under the leaf's header
+/// band, so it is placed there at the box's own scale (no aspect
+/// distortion). A downscale is box-filtered. When the thumbnail would have
+/// to enlarge the texture's rows — short leaves in a small container — each
+/// text row is drawn as a crisp bar spanning its glyph coverage in the
+/// row's average color, the same rung the live map uses.
+#[allow(clippy::too_many_arguments)]
+fn composite_leaf(
+    child: &SymbolNode,
+    src_bgra: &[u8],
+    src_w: u32,
+    src_h: u32,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
+    sy: f64,
+    buf_w: u32,
+    buf_h: u32,
+    rgba: &mut [u8],
+) {
+    if src_w == 0 || src_h == 0 || child.measure == 0 {
+        return;
+    }
+    let inner_x = px + 1;
+    let inner_w = (pw - 2).max(0);
+    let y0 = py + (content::leaf_header_px(child) * sy).round() as i32;
+    let y_end = py + ph - 1;
+    let lines_h = (child.measure as f64 * LINE_STEP * sy).round() as i32;
+    let dst_h = lines_h.min(y_end - y0);
+    if inner_w <= 0 || dst_h <= 0 {
+        return;
+    }
+    let stride = (child.measure as usize).div_ceil(MAX_TEX_H).max(1);
+    let rows = (child.measure as usize).div_ceil(stride).max(1);
+    let src_row_px = src_h as f64 / rows as f64;
+    let dst_row_px = dst_h as f64 / rows as f64;
+    if dst_row_px <= src_row_px * COMPOSITE_MAX_UPSCALE {
+        resample_box(
+            src_bgra, src_w, src_h, inner_x, y0, inner_w as u32, dst_h as u32, buf_w, buf_h,
+            rgba,
+        );
+        return;
+    }
+    let scale_x = inner_w as f64 / src_w as f64;
+    let bar_h = (dst_row_px * 0.6).clamp(1.0, 10.0) as i32;
+    for r in 0..rows {
+        let band0 = (r as f64 * src_row_px).floor() as u32;
+        let band1 = (((r + 1) as f64 * src_row_px).ceil() as u32).min(src_h);
+        let (mut x_min, mut x_max) = (u32::MAX, 0u32);
+        let (mut acc_r, mut acc_g, mut acc_b, mut acc_a) = (0u64, 0u64, 0u64, 0u64);
+        for y in band0..band1 {
+            for x in 0..src_w {
+                let i = (y * src_w + x) as usize * 4;
+                let a = src_bgra[i + 3] as u64;
+                if a < 40 {
+                    continue;
+                }
+                x_min = x_min.min(x);
+                x_max = x_max.max(x);
+                acc_b += src_bgra[i] as u64 * a;
+                acc_g += src_bgra[i + 1] as u64 * a;
+                acc_r += src_bgra[i + 2] as u64 * a;
+                acc_a += a;
+            }
+        }
+        if acc_a == 0 {
+            continue;
+        }
+        let color = [
+            (acc_r / acc_a) as u8,
+            (acc_g / acc_a) as u8,
+            (acc_b / acc_a) as u8,
+        ];
+        let dy0 = y0 + (r as f64 * dst_row_px).round() as i32;
+        let dy1 = (dy0 + bar_h).min(y0 + dst_h);
+        let dx0 = inner_x + (x_min as f64 * scale_x).floor() as i32;
+        let dx1 = (inner_x + ((x_max + 1) as f64 * scale_x).ceil() as i32)
+            .max(dx0 + 1)
+            .min(inner_x + inner_w);
+        // Same half weight as the live line bars (theme::BAR_ALPHA).
+        let alpha = (theme::BAR_ALPHA * 255.0) as u8;
+        for y in dy0.max(0)..dy1.min(buf_h as i32) {
+            for x in dx0.max(0)..dx1.min(buf_w as i32) {
+                let di = (y as u32 * buf_w + x as u32) as usize * 4;
+                blend(&mut rgba[di..di + 4], color[0], color[1], color[2], alpha);
+            }
+        }
+    }
+}
+
+/// Area-average (box filter) resample of a BGRA source into the RGBA
+/// destination rect via src-over blend. Every source pixel contributes to
+/// exactly one destination pixel, weighted by its alpha, so downscaled
+/// glyph strokes soften instead of dropping out as nearest sampling does.
+#[allow(clippy::too_many_arguments)]
+fn resample_box(
+    src_bgra: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_x: i32,
+    dst_y: i32,
+    dst_w: u32,
+    dst_h: u32,
+    buf_w: u32,
+    buf_h: u32,
+    rgba: &mut [u8],
+) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    for oy in 0..dst_h {
+        let dy = dst_y + oy as i32;
+        if dy < 0 || dy >= buf_h as i32 {
+            continue;
+        }
+        let sy0 = (oy as u64 * src_h as u64 / dst_h as u64) as u32;
+        let sy1 = (((oy + 1) as u64 * src_h as u64).div_ceil(dst_h as u64) as u32)
+            .max(sy0 + 1)
+            .min(src_h);
+        for ox in 0..dst_w {
+            let dx = dst_x + ox as i32;
+            if dx < 0 || dx >= buf_w as i32 {
+                continue;
+            }
+            let sx0 = (ox as u64 * src_w as u64 / dst_w as u64) as u32;
+            let sx1 = (((ox + 1) as u64 * src_w as u64).div_ceil(dst_w as u64) as u32)
+                .max(sx0 + 1)
+                .min(src_w);
+            let (mut acc_r, mut acc_g, mut acc_b, mut acc_a) = (0u64, 0u64, 0u64, 0u64);
+            let mut n = 0u64;
+            for y in sy0..sy1 {
+                for x in sx0..sx1 {
+                    let si = (y * src_w + x) as usize * 4;
+                    if si + 3 >= src_bgra.len() {
+                        continue;
+                    }
+                    let a = src_bgra[si + 3] as u64;
+                    acc_b += src_bgra[si] as u64 * a;
+                    acc_g += src_bgra[si + 1] as u64 * a;
+                    acc_r += src_bgra[si + 2] as u64 * a;
+                    acc_a += a;
+                    n += 1;
+                }
+            }
+            if acc_a == 0 || n == 0 {
+                continue;
+            }
+            let a = (acc_a / n) as u8;
+            if a == 0 {
+                continue;
+            }
+            let di = (dy as u32 * buf_w + dx as u32) as usize * 4;
+            blend(
+                &mut rgba[di..di + 4],
+                (acc_r / acc_a) as u8,
+                (acc_g / acc_a) as u8,
+                (acc_b / acc_a) as u8,
+                a,
+            );
+        }
+    }
+}
+
+/// Box-filtered scale of a nested container thumbnail into its box, inset
+/// by 1px to keep the border.
 #[allow(clippy::too_many_arguments)]
 fn composite_bgra(
     src_bgra: &[u8],
@@ -329,43 +515,14 @@ fn composite_bgra(
     if src_w == 0 || src_h == 0 || src_bgra.len() < 4 {
         return;
     }
-    let inner_x = dst_x + 1;
-    let inner_y = dst_y + 1;
     let inner_w = (dst_w as i32 - 2).max(0) as u32;
     let inner_h = (dst_h as i32 - 2).max(0) as u32;
     if inner_w == 0 || inner_h == 0 {
         return;
     }
-    for oy in 0..inner_h {
-        let dy = inner_y + oy as i32;
-        if dy < 0 || dy >= buf_h as i32 {
-            continue;
-        }
-        let sy = (oy as u64 * src_h as u64 / inner_h as u64) as u32;
-        for ox in 0..inner_w {
-            let dx = inner_x + ox as i32;
-            if dx < 0 || dx >= buf_w as i32 {
-                continue;
-            }
-            let sxx = (ox as u64 * src_w as u64 / inner_w as u64) as u32;
-            let si = (sy * src_w + sxx) as usize * 4;
-            if si + 3 >= src_bgra.len() {
-                continue;
-            }
-            let a = src_bgra[si + 3];
-            if a == 0 {
-                continue;
-            }
-            let di = (dy as u32 * buf_w + dx as u32) as usize * 4;
-            blend(
-                &mut rgba[di..di + 4],
-                src_bgra[si + 2], // B→R (BGRA→RGBA)
-                src_bgra[si + 1],
-                src_bgra[si], // R→B
-                a,
-            );
-        }
-    }
+    resample_box(
+        src_bgra, src_w, src_h, dst_x + 1, dst_y + 1, inner_w, inner_h, buf_w, buf_h, rgba,
+    );
 }
 
 fn rgb_u8(c: u32) -> (u8, u8, u8) {
@@ -376,7 +533,16 @@ fn rgb_u8(c: u32) -> (u8, u8, u8) {
 
 /// Bakes per frame for on-demand misses.
 pub const BAKES_PER_FRAME: usize = 4;
+/// Main-thread bake time per frame while the camera is tweening: leaves
+/// room for the paint itself inside a 16.6ms frame.
+pub const BAKE_BUDGET_TWEEN: Duration = Duration::from_millis(3);
+/// Bake time per frame when nothing else is animating.
+pub const BAKE_BUDGET_IDLE: Duration = Duration::from_millis(6);
 const DISK_QUEUE_CAPACITY: usize = 64;
+/// Disk loads dispatched per frame (a load is one small file read once the
+/// store's index is warm) and finished results collected per frame.
+const DISK_LOADS_PER_FRAME: usize = 16;
+const DISK_RESULTS_PER_FRAME: usize = 16;
 const DISK_RESULT_CAPACITY: usize = 16;
 const DISK_START_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -825,8 +991,82 @@ fn texture_from_payload(payload: TexturePayload) -> Option<NodeTexture> {
 }
 
 /// Per-node texture cache with LRU eviction and disk persistence.
+/// Off-thread leaf rasterization: the frame thread extracts a leaf's
+/// lines (cheap) and hands them here; cosmic-text does the pixel work on
+/// its own thread with its own font system, and the finished texture comes
+/// back through `results`. A 500-line leaf costs ~20ms to rasterize, far
+/// more than a tween frame can absorb.
+struct BakeWorker {
+    requests: mpsc::Sender<(SymbolId, BakeJob)>,
+    results: mpsc::Receiver<(SymbolId, NodeTexture)>,
+    inflight: HashSet<SymbolId>,
+}
+
+/// Everything a container composite needs, detached from the frame thread's
+/// tree and layout so the worker can raster it.
+pub struct ContainerBake {
+    pub node: SymbolNode,
+    pub rect: Rect,
+    pub rects: HashMap<SymbolId, Rect>,
+    pub level: u8,
+    pub child_tex: HashMap<SymbolId, (u32, u32, Vec<u8>)>,
+}
+
+/// One unit of work for the bake worker.
+pub enum BakeJob {
+    Leaf(Vec<Line>),
+    Container(ContainerBake),
+}
+
+/// The layout rects of `node`'s subtree (the part `bake_container` reads).
+pub fn subtree_rects(node: &SymbolNode, layout: &PackLayout) -> HashMap<SymbolId, Rect> {
+    fn walk(n: &SymbolNode, layout: &PackLayout, out: &mut HashMap<SymbolId, Rect>) {
+        for c in &n.children {
+            if let Some(r) = layout.rects.get(&c.id) {
+                out.insert(c.id.clone(), *r);
+            }
+            walk(c, layout, out);
+        }
+    }
+    let mut out = HashMap::new();
+    walk(node, layout, &mut out);
+    out
+}
+
+fn spawn_bake_worker() -> Option<BakeWorker> {
+    let (req_tx, req_rx) = mpsc::channel::<(SymbolId, BakeJob)>();
+    let (res_tx, res_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("outrider-bake".into())
+        .spawn(move || {
+            let mut raster = Rasterizer::new();
+            while let Ok((id, job)) = req_rx.recv() {
+                let tex = match job {
+                    BakeJob::Leaf(lines) => raster.bake(&lines),
+                    BakeJob::Container(job) => bake_container(
+                        &job.node,
+                        job.rect,
+                        &job.rects,
+                        job.level,
+                        &|cid| job.child_tex.get(cid).cloned(),
+                    ),
+                };
+                if res_tx.send((id, tex)).is_err() {
+                    break;
+                }
+            }
+        })
+        .ok()?;
+    Some(BakeWorker {
+        requests: req_tx,
+        results: res_rx,
+        inflight: HashSet::new(),
+    })
+}
+
 pub struct TextureCache {
     raster: Rasterizer,
+    bake_worker: Option<BakeWorker>,
     entries: HashMap<SymbolId, Entry>,
     clock: u64,
     bytes: usize,
@@ -930,6 +1170,7 @@ impl TextureCache {
         };
         Self {
             raster: Rasterizer::new(),
+            bake_worker: spawn_bake_worker(),
             entries: HashMap::new(),
             clock: 0,
             bytes: 0,
@@ -1022,6 +1263,18 @@ impl TextureCache {
             .is_some_and(|entry| entry.tex.image.is_some())
     }
 
+    /// Resident image for `id`, if any, refreshing its LRU slot. Unlike
+    /// `get` this never queues a disk load or bake — used by the sub-label
+    /// (Dot) tiers where thousands of nodes are visible at once and only an
+    /// already-resident image is worth painting.
+    pub fn peek_image(&mut self, id: &SymbolId) -> Option<Arc<RenderImage>> {
+        let e = self.entries.get_mut(id)?;
+        let image = e.tex.image.clone()?;
+        self.clock += 1;
+        e.last_used = self.clock;
+        Some(image)
+    }
+
     /// Start a new visibility pass. Queued work remains available, but its
     /// old screen-area scores no longer outrank nodes in the current view.
     pub fn begin_visibility_frame(&mut self) {
@@ -1053,6 +1306,15 @@ impl TextureCache {
             e.last_used = self.clock;
             return Some(&e.tex);
         }
+        if let Some(priority) = self.queue.get_mut(id) {
+            // Already past the disk check and waiting to bake (or requeued
+            // while its source materializes): keep its priority current.
+            *priority = priority.max(screen_area);
+            return None;
+        }
+        if self.bake_inflight(id) {
+            return None;
+        }
         if self.worker_slot.is_newest(self.worker_claimant)
             && self.disk_key(id).is_some()
             && self.disk_worker.is_some()
@@ -1080,6 +1342,70 @@ impl TextureCache {
             .or_insert(screen_area);
     }
 
+    /// Put `id` back on the bake queue after a bake attempt that could not
+    /// run yet (its source buffer is still materializing): drops whatever
+    /// placeholder the attempt inserted so the next frame retries.
+    pub fn requeue(&mut self, id: SymbolId, screen_area: f64) {
+        self.invalidate(&id);
+        self.queue
+            .entry(id)
+            .and_modify(|priority| *priority = priority.max(screen_area))
+            .or_insert(screen_area);
+    }
+
+    /// Sender for off-thread leaf bakes, if the worker is running. A bake
+    /// closure that sends a leaf's lines here must report the id through
+    /// `mark_bake_inflight` once the batch returns.
+    pub fn bake_sender(&self) -> Option<mpsc::Sender<(SymbolId, BakeJob)>> {
+        self.bake_worker.as_ref().map(|w| w.requests.clone())
+    }
+
+    /// Record that `id`'s lines were handed to the bake worker: it stays
+    /// out of the bake batch (and off the disk path) until its texture
+    /// arrives through `apply_bake_results`.
+    pub fn mark_bake_inflight(&mut self, id: SymbolId) {
+        self.invalidate(&id);
+        self.queue.remove(&id);
+        if let Some(worker) = self.bake_worker.as_mut() {
+            worker.inflight.insert(id);
+        }
+    }
+
+    pub fn bake_inflight(&self, id: &SymbolId) -> bool {
+        self.bake_worker
+            .as_ref()
+            .is_some_and(|w| w.inflight.contains(id))
+    }
+
+    fn apply_bake_results(&mut self) {
+        let Some(worker) = self.bake_worker.as_mut() else {
+            return;
+        };
+        let mut arrived = Vec::new();
+        loop {
+            match worker.results.try_recv() {
+                Ok((id, tex)) => {
+                    worker.inflight.remove(&id);
+                    arrived.push((id, tex));
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Worker died: anything it held goes back to inline baking.
+                    let stranded: Vec<_> = worker.inflight.drain().collect();
+                    self.bake_worker = None;
+                    for id in stranded {
+                        self.queue.entry(id).or_insert(1.0);
+                    }
+                    break;
+                }
+            }
+        }
+        for (id, tex) in arrived {
+            self.queue.remove(&id);
+            self.insert(id, tex);
+        }
+    }
+
     /// Queue one replacement bake after live text proves the source buffer is
     /// available. A fresh cache is created for each project load, so one
     /// refresh per node keeps scrolling responsive without rebaking every frame.
@@ -1099,6 +1425,7 @@ impl TextureCache {
 
     pub fn has_queued(&self) -> bool {
         !self.queue.is_empty()
+            || self.bake_worker.as_ref().is_some_and(|w| !w.inflight.is_empty())
             || !self.waiting_disk.is_empty()
             || self.disk_worker_starting
             || self.pending_disk_start.is_some()
@@ -1148,11 +1475,27 @@ impl TextureCache {
     /// group to finish other visible requests backed by the same source file.
     pub fn process_requests_grouped(
         &mut self,
+        group_fn: impl FnMut(&SymbolId) -> Option<String>,
+        bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
+    ) -> bool {
+        self.process_requests_grouped_within(Duration::MAX, group_fn, bake_fn)
+    }
+
+    /// `process_requests_grouped` with a wall-clock budget: at least one
+    /// item is always baked, and the batch stops once `budget` has elapsed
+    /// (the remaining picks go back to the queue at their priority). Keeps a
+    /// burst of large bakes — every leaf of a folder crossing into the
+    /// texture tier at once — from stalling a frame.
+    pub fn process_requests_grouped_within(
+        &mut self,
+        budget: Duration,
         mut group_fn: impl FnMut(&SymbolId) -> Option<String>,
         mut bake_fn: impl FnMut(&SymbolId, &mut Rasterizer) -> Option<NodeTexture>,
     ) -> bool {
+        let started = Instant::now();
         self.handle_disk_superseded();
         self.retry_disk_worker_start();
+        self.apply_bake_results();
         self.apply_disk_results();
         self.dispatch_clear_request();
         self.dispatch_disk_loads();
@@ -1195,10 +1538,47 @@ impl TextureCache {
                 selected.push(next);
             }
         }
-        for (id, _) in selected {
+        let mut selected = selected.into_iter();
+        for (id, priority) in selected.by_ref() {
+            let bake_started = Instant::now();
             let tex = bake_fn(&id, &mut self.raster).unwrap_or_else(NodeTexture::empty);
+            let bake_ms = bake_started.elapsed().as_millis();
+            if bake_ms >= 8 {
+                crate::frame_profile::debug_log(|| {
+                    format!(
+                        "bake: slow {bake_ms}ms {} bytes={} for {}",
+                        id.kind.label(),
+                        tex.bytes,
+                        id.qualified_path
+                    )
+                });
+            }
             self.insert(id, tex);
+            if started.elapsed() >= budget {
+                // Out of time: requeue the rest untouched.
+                let _ = priority;
+                break;
+            }
         }
+        for (id, priority) in selected {
+            self.queue.insert(id, priority);
+        }
+        self.has_queued()
+    }
+
+    /// Disk bookkeeping only: collect finished loads/saves, dispatch new
+    /// loads, retry the worker. Never bakes. Callers use this when the bake
+    /// queue was empty at frame start; a disk miss surfacing here re-enters
+    /// the bake queue for a *later* frame's `process_requests_grouped_within`
+    /// (baking it here with no rasterizer closure would insert a permanent
+    /// empty texture — that was the "blank body" bug).
+    pub fn pump_disk(&mut self) -> bool {
+        self.handle_disk_superseded();
+        self.retry_disk_worker_start();
+        self.apply_bake_results();
+        self.apply_disk_results();
+        self.dispatch_clear_request();
+        self.dispatch_disk_loads();
         self.has_queued()
     }
 
@@ -1364,7 +1744,7 @@ impl TextureCache {
     }
 
     fn apply_disk_results(&mut self) {
-        for _ in 0..BAKES_PER_FRAME {
+        for _ in 0..DISK_RESULTS_PER_FRAME {
             let received = self
                 .disk_worker
                 .as_ref()
@@ -1437,7 +1817,7 @@ impl TextureCache {
             .collect();
         candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
         let mut failed = Vec::new();
-        for (id, _) in candidates.into_iter().take(BAKES_PER_FRAME) {
+        for (id, _) in candidates.into_iter().take(DISK_LOADS_PER_FRAME) {
             let Some(key) = self.disk_key(&id) else {
                 // No stable key any more (the node changed under us):
                 // this waiter can never be served from disk. Re-route it
@@ -1499,6 +1879,7 @@ impl TextureCache {
         let worker_claimant = worker_slot.designate_successor();
         Self {
             raster: Rasterizer::new(),
+            bake_worker: None,
             entries: HashMap::new(),
             clock: 0,
             bytes: 0,
@@ -1608,7 +1989,7 @@ mod tests {
                 .collect(),
         };
 
-        let texture = bake_container(&root, root_rect, &layout, 0, &|_| None);
+        let texture = bake_container(&root, root_rect, &layout.rects, 0, &|_| None);
         let image = texture.image.expect("container texture");
         let bytes = image.as_bytes(0).expect("BGRA pixels");
         let center = (512 * 1024 + 512) * 4;
@@ -1621,9 +2002,91 @@ mod tests {
         assert_eq!(&bytes[center..center + 4], &expected_bgra);
     }
 
+    fn leaf_node(measure: u64) -> SymbolNode {
+        SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Item { label: "fn".into() },
+                qualified_path: "a.rs::f".into(),
+                ordinal: 0,
+            },
+            name: "f".into(),
+            byte_range: Some(0..10),
+            signature: None,
+            doc: None,
+            measure,
+            churn: 0.0,
+            churn_count: 0,
+            visibility: None,
+            diff_status: None,
+            diff_hunks: vec![],
+            deleted_lines: vec![],
+            children: vec![],
+        }
+    }
+
+    /// A 2-row source texture: row 0 has glyph coverage in columns 2..5,
+    /// row 1 is empty.
+    fn two_row_texture() -> (Vec<u8>, u32, u32) {
+        let (w, h) = (8u32, 8u32);
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        for y in 0..4 {
+            for x in 2..5 {
+                let i = ((y * w + x) * 4) as usize;
+                bgra[i..i + 4].copy_from_slice(&[0xb0, 0xc9, 0x4e, 0xff]); // BGRA of 0x4ec9b0
+            }
+        }
+        (bgra, w, h)
+    }
+
+    #[test]
+    fn composite_leaf_draws_enlarged_rows_as_bars_in_the_line_area() {
+        let (src, sw, sh) = two_row_texture();
+        let leaf = leaf_node(2);
+        let (tw, th) = (64u32, 128u32);
+        let mut rgba = vec![0u8; (tw * th * 4) as usize];
+        // Box 60px wide, 100px tall at sy = 100 / natural(56.8 short leaf): rows
+        // would be enlarged ~7x, so bar mode kicks in.
+        let natural = content::natural_px(&leaf);
+        let sy = 100.0 / natural;
+        composite_leaf(&leaf, &src, sw, sh, 2, 4, 60, 100, sy, tw, th, &mut rgba);
+        let y0 = 4 + (content::leaf_header_px(&leaf) * sy).round() as i32;
+        let px_at = |x: i32, y: i32| {
+            let i = ((y as u32 * tw + x as u32) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        // Row 0's bar: spans columns 2..5 of 8 → x in [3 + 57*2/8, 3 + 57*5/8),
+        // in the glyphs' average colour, at the top of the line area.
+        let bar_x = 3 + (57.0 * 2.0 / 8.0) as i32 + 1;
+        let a = (theme::BAR_ALPHA * 255.0) as u8;
+        assert_eq!(px_at(bar_x, y0), [0x4e, 0xc9, 0xb0, a]);
+        // Nothing drawn above the line area (the header band) or left of the bar.
+        assert_eq!(px_at(bar_x, y0 - 2), [0, 0, 0, 0]);
+        assert_eq!(px_at(3, y0), [0, 0, 0, 0]);
+        // Row 1 (blank in the source) draws no bar.
+        let dst_row = (2.0 * LINE_STEP * sy / 2.0).round() as i32;
+        assert_eq!(px_at(bar_x, y0 + dst_row + 1), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn composite_leaf_box_filters_a_downscale() {
+        let (src, sw, sh) = two_row_texture();
+        let leaf = leaf_node(2);
+        let (tw, th) = (16u32, 16u32);
+        let mut rgba = vec![0u8; (tw * th * 4) as usize];
+        // Tiny box: 6px wide, 6px tall → the 8x8 source shrinks (no bars).
+        let natural = content::natural_px(&leaf);
+        let sy = 6.0 / natural;
+        composite_leaf(&leaf, &src, sw, sh, 0, 0, 6, 6, sy, tw, th, &mut rgba);
+        let covered = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(covered > 0, "downscaled glyphs still leave coverage");
+        // Area averaging: the destination column straddling glyph column 4
+        // and empty column 5 gets partial alpha, never a hard drop-out.
+        assert!(rgba.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
+    }
+
     #[test]
     fn render_schema_tracks_shared_file_type_classification() {
-        assert_eq!(RENDER_SCHEMA_VERSION, 4);
+        assert_eq!(RENDER_SCHEMA_VERSION, 6);
     }
 
     #[test]
@@ -1631,16 +2094,30 @@ mod tests {
         let lines: Vec<Line> = (0..10).map(|_| plain("fn foo() {}")).collect();
         let tex = Rasterizer::new().bake(&lines);
         let img = tex.image.as_ref().unwrap();
-        assert_eq!(img.size(0).width.0, 164);
-        assert_eq!(img.size(0).height.0, 40);
-        assert_eq!(tex.bytes, 164 * 40 * 4);
+        // PAGE_W / LINE_STEP columns of MASTER_LINE_PX rows: 640/15.6·7 → 287 wide, 10·7 tall.
+        let w = (world::PAGE_W / LINE_STEP * MASTER_LINE_PX).round() as i32;
+        let h = (10.0 * MASTER_LINE_PX).ceil() as i32;
+        assert_eq!((w, h), (287, 70));
+        assert_eq!(img.size(0).width.0, w);
+        assert_eq!(img.size(0).height.0, h);
+        assert_eq!(tex.bytes, (w * h * 4) as usize);
+    }
+
+    #[test]
+    fn bake_never_exceeds_the_height_cap_by_rounding() {
+        // 1000 rows → l = 1.792, and 1000 · 1.792 rounds above 1792.0.
+        let lines: Vec<Line> = (0..1000).map(|_| plain("x")).collect();
+        let tex = Rasterizer::new().bake(&lines);
+        let img = tex.image.unwrap();
+        assert!(img.size(0).height.0 <= MAX_TEX_H as i32);
+        assert!(img.size(0).width.0 <= 1024);
     }
 
     #[test]
     fn bake_strides_huge_leaves_to_height_cap() {
-        let lines: Vec<Line> = (0..3000).map(|_| plain("x")).collect();
+        let lines: Vec<Line> = (0..5000).map(|_| plain("x")).collect();
         let tex = Rasterizer::new().bake(&lines);
-        assert_eq!(tex.image.unwrap().size(0).height.0, 1024);
+        assert_eq!(tex.image.unwrap().size(0).height.0, MAX_TEX_H as i32);
     }
 
     #[test]

@@ -19,6 +19,20 @@ pub struct ResolvedSet {
     pub ids: HashSet<SymbolId>,
     pub ranges: BTreeMap<SymbolId, Vec<std::ops::Range<usize>>>,
     pub deps: Deps,
+    /// Identity of this resolution: stamped from a global counter each time
+    /// a set is freshly computed, carried through reuse and clones. Lets
+    /// callers memoize derived data (e.g. a union rect over 20k ids)
+    /// without hashing the membership again.
+    pub revision: u64,
+}
+
+static NEXT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl ResolvedSet {
+    /// Fresh identity for a newly computed set.
+    pub fn stamp(&mut self) {
+        self.revision = NEXT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl ResolvedSet {

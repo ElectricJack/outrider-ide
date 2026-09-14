@@ -10,5 +10,5 @@ mod skyline;
 mod zones;
 
 pub use graph::{layout_graph, GraphConfig, GraphLayout, GraphNode};
-pub use pack::{pack, PackConfig, PackLayout, Rect};
+pub use pack::{is_short_leaf, leaf_natural_h, pack, PackConfig, PackLayout, Rect};
 pub use progressive::{pack_progressive, PackCancelled, PackProgress};

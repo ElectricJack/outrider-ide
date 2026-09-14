@@ -61,11 +61,20 @@ pub struct TextureStore {
     namespace_lock: Arc<Mutex<()>>,
     namespace_usage: Arc<AtomicU64>,
     namespace_generation: Arc<AtomicU64>,
+    /// Shared in-process directory mutation counter (see
+    /// `NamespaceResources::revision`).
+    namespace_revision: Arc<AtomicU64>,
     generation: u64,
     max_bytes: u64,
     used_bytes: u64,
     clock: u64,
     entries: HashMap<TextureKey, Metadata>,
+    /// The namespace revision `entries` was last reconciled against; 0
+    /// means never indexed.
+    indexed_revision: u64,
+    /// Directory mtime observed at the last reconciliation. A change means
+    /// another process touched the namespace and the index is stale.
+    indexed_dir_mtime: Option<SystemTime>,
 }
 
 impl TextureStore {
@@ -111,6 +120,7 @@ impl TextureStore {
         let namespace_lock = Arc::clone(&namespace.shared.lock);
         let namespace_usage = Arc::clone(&namespace.shared.usage);
         let namespace_generation = Arc::clone(&namespace.shared.generation);
+        let namespace_revision = Arc::clone(&namespace.shared.revision);
         let operation_lock = Arc::clone(&namespace_lock);
         let _guard = operation_lock
             .lock()
@@ -121,15 +131,19 @@ impl TextureStore {
             namespace_lock,
             namespace_usage,
             namespace_generation,
+            namespace_revision,
             generation,
             max_bytes,
             used_bytes: 0,
             clock: 0,
             entries: HashMap::new(),
+            indexed_revision: 0,
+            indexed_dir_mtime: None,
         };
         store.ensure_current_generation()?;
         store.rebuild_index_unlocked()?;
         store.evict_unlocked()?;
+        store.mark_dir_mutated();
         Ok(store)
     }
 
@@ -147,7 +161,7 @@ impl TextureStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         self.ensure_current_generation()?;
-        self.rebuild_index_with_remove_unlocked(&mut remove)?;
+        self.refresh_index_if_stale(&mut remove)?;
         let path = self.path(*key);
         let mut file = match File::open(&path) {
             Ok(file) => file,
@@ -160,8 +174,14 @@ impl TextureStore {
         let Some(header) = validate_file(&mut file, self.max_bytes)? else {
             drop(file);
             match remove(&path) {
-                Ok(()) => self.remove_metadata(*key),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => self.remove_metadata(*key),
+                Ok(()) => {
+                    self.remove_metadata(*key);
+                    self.mark_dir_mutated();
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.remove_metadata(*key);
+                    self.mark_dir_mutated();
+                }
                 Err(error) => {
                     self.rebuild_index_with_remove_unlocked(|_| {
                         Err(io::Error::new(
@@ -169,6 +189,7 @@ impl TextureStore {
                             "cleanup disabled",
                         ))
                     })?;
+                    self.mark_dir_mutated();
                     return Err(error);
                 }
             }
@@ -197,7 +218,9 @@ impl TextureStore {
         }
         self.used_bytes = self.used_bytes.saturating_add(header.file_bytes);
         self.publish_usage();
-        self.evict_unlocked()?;
+        let evict = self.evict_unlocked();
+        self.mark_dir_mutated();
+        evict?;
         Ok(Some(TexturePayload {
             width: header.width,
             height: header.height,
@@ -228,8 +251,10 @@ impl TextureStore {
         if file_bytes > self.max_bytes {
             return Ok(());
         }
-        self.rebuild_index_with_remove_unlocked(&mut remove)?;
-        self.reserve_physical_space(file_bytes, &mut remove)?;
+        self.refresh_index_if_stale(&mut remove)?;
+        let reserved = self.reserve_physical_space(file_bytes, &mut remove);
+        self.mark_dir_mutated();
+        reserved?;
         let access = self.next_access();
         let path = self.path(*key);
         let temp = path.with_extension("tmp");
@@ -249,9 +274,12 @@ impl TextureStore {
         })();
         if result.is_err() {
             let _ = remove(&temp);
-            self.rebuild_index_with_remove_unlocked(&mut remove)?;
+            let rebuilt = self.rebuild_index_with_remove_unlocked(&mut remove);
+            self.mark_dir_mutated();
+            rebuilt?;
         }
         result?;
+        self.mark_dir_mutated();
 
         if let Some(old) = self.entries.insert(
             *key,
@@ -264,7 +292,9 @@ impl TextureStore {
         }
         self.used_bytes = self.used_bytes.saturating_add(file_bytes);
         self.publish_usage();
-        self.evict_unlocked()
+        let evict = self.evict_unlocked();
+        self.mark_dir_mutated();
+        evict
     }
 
     #[cfg(test)]
@@ -316,12 +346,14 @@ impl TextureStore {
                 }
             }
         }
-        self.rebuild_index_with_remove_unlocked(|_| {
+        let rebuilt = self.rebuild_index_with_remove_unlocked(|_| {
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "cleanup disabled",
             ))
-        })?;
+        });
+        self.mark_dir_mutated();
+        rebuilt?;
         first_error.map_or(Ok(()), Err)
     }
 
@@ -332,6 +364,46 @@ impl TextureStore {
 
     fn rebuild_index_unlocked(&mut self) -> io::Result<()> {
         self.rebuild_index_with_remove_unlocked(|path| fs::remove_file(path))
+    }
+
+    fn dir_mtime(&self) -> Option<SystemTime> {
+        fs::metadata(&self.dir).and_then(|m| m.modified()).ok()
+    }
+
+    /// Record that this store just changed the namespace directory: its own
+    /// index already reflects the change, every other store must re-read
+    /// the directory before trusting theirs.
+    fn mark_dir_mutated(&mut self) {
+        self.indexed_revision = self.namespace_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        self.indexed_dir_mtime = self.dir_mtime();
+    }
+
+    /// The index is current when no other store in this process has
+    /// mutated the namespace since it was built and the directory's mtime
+    /// (which every create/delete touches) is unchanged — so a load or
+    /// save no longer re-reads and header-validates every cached file.
+    fn index_is_current(&self) -> bool {
+        self.indexed_revision != 0
+            && self.indexed_revision == self.namespace_revision.load(Ordering::Acquire)
+            && self.indexed_dir_mtime.is_some()
+            && self.indexed_dir_mtime == self.dir_mtime()
+    }
+
+    fn refresh_index_if_stale(
+        &mut self,
+        remove: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.index_is_current() {
+            return Ok(());
+        }
+        let mtime_before = self.dir_mtime();
+        self.rebuild_index_with_remove_unlocked(remove)?;
+        self.indexed_revision = self.namespace_revision.load(Ordering::Acquire);
+        // If the rebuild itself removed files, the mtime moved on; taking
+        // the earlier stamp forces one more (cheap, already-consistent)
+        // reconciliation rather than ever trusting a stale index.
+        self.indexed_dir_mtime = mtime_before;
+        Ok(())
     }
 
     fn rebuild_index_with_remove_unlocked(
@@ -584,6 +656,10 @@ struct NamespaceResources {
     lock: Arc<Mutex<()>>,
     usage: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
+    /// Bumped by every store in this process that adds or removes a file
+    /// in the namespace directory, so other stores know their index is
+    /// stale without re-reading the directory on every operation.
+    revision: Arc<AtomicU64>,
 }
 
 fn canonical_project_identity(project_root: &Path) -> String {
@@ -630,6 +706,7 @@ fn namespace_resources(key: String) -> Arc<NamespaceResources> {
         lock: Arc::new(Mutex::new(())),
         usage: Arc::new(AtomicU64::new(0)),
         generation: Arc::new(AtomicU64::new(1)),
+        revision: Arc::new(AtomicU64::new(1)),
     });
     locks.insert(key, Arc::downgrade(&resources));
     resources

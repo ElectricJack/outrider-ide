@@ -163,6 +163,34 @@ pub fn spatial_step(
 
 /// The four beam-cast arrow targets of `current`, indexed Left, Right,
 /// Up, Down. `None` entries are dead directions (and get no highlight).
+/// Beam-cast score of candidate `r` relative to `cur` in direction `dir`:
+/// `(primary distance, misalignment)` when `r` lies in the beam, else None.
+fn beam_score(cur: &outrider_layout::Rect, r: &outrider_layout::Rect, dir: Dir) -> Option<(f64, f64)> {
+    let (overlap, primary, misalign) = match dir {
+        Dir::Left | Dir::Right => (
+            r.y < cur.y + cur.h && r.y + r.h > cur.y,
+            if dir == Dir::Left {
+                cur.x - (r.x + r.w)
+            } else {
+                r.x - (cur.x + cur.w)
+            },
+            ((r.y + r.h / 2.0) - (cur.y + cur.h / 2.0)).abs(),
+        ),
+        Dir::Up | Dir::Down => (
+            r.x < cur.x + cur.w && r.x + r.w > cur.x,
+            if dir == Dir::Up {
+                cur.y - (r.y + r.h)
+            } else {
+                r.y - (cur.y + cur.h)
+            },
+            ((r.x + r.w / 2.0) - (cur.x + cur.w / 2.0)).abs(),
+        ),
+    };
+    (overlap && primary >= 0.0).then_some((primary, misalign))
+}
+
+const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+
 pub fn neighbors(
     current: &SymbolId,
     pack: &PackLayout,
@@ -182,7 +210,6 @@ pub fn neighbors(
     let leaf_mode = index
         .node(current)
         .is_some_and(crate::content::is_leaf_item);
-    const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
     let mut best: [Option<(f64, f64, &SymbolId)>; 4] = [None, None, None, None];
     for (id, r) in &pack.rects {
         if id == current {
@@ -197,29 +224,9 @@ pub fn neighbors(
             continue;
         }
         for (slot, dir) in DIRS.iter().enumerate() {
-            let (overlap, primary, misalign) = match dir {
-                Dir::Left | Dir::Right => (
-                    r.y < cur.y + cur.h && r.y + r.h > cur.y,
-                    if *dir == Dir::Left {
-                        cur.x - (r.x + r.w)
-                    } else {
-                        r.x - (cur.x + cur.w)
-                    },
-                    ((r.y + r.h / 2.0) - (cur.y + cur.h / 2.0)).abs(),
-                ),
-                Dir::Up | Dir::Down => (
-                    r.x < cur.x + cur.w && r.x + r.w > cur.x,
-                    if *dir == Dir::Up {
-                        cur.y - (r.y + r.h)
-                    } else {
-                        r.y - (cur.y + cur.h)
-                    },
-                    ((r.x + r.w / 2.0) - (cur.x + cur.w / 2.0)).abs(),
-                ),
-            };
-            if !overlap || primary < 0.0 {
+            let Some((primary, misalign)) = beam_score(cur, r, *dir) else {
                 continue;
-            }
+            };
             let better = match best[slot] {
                 None => true,
                 Some((bp, bm, bid)) => {
@@ -233,6 +240,49 @@ pub fn neighbors(
         }
     }
     best.map(|b| b.map(|(_, _, id)| id.clone()))
+}
+
+/// `neighbors` over the cached pre-order structure instead of a fresh
+/// `TreeIndex`: no per-candidate hashing, so it runs in well under a
+/// millisecond on a 30k-node layout. Ties on identical geometry break by
+/// pre-order position rather than id order.
+pub fn neighbors_by_position(
+    current: &SymbolId,
+    shape: &crate::world::TreeShape,
+    pre: &crate::world::PreorderRects,
+) -> Option<[Option<usize>; 4]> {
+    let cur_pos = shape.position(current)?;
+    let cur = pre.rect_at(cur_pos)?;
+    let depth = shape.depth_at(cur_pos);
+    let leaf_mode = shape.is_leaf_at(cur_pos);
+    let mut best: [Option<(f64, f64, usize)>; 4] = [None, None, None, None];
+    for pos in 0..shape.len() {
+        if pos == cur_pos {
+            continue;
+        }
+        let eligible = if leaf_mode {
+            shape.is_leaf_at(pos)
+        } else {
+            shape.depth_at(pos) == depth
+        };
+        if !eligible {
+            continue;
+        }
+        let Some(r) = pre.rect_at(pos) else { continue };
+        for (slot, dir) in DIRS.iter().enumerate() {
+            let Some((primary, misalign)) = beam_score(&cur, &r, *dir) else {
+                continue;
+            };
+            let better = match best[slot] {
+                None => true,
+                Some((bp, bm, _)) => primary < bp || (primary == bp && misalign < bm),
+            };
+            if better {
+                best[slot] = Some((primary, misalign, pos));
+            }
+        }
+    }
+    Some(best.map(|b| b.map(|(_, _, pos)| pos)))
 }
 
 #[cfg(test)]
@@ -377,6 +427,8 @@ mod tests {
             header: 20.8,
             container_header: 52.0,
             bottom_pad: 6.0,
+            short_leaf_lines: 3,
+            short_leaf_header: 4.0,
             gap: 8.0,
             aspect: 1.0,
             max_display_lines: None,

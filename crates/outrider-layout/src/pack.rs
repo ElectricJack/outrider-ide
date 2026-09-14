@@ -27,7 +27,8 @@ pub struct Rect {
 pub struct PackConfig {
     /// Leaf page width (world px).
     pub page_w: f64,
-    /// Per-code-line height; leaf h = header + (1+measure)·line_step + bottom_pad.
+    /// Per-code-line height; leaf h = header + (1+measure)·line_step + bottom_pad,
+    /// except short item leaves (see `short_leaf_lines`).
     pub line_step: f64,
     /// Name-row strip height at the top of a leaf page.
     pub header: f64,
@@ -35,6 +36,12 @@ pub struct PackConfig {
     /// text (inventory, kind counts, etc.). Children are placed below this.
     pub container_header: f64,
     pub bottom_pad: f64,
+    /// Item leaves with at most this many lines paint their code as the box
+    /// content with no name row (the declaration already names the item):
+    /// h = short_leaf_header + measure·line_step + bottom_pad.
+    pub short_leaf_lines: u64,
+    /// Top padding replacing the name row on a short leaf.
+    pub short_leaf_header: f64,
     /// Space between siblings, both axes; also the container's inner margin.
     pub gap: f64,
     /// Target container width/height ratio for column wrapping.
@@ -69,12 +76,27 @@ pub fn pack(tree: &SymbolTree, cfg: &PackConfig) -> PackLayout {
     absolute_from_layouts(&tree.root, &layouts)
 }
 
-pub(crate) fn leaf_local_layout(node: &SymbolNode, cfg: &PackConfig) -> LocalLayout {
+/// Whether a leaf paints without a name row: an item (not a file or chunk)
+/// short enough that its declaration is the better label.
+pub fn is_short_leaf(node: &SymbolNode, short_leaf_lines: u64) -> bool {
+    matches!(node.id.kind, SymbolKind::Item { .. }) && node.measure <= short_leaf_lines
+}
+
+/// Natural (zoom 1.0) height of a leaf page under `cfg`.
+pub fn leaf_natural_h(node: &SymbolNode, cfg: &PackConfig) -> f64 {
     let measure = match cfg.max_display_lines {
         Some(cap) => node.measure.min(cap),
         None => node.measure,
     };
-    let h = cfg.header + (1.0 + measure as f64) * cfg.line_step + cfg.bottom_pad;
+    if is_short_leaf(node, cfg.short_leaf_lines) {
+        cfg.short_leaf_header + measure as f64 * cfg.line_step + cfg.bottom_pad
+    } else {
+        cfg.header + (1.0 + measure as f64) * cfg.line_step + cfg.bottom_pad
+    }
+}
+
+pub(crate) fn leaf_local_layout(node: &SymbolNode, cfg: &PackConfig) -> LocalLayout {
+    let h = leaf_natural_h(node, cfg);
     LocalLayout {
         size: (cfg.page_w, h),
         children: BTreeMap::new(),
@@ -522,10 +544,49 @@ mod tests {
             header: 20.8,
             container_header: 52.0,
             bottom_pad: 6.0,
+            // Exact-rect fixtures below predate header-less short leaves;
+            // keep every leaf on the headed formula here.
+            short_leaf_lines: 0,
+            short_leaf_header: 4.0,
             gap: 8.0,
             aspect: 1.6,
             max_display_lines: None,
         }
+    }
+
+    #[test]
+    fn short_item_leaves_drop_the_name_row() {
+        let mut cfg = cfg();
+        cfg.short_leaf_lines = 3;
+        let mut leaf = SymbolNode {
+            id: SymbolId {
+                kind: SymbolKind::Item { label: "field".into() },
+                qualified_path: "a.rs::x".into(),
+                ordinal: 0,
+            },
+            name: "x".into(),
+            byte_range: Some(0..4),
+            signature: None,
+            doc: None,
+            measure: 1,
+            churn: 0.0,
+            churn_count: 0,
+            visibility: None,
+            diff_status: None,
+            diff_hunks: vec![],
+            deleted_lines: vec![],
+            children: vec![],
+        };
+        assert!(is_short_leaf(&leaf, 3));
+        assert!((leaf_natural_h(&leaf, &cfg) - (4.0 + 15.6 + 6.0)).abs() < 1e-9);
+        leaf.measure = 4;
+        assert!(!is_short_leaf(&leaf, 3));
+        assert!((leaf_natural_h(&leaf, &cfg) - (20.8 + 5.0 * 15.6 + 6.0)).abs() < 1e-9);
+        // Files and chunks always keep their header.
+        leaf.measure = 1;
+        leaf.id.kind = SymbolKind::File;
+        assert!(!is_short_leaf(&leaf, 3));
+        assert!((leaf_natural_h(&leaf, &cfg) - (20.8 + 2.0 * 15.6 + 6.0)).abs() < 1e-9);
     }
 
     fn n(
