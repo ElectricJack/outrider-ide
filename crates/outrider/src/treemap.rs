@@ -660,6 +660,8 @@ pub struct TreemapView {
     wake: std::sync::Arc<crate::view::rpc::Wake>,
     /// Background pump task that polls the wake flag and notifies GPUI.
     _view_pump: Option<gpui::Task<()>>,
+    /// Keeps the folder-picker task alive while the platform dialog is up.
+    _folder_prompt: Option<gpui::Task<()>>,
     /// Last known viewport size for camera commands from RPC.
     pub(crate) last_viewport: Option<(f64, f64)>,
 }
@@ -1451,6 +1453,7 @@ impl TreemapView {
             watch_state: crate::view::watch::WatchState::new(),
             wake: std::sync::Arc::new(crate::view::rpc::Wake::new()),
             _view_pump: None,
+            _folder_prompt: None,
             last_viewport: None,
         }
     }
@@ -1741,9 +1744,84 @@ impl TreemapView {
         applied
     }
 
+    /// Drop every `__palette` panel layer still in the spec.
+    ///
+    /// The panel table is the usual owner of those layers, but a palette that
+    /// went away by another route (a spec swap, a tab change) can leave one
+    /// behind. The id is fixed, so a survivor makes the next push a duplicate
+    /// and spec validation rejects it — the palette then refuses to open at
+    /// all. Remove by index, high to low, so earlier indices stay valid.
+    fn remove_stale_palette_layers(&mut self) {
+        use outrider_view::spec::LayerSpec;
+        let stale: Vec<usize> = self
+            .view_spec
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| {
+                matches!(layer, LayerSpec::Panel(p) if p.id.as_deref() == Some("__palette"))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for idx in stale.into_iter().rev() {
+            self.apply_view_command(outrider_view::command::ViewCommand::RemoveLayer(idx));
+        }
+    }
+
+    /// Ask the platform for a project folder and load it when one comes back.
+    ///
+    /// `rfd`'s blocking `pick_folder()` spun a modal dialog from inside GPUI's
+    /// event loop and took the process down with it; `prompt_for_paths` hands
+    /// the request to the platform and relays the answer over a channel.
+    fn prompt_open_folder(&mut self, cx: &mut gpui::Context<Self>) {
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Project Folder".into()),
+        });
+        self._folder_prompt = Some(cx.spawn(
+            async move |this: gpui::WeakEntity<TreemapView>, cx: &mut gpui::AsyncApp| {
+                // Cancelled, dismissed, or the platform refused it.
+                let Ok(Ok(Some(mut selected))) = prompt.await else {
+                    return;
+                };
+                let Some(folder) = selected.pop() else {
+                    return;
+                };
+                let _ = this.update(cx, |this, cx| {
+                    let (settings, warning) = crate::settings::Settings::load().into_parts();
+                    this.global_settings = settings.clone();
+                    this.settings = settings;
+                    if let Some(message) = warning {
+                        this.notifications.push(Notification::warning(message));
+                    }
+                    this.start_loading(folder);
+                    cx.notify();
+                });
+            },
+        ));
+    }
+
+    fn clear_disk_cache(&mut self, cx: &mut gpui::Context<Self>) {
+        if !self.map_interaction_enabled() {
+            return;
+        }
+        if let Some(textures) = self.textures.as_mut() {
+            textures.request_clear_disk_cache();
+            self.bake_pending = true;
+        }
+        cx.notify();
+    }
+
     fn open_palette(&mut self, files_only: bool) {
         use outrider_view::command::ViewCommand;
         use outrider_view::spec::*;
+
+        // A palette is singular: Ctrl+T while the file palette is open must
+        // replace it, not stack a second one under the same id.
+        self.close_all_panels();
+        self.remove_stale_palette_layers();
 
         let kind_filter = if files_only {
             SetExpr::Kind("file".into())
@@ -5860,7 +5938,13 @@ impl TreemapView {
                 crate::overlays::context_menu_row("file-menu-open", "Open Folder...").on_click(
                     cx.listener(|this, _event, window, cx| {
                         this.file_menu_open = false;
-                        this.focus_handle.dispatch_action(&OpenFolder, window, cx);
+                        // Call the work directly. Dispatching the action to
+                        // ourselves re-enters this entity while the click's own
+                        // update still holds it, which GPUI treats as a
+                        // non-unwinding panic and the process aborts — and
+                        // deferring does not help, because the deferred closure
+                        // is itself run inside an update of this entity.
+                        this.prompt_open_folder(cx);
                     }),
                 ),
             );
@@ -5875,8 +5959,7 @@ impl TreemapView {
                         .on_click(cx.listener(
                             |this, _event, window, cx| {
                                 this.file_menu_open = false;
-                                this.focus_handle
-                                    .dispatch_action(&ClearDiskCache, window, cx);
+                                this.clear_disk_cache(cx);
                             },
                         )),
                     )
@@ -6975,29 +7058,10 @@ impl Render for TreemapView {
             .bg(rgb(theme::BG))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &OpenFolder, _w, cx| {
-                if let Some(folder) = rfd::FileDialog::new()
-                    .set_title("Open Project Folder")
-                    .pick_folder()
-                {
-                    let (settings, warning) = crate::settings::Settings::load().into_parts();
-                    this.global_settings = settings.clone();
-                    this.settings = settings;
-                    if let Some(message) = warning {
-                        this.notifications.push(Notification::warning(message));
-                    }
-                    this.start_loading(folder);
-                }
-                cx.notify();
+                this.prompt_open_folder(cx);
             }))
             .on_action(cx.listener(|this, _: &ClearDiskCache, _w, cx| {
-                if !this.map_interaction_enabled() {
-                    return;
-                }
-                if let Some(textures) = this.textures.as_mut() {
-                    textures.request_clear_disk_cache();
-                    this.bake_pending = true;
-                }
-                cx.notify();
+                this.clear_disk_cache(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSettings, _w, cx| {
                 if !this.map_interaction_enabled() {
